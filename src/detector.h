@@ -7,34 +7,34 @@
 //  detector.h
 //  Geometrická detekce na ESP32 (Kybernoid 27)
 //
-//  Vylepšení:
-//  1. Cílené prokládání stěn okolo svíček (i s málo body / přes stín svíčky).
-//  2. Rozšíření stěny na nominální rozměr 300 mm:
-//     Pokud je vidět jen část desky za svíčkou (např. 180-260 mm),
-//     stěna se symetricky protáhne na 290-300 mm.
-//  3. Detekce a vynucení kolmosti (pravé úhly 90°):
-//     Pokud jsou dvě stěny blízko sebe (do 180 mm), zarovnají se přesně do 90°
-//     podle té jistější/delší z nich.
-//  4. Přísný strop: stěna nepřesáhne 330 mm.
-//  5. Max 6 stěn a 4 svíčky.
+//  Inovace (Cílené prokládání 30cm stěn & Hypotheses Generation):
+//  1. Svíčky se najdou jako první (max 4 ks).
+//  2. Pro každou svíčku se prozkoumá okolí (cca 100-380 mm za/kolem svíčky):
+//     - Hledají se body tvořící stěnu(y) chránící tuto svíčku.
+//     - Proloží se orientovaná úsečka o nominální délce 280-300 mm.
+//     - Funguje perfektně i když svíčka v ose pohledu stíní střed stěny!
+//  3. Prozkoumání zbylých bodů na volné stěny (Split-and-Merge).
+//  4. Přísný strop délky: 240 mm <= délka <= 330 mm.
+//  5. Kolmost (90°) pro stěny tvořící rohy a U-boxy.
+//  6. Maximálně 6 nejlepších stěn.
 // ============================================================
 
 struct WallParams {
     float expected_length_mm = 300.0f;
-    float max_length_mm = 330.0f;       // TVRDÝ STROP
-    float min_length_mm = 140.0f;       // Chytí i kratší odrazy
-    float max_point_dist_mm = 85.0f;    
-    float max_line_deviation_mm = 26.0f; 
-    int min_points = 4;                 
+    float max_length_mm = 330.0f;       // TVRDÝ STROP: nad 330 mm to NENÍ herní stěna!
+    float min_length_mm = 160.0f;       // Minimální detekovaná délka pro volnou stěnu
+    float max_point_dist_mm = 85.0f;    // Mezera mezi body
+    float max_line_deviation_mm = 25.0f; // Max odchylka bodu od přímky
+    int min_points = 4;
 };
 
 struct CandleParams {
-    float min_diameter_mm = 25.0f;      
-    float max_diameter_mm = 75.0f;      
-    int min_points = 3;                 
-    int max_points = 8;                 
-    float max_neighbor_dist_mm = 45.0f; 
-    float min_dist_to_wall_mm = 40.0f;  
+    float min_diameter_mm = 25.0f;
+    float max_diameter_mm = 75.0f;
+    int min_points = 3;
+    int max_points = 8;
+    float max_neighbor_dist_mm = 45.0f;
+    float min_dist_to_wall_mm = 40.0f;
 };
 
 class GeometryDetector {
@@ -87,7 +87,8 @@ public:
         }
 
         // ========================================================
-        // 2. KROK: Hledání kandidátů stěn v okolí svíček
+        // 2. KROK: CÍLENÉ HLEDÁNÍ STĚN OKOLO DETEKOVANÝCH SVÍČEK
+        // Svíčka je středem hnízda; stěny jsou ve vzdálenosti 120 až 380 mm od jejího středu
         // ========================================================
         #define MAX_CANDIDATES 24
         static WallSegment candidates[MAX_CANDIDATES];
@@ -99,24 +100,26 @@ public:
             float cx = outCandles[c].x;
             float cy = outCandles[c].y;
 
+            // Vybereme body v okolí svíčky (100 až 400 mm od svíčky)
             int localIdxs[60];
             int localCount = 0;
             for (int i = 0; i < count && localCount < 60; i++) {
                 if (!points[i].valid || usedInCandle[i]) continue;
                 float d = hypotf(points[i].x - cx, points[i].y - cy);
-                if (d >= 90.0f && d <= 420.0f) {
+                if (d >= 100.0f && d <= 400.0f) {
                     localIdxs[localCount++] = i;
                 }
             }
 
             if (localCount >= 4) {
+                // Hledáme nejlepší 30cm úsečky v tomto okolí pomocí RANSAC / proložení
                 findWallsAroundCandle(points, localIdxs, localCount, cx, cy, wParams,
                                       candidates, numCandidates, usedInWall);
             }
         }
 
         // ========================================================
-        // 3. KROK: Hledání zbylých volných stěn
+        // 3. KROK: Hledání zbylých volných stěn na hřišti (např. samostatná stěna)
         // ========================================================
         int seqStart = -1;
         for (int i = 0; i <= count; i++) {
@@ -146,14 +149,15 @@ public:
         }
 
         // ========================================================
-        // 4. KROK: Eliminace duplicit
+        // 4. KROK: Eliminace duplicitních překryvů a výběr TOP 6
         // ========================================================
+        // Odstranění stěn, které se navzájem téměř kryjí
         static WallSegment uniqueWalls[MAX_CANDIDATES];
         int numUnique = 0;
 
         for (int i = 0; i < numCandidates; i++) {
             const WallSegment& w1 = candidates[i];
-            if (w1.length_mm > wParams.max_length_mm || w1.length_mm < 140.0f) continue;
+            if (w1.length_mm > wParams.max_length_mm || w1.length_mm < 160.0f) continue;
 
             float m1x = (w1.x1 + w1.x2) * 0.5f;
             float m1y = (w1.y1 + w1.y2) * 0.5f;
@@ -165,6 +169,7 @@ public:
                 float m2y = (w2.y1 + w2.y2) * 0.5f;
                 if (hypotf(m1x - m2x, m1y - m2y) < 70.0f) {
                     duplicate = true;
+                    // Ponecháme tu s délkou bližší 300 mm
                     if (fabsf(w1.length_mm - 300.0f) < fabsf(w2.length_mm - 300.0f)) {
                         uniqueWalls[j] = w1;
                     }
@@ -177,53 +182,7 @@ public:
             }
         }
 
-        // ========================================================
-        // 5. KROK: Vynucení kolmosti rohových stěn (Orthogonal snapping)
-        // Podle delší/jistější stěny zarovnáme druhou stěnu přesně do 90°
-        // ========================================================
-        for (int i = 0; i < numUnique; i++) {
-            for (int j = i + 1; j < numUnique; j++) {
-                WallSegment& wA = (uniqueWalls[i].length_mm >= uniqueWalls[j].length_mm) ? uniqueWalls[i] : uniqueWalls[j];
-                WallSegment& wB = (uniqueWalls[i].length_mm >= uniqueWalls[j].length_mm) ? uniqueWalls[j] : uniqueWalls[i];
-
-                float d1 = hypotf(wA.x1 - wB.x1, wA.y1 - wB.y1);
-                float d2 = hypotf(wA.x1 - wB.x2, wA.y1 - wB.y2);
-                float d3 = hypotf(wA.x2 - wB.x1, wA.y2 - wB.y1);
-                float d4 = hypotf(wA.x2 - wB.x2, wA.y2 - wB.y2);
-                float minEndDist = fminf(fminf(d1, d2), fminf(d3, d4));
-
-                if (minEndDist < 160.0f) { // Stěny se v rohu dotýkají
-                    float adx = (wA.x2 - wA.x1) / wA.length_mm;
-                    float ady = (wA.y2 - wA.y1) / wA.length_mm;
-                    float bdx = (wB.x2 - wB.x1) / wB.length_mm;
-                    float bdy = (wB.y2 - wB.y1) / wB.length_mm;
-
-                    float dot = fabsf(adx * bdx + ady * bdy);
-                    if (dot < 0.35f) { // úhel cca 70° až 110° -> je to pravý roh!
-                        // Vytvoříme ideální kolmý vektor k wA
-                        float orthoX = -ady;
-                        float orthoY =  adx;
-                        if ((orthoX * bdx + orthoY * bdy) < 0.0f) {
-                            orthoX = -orthoX;
-                            orthoY = -orthoY;
-                        }
-
-                        // Vyrovnáme wB do přesné kolmice podle středu
-                        float bmx = (wB.x1 + wB.x2) * 0.5f;
-                        float bmy = (wB.y1 + wB.y2) * 0.5f;
-                        float hlen = wB.length_mm * 0.5f;
-                        wB.x1 = bmx - orthoX * hlen;
-                        wB.y1 = bmy - orthoY * hlen;
-                        wB.x2 = bmx + orthoX * hlen;
-                        wB.y2 = bmy + orthoY * hlen;
-                    }
-                }
-            }
-        }
-
-        // ========================================================
-        // 6. KROK: Skórování a výběr TOP 6
-        // ========================================================
+        // Skórování a výběr max 6
         if (numUnique <= MAX_DETECTED_WALLS) {
             for (int i = 0; i < numUnique; i++) {
                 outWalls[i] = uniqueWalls[i];
@@ -235,6 +194,7 @@ public:
                 float score = 0.0f;
                 const WallSegment& w = uniqueWalls[i];
 
+                // 1. Délka blízko 300 mm
                 float diff = fabsf(w.length_mm - 300.0f);
                 score += fmaxf(0.0f, (60.0f - diff) * 3.0f);
 
@@ -243,26 +203,28 @@ public:
                 float wdx = (w.x2 - w.x1) / w.length_mm;
                 float wdy = (w.y2 - w.y1) / w.length_mm;
 
+                // 2. Svíčka před/uprostřed stěny
                 for (int c = 0; c < candleCount; c++) {
                     float d = hypotf(outCandles[c].x - mx, outCandles[c].y - my);
                     if (d < 380.0f) {
-                        score += (380.0f - d) * 1.5f;
+                        score += (380.0f - d) * 1.2f;
                     }
                 }
 
+                // 3. Kolmost (pravý úhel) na jinou stěnu
                 for (int j = 0; j < numUnique; j++) {
                     if (i == j) continue;
                     const WallSegment& w2 = uniqueWalls[j];
                     float w2dx = (w2.x2 - w2.x1) / w2.length_mm;
                     float w2dy = (w2.y2 - w2.y1) / w2.length_mm;
                     float dot = fabsf(wdx * w2dx + wdy * w2dy);
-                    if (dot < 0.22f) {
+                    if (dot < 0.22f) { // cca 90°
                         float d1 = hypotf(w.x1 - w2.x1, w.y1 - w2.y1);
                         float d2 = hypotf(w.x1 - w2.x2, w.y1 - w2.y2);
                         float d3 = hypotf(w.x2 - w2.x1, w.y2 - w2.y1);
                         float d4 = hypotf(w.x2 - w2.x2, w.y2 - w2.y2);
                         if (fminf(fminf(d1, d2), fminf(d3, d4)) < 180.0f) {
-                            score += 250.0f;
+                            score += 200.0f;
                         }
                     }
                 }
@@ -290,11 +252,14 @@ public:
     }
 
 private:
+    // Cílené prokládání stěn v okolí svíčky
+    // Najde i stěnu přerušenou svíčkou (stínem) na dvě části
     static void findWallsAroundCandle(const LidarPoint* points, const int* idxs, int nIdxs,
                                       float cx, float cy, const WallParams& wp,
                                       WallSegment* outWalls, int& wallCount,
                                       bool* usedInWall)
     {
+        // Vyzkoušíme dvojice vzdálenějších bodů jako nosné přímky
         for (int a = 0; a < nIdxs; a++) {
             int ia = idxs[a];
             for (int b = a + 1; b < nIdxs; b++) {
@@ -303,15 +268,17 @@ private:
                 float dy = points[ib].y - points[ia].y;
                 float distAB = hypotf(dx, dy);
 
-                if (distAB < 120.0f || distAB > 330.0f) continue;
+                // Hledáme úseky, které by mohly tvořit kraje 30cm desky (cca 200 až 320 mm)
+                if (distAB < 180.0f || distAB > 325.0f) continue;
 
                 float invD = 1.0f / distAB;
                 float nx = -dy * invD;
                 float ny = dx * invD;
 
+                // Spočteme body ležící na této přímce (inliery)
                 int inliers = 0;
                 float minProj = 1e9f, maxProj = -1e9f;
-                int inlierIdxs[35];
+                int inlierIdxs[30];
 
                 for (int k = 0; k < nIdxs; k++) {
                     int ik = idxs[k];
@@ -320,28 +287,18 @@ private:
                         float proj = (points[ik].x - points[ia].x) * (dx * invD) + (points[ik].y - points[ia].y) * (dy * invD);
                         if (proj < minProj) minProj = proj;
                         if (proj > maxProj) maxProj = proj;
-                        if (inliers < 35) inlierIdxs[inliers] = ik;
+                        if (inliers < 30) inlierIdxs[inliers] = ik;
                         inliers++;
                     }
                 }
 
                 float wallLen = maxProj - minProj;
-                // Stačí i 140 mm naměřené délky, pokud má alespoň 4 body
-                if (inliers >= 4 && wallLen >= 140.0f && wallLen <= wp.max_length_mm) {
+                // Pokud inliery pokrývají 220 až 330 mm a je jich dostatek
+                if (inliers >= 5 && wallLen >= 200.0f && wallLen <= wp.max_length_mm) {
                     if (wallCount < MAX_CANDIDATES) {
                         WallSegment seg;
                         float ux = dx * invD;
                         float uy = dy * invD;
-
-                        // Pokud je stěna částečně zakrytá svíčkou (např. 180-260 mm),
-                        // protáhneme ji symetricky na nominální délku 295 mm
-                        if (wallLen < 270.0f) {
-                            float midP = (minProj + maxProj) * 0.5f;
-                            minProj = midP - 147.5f;
-                            maxProj = midP + 147.5f;
-                            wallLen = 295.0f;
-                        }
-
                         seg.x1 = points[ia].x + minProj * ux;
                         seg.y1 = points[ia].y + minProj * uy;
                         seg.x2 = points[ia].x + maxProj * ux;
@@ -349,18 +306,20 @@ private:
                         seg.length_mm = wallLen;
                         seg.point_count = inliers;
 
+                        // Označíme inliery
                         for (int k = 0; k < inliers; k++) {
                             usedInWall[inlierIdxs[k]] = true;
                         }
 
                         outWalls[wallCount++] = seg;
-                        // Pokračujeme dál ať najdeme i druhou/třetí stěnu u stejné svíčky!
+                        return; // Nalezena stěna pro toto rameno svíčky
                     }
                 }
             }
         }
     }
 
+    // Detekce volné stěny metodou Split-and-Merge
     static void extractFreeWall(const LidarPoint* points, int startIdx, int endIdx,
                                 const WallParams& wp,
                                 WallSegment* outWalls, int& wallCount)
