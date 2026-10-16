@@ -162,8 +162,8 @@ class StableFieldModel:
                 vy = c['y'] - w['y1']
                 proj_t = vx * ux + vy * uy
                 d_perp = abs(vx * nx + vy * ny)
-                # Svíčka nesmí ležet v dráze stěny ani na jejím bezprostředním rohu
-                if d_perp < 55.0 and -60.0 <= proj_t <= L + 60.0:
+                # Fialový koridor: svíčka nesmí ležet v dráze stěny ani v prodloužení o 15 cm před/za
+                if d_perp <= 55.0 and -150.0 <= proj_t <= L + 150.0:
                     in_wall = True
                     break
             if not in_wall:
@@ -335,6 +335,38 @@ class DualLidarVisualizer:
         pygame.draw.circle(self.screen, (0, 180, 255), (cx, cy), 8)
         pygame.draw.line(self.screen, (0, 255, 180), (cx, cy), (cx, cy - 35), 3)
 
+    def draw_wall_corridor(self, x1, y1, x2, y2, wlen, offset_x):
+        if wlen < 10.0: return
+        dx = (x2 - x1) / wlen
+        dy = (y2 - y1) / wlen
+        nx = -dy
+        ny = dx
+
+        ext = 150.0  # 15 cm prodloužení přes stěnu
+        hw = 55.0    # Tloušťka koridoru (+-55 mm od přímky)
+
+        ax1 = x1 - ext * dx
+        ay1 = y1 - ext * dy
+        ax2 = x2 + ext * dx
+        ay2 = y2 + ext * dy
+
+        c1 = self.to_screen(ax1 + hw * nx, ay1 + hw * ny, offset_x)
+        c2 = self.to_screen(ax2 + hw * nx, ay2 + hw * ny, offset_x)
+        c3 = self.to_screen(ax2 - hw * nx, ay2 - hw * ny, offset_x)
+        c4 = self.to_screen(ax1 - hw * nx, ay1 - hw * ny, offset_x)
+
+        # Fialový koridor (zakázaná zóna pro svíčky)
+        pygame.draw.polygon(self.screen, (45, 12, 55), [c1, c2, c3, c4], 0)
+        pygame.draw.polygon(self.screen, (160, 45, 200), [c1, c2, c3, c4], 1)
+
+        # Prodloužení osy fialovou čarou
+        ep1 = self.to_screen(ax1, ay1, offset_x)
+        ep2 = self.to_screen(ax2, ay2, offset_x)
+        p1 = self.to_screen(x1, y1, offset_x)
+        p2 = self.to_screen(x2, y2, offset_x)
+        pygame.draw.line(self.screen, (200, 60, 240), ep1, p1, 1)
+        pygame.draw.line(self.screen, (200, 60, 240), p2, ep2, 1)
+
     def draw_left_live(self):
         self.draw_panel_decorations(0)
         scale = (PANEL_W / 2.0) / self.view_span_mm
@@ -351,8 +383,9 @@ class DualLidarVisualizer:
                 v = min(255, max(30, intensity * 2 + 40))
                 self.screen.set_at((sx, sy), (v, v, v))
 
-        # Živé stěny
+        # Živé stěny a fialový koridor
         for w in self.last_frame.get("walls", []):
+            self.draw_wall_corridor(w[0], w[1], w[2], w[3], w[4], 0)
             p1 = self.to_screen(w[0], w[1], 0)
             p2 = self.to_screen(w[2], w[3], 0)
             pygame.draw.line(self.screen, (0, 255, 120), p1, p2, 4)
@@ -454,8 +487,9 @@ class DualLidarVisualizer:
         conf_candles = self.model.get_confirmed_candles()
         conf_walls = self.model.get_confirmed_walls()
 
-        # Stabilní stěny
+        # Stabilní stěny a fialový koridor
         for w in conf_walls:
+            self.draw_wall_corridor(w['x1'], w['y1'], w['x2'], w['y2'], w['len'], PANEL_W)
             p1 = self.to_screen(w['x1'], w['y1'], PANEL_W)
             p2 = self.to_screen(w['x2'], w['y2'], PANEL_W)
             pygame.draw.line(self.screen, (80, 255, 140), p1, p2, 6)
@@ -516,15 +550,15 @@ class DualLidarVisualizer:
         self.screen.blit(self.font_main.render(stat_str, True, (210, 215, 225)), (PANEL_W + 25, 43))
 
         # Nápověda vpravo dole
-        tip_box = pygame.Surface((380, 80))
+        tip_box = pygame.Surface((440, 95))
         tip_box.set_alpha(210)
         tip_box.fill((10, 12, 16))
-        self.screen.blit(tip_box, (PANEL_W + 15, PANEL_H - 95))
-        pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, PANEL_H - 95, 380, 80), 1)
-        self.screen.blit(self.font_bold.render("PRINCIP DLOUHODOBÉ MAPY:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 87))
-        self.screen.blit(self.font_main.render("• Akumuluje stabilní shodná měření bez šumu", True, (200, 205, 215)), (PANEL_W + 25, PANEL_H - 67))
-        self.screen.blit(self.font_main.render("• Při změně parametrů se automaticky vyčistí", True, (240, 200, 80)), (PANEL_W + 25, PANEL_H - 49))
-        self.screen.blit(self.font_main.render("• Klávesa [C] pro okamžitý manuální reset", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 31))
+        self.screen.blit(tip_box, (PANEL_W + 15, PANEL_H - 110))
+        pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, PANEL_H - 110, 440, 95), 1)
+        self.screen.blit(self.font_bold.render("PRINCIP DLOUHODOBÉ MAPY:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 102))
+        self.screen.blit(self.font_main.render("• Fialový koridor: Zóna stěny (+15 cm za roh), svíčka zde nesmí být", True, (210, 130, 255)), (PANEL_W + 25, PANEL_H - 82))
+        self.screen.blit(self.font_main.render("• Samostatná svíčka bez stěny je plně podporována", True, (200, 205, 215)), (PANEL_W + 25, PANEL_H - 64))
+        self.screen.blit(self.font_main.render("• Při změně parametrů se mapa vyčistí | [C] Manuální reset", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 46))
 
     def run(self):
         while self.running:

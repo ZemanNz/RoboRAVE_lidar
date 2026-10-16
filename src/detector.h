@@ -281,9 +281,9 @@ public:
                 float projT = vx * ux + vy * uy;
                 float distToLine = fabsf(vx * nx + vy * ny);
 
-                // Pokud je svíčka v bezprostřední dráze přímky stěny (d_perp < 55 mm)
-                // v rámci délky stěny nebo na jejím rohu/prodloužení (-60 mm až +60 mm):
-                if (distToLine < 55.0f && projT >= -60.0f && projT <= (wLen + 60.0f)) {
+                // Zakázaný koridor stěny (prodloužený o 150 mm před i za stěnu):
+                // Svíčka nesmí ležet v přímce stěny ani v mezeře/rohu mezi stěnami (d_perp <= 55 mm)
+                if (distToLine <= 55.0f && projT >= -150.0f && projT <= (wLen + 150.0f)) {
                     inWallPath = true;
                     break;
                 }
