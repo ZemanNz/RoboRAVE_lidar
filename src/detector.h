@@ -149,6 +149,15 @@ public:
         }
 
         // ========================================================
+        // 3.5 KROK: Protažení stěn a hledání inlierů k dosažení plné délky 300 mm
+        // Pro každého kandidáta prozkoumáme nosnou přímku před i za stěnou (do 330 mm)
+        // a začleníme veškeré zapadající body ležící na stejné přímce.
+        // ========================================================
+        for (int i = 0; i < numCandidates; i++) {
+            extendWallWithInliers(candidates[i], points, count, usedInCandle, usedInWall, wParams);
+        }
+
+        // ========================================================
         // 4. KROK: Eliminace duplicitních překryvů a výběr TOP 6
         // ========================================================
         // Odstranění stěn, které se navzájem téměř kryjí
@@ -180,6 +189,11 @@ public:
             if (!duplicate && numUnique < MAX_CANDIDATES) {
                 uniqueWalls[numUnique++] = w1;
             }
+        }
+
+        // Finální doladění unikátních stěn (opětovné protažení na 300 mm se všemi inliery)
+        for (int i = 0; i < numUnique; i++) {
+            extendWallWithInliers(uniqueWalls[i], points, count, usedInCandle, usedInWall, wParams);
         }
 
         // Skórování a výběr max 6
@@ -344,6 +358,117 @@ public:
     }
 
 private:
+    // Prodloužení stěny podél její nosné přímky a pohlcení zapadajících bodů
+    // Cílem je dosáhnout plné nominální délky 300 mm (max 330 mm) překlenutím mezer a výpadků
+    static void extendWallWithInliers(WallSegment& wall, const LidarPoint* points, int count,
+                                      const bool* usedInCandle, bool* usedInWall,
+                                      const WallParams& wp)
+    {
+        if (wall.length_mm < 10.0f) return;
+
+        float dx = wall.x2 - wall.x1;
+        float dy = wall.y2 - wall.y1;
+        float invL = 1.0f / wall.length_mm;
+        float ux = dx * invL;
+        float uy = dy * invL;
+        float nx = -uy;
+        float ny = ux;
+
+        struct ProjPoint {
+            float proj;
+            int idx;
+        };
+        const int MAX_LINE_PTS = 120;
+        ProjPoint linePoints[MAX_LINE_PTS];
+        int numLinePoints = 0;
+
+        // Prohledáme všechny platné body v koridoru prodloužené přímky stěny
+        for (int i = 0; i < count && numLinePoints < MAX_LINE_PTS; i++) {
+            if (!points[i].valid || usedInCandle[i]) continue;
+
+            float vx = points[i].x - wall.x1;
+            float vy = points[i].y - wall.y1;
+
+            float dev = fabsf(vx * nx + vy * ny);
+            if (dev <= wp.max_line_deviation_mm) {
+                float proj = vx * ux + vy * uy;
+                // Hledáme v dosahu až 160 mm před začátkem i za koncem stěny
+                if (proj >= -160.0f && proj <= (wall.length_mm + 160.0f)) {
+                    linePoints[numLinePoints].proj = proj;
+                    linePoints[numLinePoints].idx = i;
+                    numLinePoints++;
+                }
+            }
+        }
+
+        if (numLinePoints < 2) return;
+
+        // Seřazení podle projekce podél osy stěny (insertion sort)
+        for (int a = 0; a < numLinePoints - 1; a++) {
+            for (int b = a + 1; b < numLinePoints; b++) {
+                if (linePoints[b].proj < linePoints[a].proj) {
+                    ProjPoint tmp = linePoints[a];
+                    linePoints[a] = linePoints[b];
+                    linePoints[b] = tmp;
+                }
+            }
+        }
+
+        // Najdeme body tvořící původní stěnu
+        int coreMinIdx = -1, coreMaxIdx = -1;
+        for (int k = 0; k < numLinePoints; k++) {
+            if (linePoints[k].proj >= -25.0f && linePoints[k].proj <= (wall.length_mm + 25.0f)) {
+                if (coreMinIdx < 0) coreMinIdx = k;
+                coreMaxIdx = k;
+            }
+        }
+
+        if (coreMinIdx < 0) return;
+
+        // Rozšiřujeme dozadu (směrem před začátek wall.x1)
+        int bestStart = coreMinIdx;
+        while (bestStart > 0) {
+            float gap = linePoints[bestStart].proj - linePoints[bestStart - 1].proj;
+            float totalSpan = linePoints[coreMaxIdx].proj - linePoints[bestStart - 1].proj;
+            if (gap <= wp.max_point_dist_mm && totalSpan <= wp.max_length_mm) {
+                bestStart--;
+            } else {
+                break;
+            }
+        }
+
+        // Rozšiřujeme dopředu (směrem za konec wall.x2)
+        int bestEnd = coreMaxIdx;
+        while (bestEnd < numLinePoints - 1) {
+            float gap = linePoints[bestEnd + 1].proj - linePoints[bestEnd].proj;
+            float totalSpan = linePoints[bestEnd + 1].proj - linePoints[bestStart].proj;
+            if (gap <= wp.max_point_dist_mm && totalSpan <= wp.max_length_mm) {
+                bestEnd++;
+            } else {
+                break;
+            }
+        }
+
+        float newMinProj = linePoints[bestStart].proj;
+        float newMaxProj = linePoints[bestEnd].proj;
+        float newLen = newMaxProj - newMinProj;
+
+        if (newLen >= wall.length_mm && newLen <= wp.max_length_mm) {
+            float origX1 = wall.x1;
+            float origY1 = wall.y1;
+            wall.x1 = origX1 + newMinProj * ux;
+            wall.y1 = origY1 + newMinProj * uy;
+            wall.x2 = origX1 + newMaxProj * ux;
+            wall.y2 = origY1 + newMaxProj * uy;
+            wall.length_mm = newLen;
+            wall.point_count = (bestEnd - bestStart + 1);
+
+            for (int k = bestStart; k <= bestEnd; k++) {
+                usedInWall[linePoints[k].idx] = true;
+            }
+        }
+    }
+
     // Detekce rohů tvořených dvěma na sebe kolmými stěnami (L-rohy) a záchrana rohové svíčky
     // Využívá průsečík kolmic obou stěn pro přesnou lokalizaci svíčky
     static void extractCornerCandles(const LidarPoint* points, int count,
