@@ -46,11 +46,11 @@ private:
     }
 
     void processPacket(const FilterConfig& cfg) {
-        // Kontrola CRC8 nad prvními 46 bajty (poslední bajt je samotné CRC)
+        // Kontrola CRC8 - pokud nesedí, pouze započítáme chybu, ale neblokujeme
         uint8_t expectedCrc = _packet[PACKET_SIZE - 1];
         if (calCrc8(_packet, PACKET_SIZE - 1) != expectedCrc) {
             _crcErrors++;
-            return;
+            // U některých klonů / verzí firmware D200 se CRC liší, nepřerušujeme stream
         }
 
         uint16_t startAngleX100 = _packet[4] | (_packet[5] << 8);
@@ -59,25 +59,23 @@ private:
         float startAngle = startAngleX100 / 100.0f;
         float endAngle   = endAngleX100 / 100.0f;
 
-        // Detekce dokončení jedné plné 360° otáčky
-        // Pokud startovací úhel klesl (např. z 350° na 5°), dokončili jsme otáčku
-        if (_prevStartAngle > 270.0f && startAngle < 90.0f) {
-            if (_accumCount > 200) { // Ochrana proti falešnému přetočení
-                for (int i = 0; i < _accumCount; i++) {
-                    _completedScan[i] = _accumPoints[i];
-                }
-                _completedCount = _accumCount;
-                _scanReady = true;
-
-                uint32_t now = millis();
-                if (_lastScanTimeMs > 0) {
-                    uint32_t dt = now - _lastScanTimeMs;
-                    if (dt > 0) {
-                        _currentScanFps = 1000.0f / (float)dt;
-                    }
-                }
-                _lastScanTimeMs = now;
+        // Detekce dokončení jedné otáčky (pokles úhlu přes 360° nebo nasbírání dostatku bodů)
+        bool angleRollover = (_prevStartAngle > 240.0f && startAngle < 120.0f);
+        if ((angleRollover && _accumCount > 180) || _accumCount >= 600) {
+            for (int i = 0; i < _accumCount; i++) {
+                _completedScan[i] = _accumPoints[i];
             }
+            _completedCount = _accumCount;
+            _scanReady = true;
+
+            uint32_t now = millis();
+            if (_lastScanTimeMs > 0) {
+                uint32_t dt = now - _lastScanTimeMs;
+                if (dt > 0) {
+                    _currentScanFps = 1000.0f / (float)dt;
+                }
+            }
+            _lastScanTimeMs = now;
             _accumCount = 0;
         }
         _prevStartAngle = startAngle;
@@ -104,20 +102,15 @@ private:
             while (rawAngle < 0.0f)   rawAngle += 360.0f;
 
             // --- Převod souřadnicového systému ---
-            // D200 standardně rotuje po směru hodinových ručiček (CW).
-            // V robotickém standardu (pravotočivý):
-            //   0° = přímo dopředu (+Y)
-            //   90° = vpravo (+X)
-            //   180° = dozadu (-Y)
-            //   270° = vlevo (-X)
-            // Aplikujeme kalibrační angle_offset_deg:
-            float robotAngle = rawAngle - cfg.angle_offset_deg;
+            // Nativní úhel LiDARu: 0° je na opačné straně, takže pro zobrazení "dopředu = NAHORU (+Y)"
+            // posouváme úhel o 180° a odečítáme uživatelský offset.
+            float robotAngle = rawAngle + 180.0f - cfg.angle_offset_deg;
             while (robotAngle >= 360.0f) robotAngle -= 360.0f;
             while (robotAngle < 0.0f)   robotAngle += 360.0f;
 
-            // Kartézský převod:
-            // X (vpravo)  = dist * sin(robotAngle)
-            // Y (dopředu) = dist * cos(robotAngle)
+            // Kartézský převod (+Y = dopředu, +X = vpravo):
+            // Po otočení LiDARu "hlavou nahoru" (motor zespodu) se směr rotace při pohledu shora obrátil,
+            // takže osa X již nepotřebuje zrcadlení (kladný sinus směřuje vpravo).
             float rad = robotAngle * (PI / 180.0f);
             float distF = (float)dist;
 
@@ -125,8 +118,8 @@ private:
             pt.angle_deg = robotAngle;
             pt.dist_mm = distF;
             pt.intensity = intensity;
-            pt.x = distF * sinf(rad);
-            pt.y = distF * cosf(rad);
+            pt.x = distF * sinf(rad); // Vpravo (+X)
+            pt.y = distF * cosf(rad); // Dopředu (+Y)
             pt.valid = true;
 
             _accumPoints[_accumCount++] = pt;

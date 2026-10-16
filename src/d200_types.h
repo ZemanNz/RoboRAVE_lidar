@@ -8,8 +8,8 @@
 
 // Maximální počet bodů na jednu 360° otáčku (při 4000 Hz a 6 Hz je to cca 667 bodů)
 #define MAX_LIDAR_POINTS 750
-#define MAX_DETECTED_WALLS 10
-#define MAX_DETECTED_CANDLES 10
+#define MAX_DETECTED_WALLS 6
+#define MAX_DETECTED_CANDLES 4
 
 // Struktura jednoho bodu měření
 struct LidarPoint {

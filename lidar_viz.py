@@ -132,24 +132,26 @@ class LidarVisualizer:
         if not self.ser or not self.ser.is_open:
             return
 
+        # Zpracujeme řádky ze sériové linky
+        newest_frame = None
         while self.ser.in_waiting > 0:
             try:
                 raw_line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                 if not raw_line:
                     continue
                 
-                # Zprávy začínající # jsou logy z firmware
                 if raw_line.startswith("#"):
                     print(raw_line)
                     continue
 
                 if raw_line.startswith("{") and raw_line.endswith("}"):
-                    if not self.frozen:
-                        data = json.loads(raw_line)
-                        self.last_frame = data
-            except Exception as e:
-                # Ošetření přerušeného JSONu na lince
+                    data = json.loads(raw_line)
+                    newest_frame = data
+            except Exception:
                 pass
+
+        if newest_frame is not None and not self.frozen:
+            self.last_frame = newest_frame
 
     def draw_grid_and_rings(self):
         cx = WIN_SIZE // 2
