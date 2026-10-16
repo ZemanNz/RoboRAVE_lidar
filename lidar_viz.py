@@ -4,17 +4,18 @@ LIDAR_SVICKY_27 - Dvoupanelový vizualizér s interaktivními tlačítky (GUI)
 Autor: Antigravity & Nik
 
 Dva panely vedle sebe:
-  1. LEVÝ PANEL: Živý radar (Live LIDAR scan) v reálném čase.
+  1. LEVÝ PANEL: Živý radar (Live LIDAR scan) v reálném čase + původní přehledný HUD.
   2. PRAVÝ PANEL: Stabilní herní mapa (World Model - uzamčené 4 svíčky a 6 stěn).
 
-Interaktivní tlačítka (klikací myší i přes klávesnici):
-  - [FOV]: Přepínání 180° dopředný kužel / 360° celé pole (výchozí 180°)
-  - [ZOOM +/-]: Zvětšení / zmenšení zobrazení (zoom in / zoom out)
-  - [MIN DIST +/-]: Ořez mrtvé zóny senzoru
-  - [MAX DIST +/-]: Ořez stěn místnosti
-  - [INTENSITY +/-]: Práh odrazivosti
-  - [RESET MAPY]: Okamžité vymazání stabilní mapy (také se resetuje automaticky při každé změně parametrů!)
-  - [FREEZE]: Zmrazení obrazu
+Integrovaná tlačítka a klávesové zkratky:
+  - [FoV 180° / 360°] (klávesa F): Výchozí předních 180°
+  - [Zoom +/-] (klávesy +/- nebo kolečko myši): Zvětšení / zmenšení zobrazení
+  - [MinR +/-] (klávesy R / E): Práh mrtvé zóny
+  - [MaxR +/-] (klávesy T / G): Práh ořezu stěn místnosti
+  - [Int +/-] (klávesy I / K): Práh odrazivosti
+  - [Reset Mapy] (klávesa C): Vymazání a přepočet stabilní mapy
+  - [Zmrazit] (Mezerník): Zmrazení / odmrazení obrazu
+  - Kliknutí na radar: Inspekce přesných souřadnic bodu/objektu
 """
 
 import sys, os, time, json, math
@@ -23,20 +24,22 @@ import serial
 from serial.tools import list_ports
 
 # Rozměry
-PANEL_W     = 820
-PANEL_H     = 840
+PANEL_W     = 840
+PANEL_H     = 850
 WIN_W       = PANEL_W * 2
 WIN_H       = PANEL_H
 
 # Barvy
-BG_COLOR    = (13, 15, 19)
-GRID_COLOR  = (30, 34, 42)
-TEXT_COLOR  = (220, 225, 230)
-ACCENT_LIVE = (0, 210, 255)
-ACCENT_MAP  = (255, 200, 60)
-BTN_BG      = (22, 26, 34)
-BTN_BORDER  = (50, 60, 75)
-BTN_HOVER   = (35, 42, 55)
+BG_COLOR     = (18, 20, 24)
+GRID_COLOR   = (40, 45, 52)
+CIRCLE_COLOR = (55, 62, 75)
+TEXT_COLOR   = (220, 225, 230)
+ACCENT_COLOR = (0, 210, 255)
+ACCENT_MAP   = (255, 200, 60)
+
+BTN_BG       = (20, 25, 33)
+BTN_BORDER   = (50, 62, 78)
+BTN_HOVER    = (35, 48, 65)
 
 def get_serial_port():
     if len(sys.argv) > 1: return sys.argv[1]
@@ -50,10 +53,10 @@ def get_baudrate():
     return 921600
 
 # ============================================================
-#  Trida pro tlacitko v GUI
+#  Třída pro interaktivní tlačítko v GUI
 # ============================================================
 class Button:
-    def __init__(self, rect, label, action_tag, col_accent=ACCENT_LIVE):
+    def __init__(self, rect, label, action_tag, col_accent=ACCENT_COLOR):
         self.rect = pygame.Rect(rect)
         self.label = label
         self.action_tag = action_tag
@@ -66,7 +69,7 @@ class Button:
         border_col = self.col_accent if self.hovered else BTN_BORDER
         pygame.draw.rect(screen, border_col, self.rect, 1, border_radius=4)
 
-        lbl = font.render(self.label, True, (240, 240, 245) if self.hovered else (180, 190, 205))
+        lbl = font.render(self.label, True, (245, 245, 250) if self.hovered else (190, 200, 215))
         lx = self.rect.centerx - lbl.get_width() // 2
         ly = self.rect.centery - lbl.get_height() // 2
         screen.blit(lbl, (lx, ly))
@@ -79,7 +82,7 @@ class Button:
 
 
 # ============================================================
-#  Trida pro akumulaci a stabilitu herniho pole (World Model)
+#  Třída pro stabilní herní mapu (World Model)
 # ============================================================
 class StableFieldModel:
     def __init__(self):
@@ -127,7 +130,7 @@ class StableFieldModel:
 
         self.candles = [c for c in self.candles if c['missed'] < 25 or (c['hits'] > 15 and c['missed'] < 80)]
 
-        # 2. STĚNY
+        # 2. STĚNY (párování do 140 mm)
         matched_w = set()
         for lw in live_walls:
             x1, y1, x2, y2 = lw[0], lw[1], lw[2], lw[3]
@@ -199,7 +202,9 @@ class DualLidarVisualizer:
         self.min_range = 130
         self.max_range = 2400
         self.min_intensity = 15
-        self.view_span_mm = 2800.0  # Měřítko zoomu
+        self.view_span_mm = 3500.0  # Měřítko zoomu (odpovídá 3.5 m poloměru)
+
+        self.selected_object = None
 
         self.last_frame = {
             "fps": 0.0, "pts": 0, "calc_us": 0, "heap": 0, "crc_err": 0,
@@ -222,34 +227,38 @@ class DualLidarVisualizer:
             self.font_bold = pygame.font.SysFont(None, 17)
             self.font_big  = pygame.font.SysFont(None, 21)
 
-        # Vytvoření tlačítek GUI
+        # Inicializace tlačítek GUI
         self.buttons = []
         self.init_buttons()
 
         self.connect_serial()
-        # Pošleme výchozí 180° režim do ESP32
+        # Nastavení 180° výchozího režimu do ESP32
         self.send_cmd(f"FOV 1")
         self.send_cmd(f"RANGE {self.min_range} {self.max_range}")
 
     def init_buttons(self):
-        # Spodní lišta tlačítek pod levým panelem
-        y_row1 = PANEL_H - 105
-        y_row2 = PANEL_H - 65
+        """Umístění tlačítek přímo do panelu ovládání v levém dolním rohu."""
+        self.buttons.clear()
+        
+        # Řádek 1 (y = PANEL_H - 140): FoV, Freeze, Zoom+, Zoom-, Reset Mapy
+        y_r1 = PANEL_H - 142
+        self.buttons.append(Button((25,  y_r1, 120, 28), "FoV: 180°", "TOGGLE_FOV", ACCENT_COLOR))
+        self.buttons.append(Button((155, y_r1, 95,  28), "Zmrazit", "FREEZE", ACCENT_COLOR))
+        self.buttons.append(Button((260, y_r1, 65,  28), "Zoom +", "ZOOM_IN", ACCENT_COLOR))
+        self.buttons.append(Button((330, y_r1, 65,  28), "Zoom -", "ZOOM_OUT", ACCENT_COLOR))
+        self.buttons.append(Button((405, y_r1, 125, 28), "Reset Map (C)", "RESET_MAP", ACCENT_MAP))
 
-        # Řádek 1: FOV, Zoom, Freeze, Reset Mapy
-        self.buttons.append(Button((20,  y_row1, 130, 32), "FoV: 180°", "TOGGLE_FOV", ACCENT_LIVE))
-        self.buttons.append(Button((160, y_row1, 95, 32), "Zoom +", "ZOOM_IN", ACCENT_LIVE))
-        self.buttons.append(Button((265, y_row1, 95, 32), "Zoom -", "ZOOM_OUT", ACCENT_LIVE))
-        self.buttons.append(Button((370, y_row1, 110, 32), "Zmrazit", "FREEZE", ACCENT_LIVE))
-        self.buttons.append(Button((490, y_row1, 160, 32), "RESET MAPY (C)", "RESET_MAP", ACCENT_MAP))
+        # Řádek 2 (y = PANEL_H - 104): Min Range a Max Range tlačítka +/-
+        y_r2 = PANEL_H - 105
+        self.buttons.append(Button((180, y_r2, 32, 24), "-50", "MINR_DEC", ACCENT_COLOR))
+        self.buttons.append(Button((216, y_r2, 32, 24), "+50", "MINR_INC", ACCENT_COLOR))
+        self.buttons.append(Button((440, y_r2, 42, 24), "-200", "MAXR_DEC", ACCENT_COLOR))
+        self.buttons.append(Button((486, y_r2, 42, 24), "+200", "MAXR_INC", ACCENT_COLOR))
 
-        # Řádek 2: Min Range, Max Range, Intenzita
-        self.buttons.append(Button((20,  y_row2, 100, 32), "MinR -50", "MINR_DEC", ACCENT_LIVE))
-        self.buttons.append(Button((125, y_row2, 100, 32), "MinR +50", "MINR_INC", ACCENT_LIVE))
-        self.buttons.append(Button((235, y_row2, 105, 32), "MaxR -200", "MAXR_DEC", ACCENT_LIVE))
-        self.buttons.append(Button((345, y_row2, 105, 32), "MaxR +200", "MAXR_INC", ACCENT_LIVE))
-        self.buttons.append(Button((460, y_row2, 90, 32), "Int -5", "INT_DEC", ACCENT_LIVE))
-        self.buttons.append(Button((555, y_row2, 90, 32), "Int +5", "INT_INC", ACCENT_LIVE))
+        # Řádek 3 (y = PANEL_H - 72): Intenzita tlačítka +/-
+        y_r3 = PANEL_H - 72
+        self.buttons.append(Button((180, y_r3, 32, 24), "-5", "INT_DEC", ACCENT_COLOR))
+        self.buttons.append(Button((216, y_r3, 32, 24), "+5", "INT_INC", ACCENT_COLOR))
 
     def connect_serial(self):
         try:
@@ -269,13 +278,13 @@ class DualLidarVisualizer:
             except: pass
 
     def on_parameter_changed(self):
-        """Vždy když se změní nastavení filtrů/dosahu/FoV, vygeneruje se nová mapa."""
+        """Vždy při změně nastavení filtrů/dosahu/FoV se vygeneruje čistá nová mapa."""
         self.model.reset()
-        print("[MAPA] Parametry změněny -> vygenerována nová čistá mapa.")
+        print("[MAPA] Parametry upraveny -> stabilní mapa resetována a přepočítává se.")
 
     def to_screen(self, x_mm, y_mm, panel_offset_x):
         cx = panel_offset_x + PANEL_W / 2.0
-        cy = PANEL_H / 2.0 - 20
+        cy = PANEL_H / 2.0
         scale = (PANEL_W / 2.0) / self.view_span_mm
         sx = int(cx + x_mm * scale)
         sy = int(cy - y_mm * scale)
@@ -304,10 +313,10 @@ class DualLidarVisualizer:
         elif tag == "ZOOM_IN":
             self.view_span_mm = max(1200.0, self.view_span_mm - 300.0)
         elif tag == "ZOOM_OUT":
-            self.view_span_mm = min(5000.0, self.view_span_mm + 300.0)
+            self.view_span_mm = min(6000.0, self.view_span_mm + 300.0)
         elif tag == "FREEZE":
             self.frozen = not self.frozen
-            self.buttons[3].label = "Odmrazit" if self.frozen else "Zmrazit"
+            self.buttons[1].label = "Odmrazit" if self.frozen else "Zmrazit"
         elif tag == "RESET_MAP":
             self.on_parameter_changed()
         elif tag == "MINR_DEC":
@@ -335,21 +344,59 @@ class DualLidarVisualizer:
             self.send_cmd(f"INTENSITY {self.min_intensity}")
             self.on_parameter_changed()
 
+    def handle_click(self, pos):
+        if pos[0] >= PANEL_W:
+            return  # Klik v pravém panelu neprovádí inspekci bodů radaru
+        cx = PANEL_W / 2.0
+        cy = PANEL_H / 2.0
+        scale = (PANEL_W / 2.0) / self.view_span_mm
+        click_x_mm = (pos[0] - cx) / scale
+        click_y_mm = -(pos[1] - cy) / scale
+
+        best_dist = 999999.0
+        best_obj = None
+
+        # Svíčky
+        for c in self.last_frame.get("candles", []):
+            dx = c[0] - click_x_mm
+            dy = c[1] - click_y_mm
+            d = math.hypot(dx, dy)
+            if d < best_dist:
+                best_dist = d
+                best_obj = (c[0], c[1], math.hypot(c[0], c[1]))
+
+        # Stěny
+        for w in self.last_frame.get("walls", []):
+            mx = (w[0] + w[2]) / 2.0
+            my = (w[1] + w[3]) / 2.0
+            dx = mx - click_x_mm
+            dy = my - click_y_mm
+            d = math.hypot(dx, dy)
+            if d < best_dist:
+                best_dist = d
+                best_obj = (mx, my, math.hypot(mx, my))
+
+        if best_dist < 400: # V dosahu kliku
+            self.selected_object = best_obj
+        else:
+            self.selected_object = (click_x_mm, click_y_mm, math.hypot(click_x_mm, click_y_mm))
+
     def draw_panel_decorations(self, offset_x, title, accent_col):
         cx = offset_x + PANEL_W // 2
-        cy = PANEL_H // 2 - 20
+        cy = PANEL_H // 2
         scale = (PANEL_W / 2.0) / self.view_span_mm
 
-        pygame.draw.rect(self.screen, (22, 26, 32), (offset_x + 2, 2, PANEL_W - 4, PANEL_H - 4), 1)
+        # Vnější ohraničení panelu
+        pygame.draw.rect(self.screen, (25, 30, 38), (offset_x + 2, 2, PANEL_W - 4, PANEL_H - 4), 1)
 
         # Osy
         pygame.draw.line(self.screen, GRID_COLOR, (offset_x, cy), (offset_x + PANEL_W, cy), 1)
         pygame.draw.line(self.screen, GRID_COLOR, (cx, 0), (cx, PANEL_H), 1)
 
-        # Orientační kruhy
-        for d_m in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]:
+        # Orientační kruhy (po 0.5 m až do 3.5 m)
+        for d_m in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]:
             r_px = int(d_m * 1000.0 * scale)
-            c = (42, 50, 62) if d_m in [1.0, 2.0] else (24, 28, 35)
+            c = CIRCLE_COLOR if d_m in [1.0, 2.0, 3.0] else (30, 34, 42)
             pygame.draw.circle(self.screen, c, (cx, cy), r_px, 1)
             lbl = self.font_main.render(f"{d_m:.1f} m", True, (90, 100, 115))
             self.screen.blit(lbl, (cx + 5, cy - r_px - 8))
@@ -360,18 +407,14 @@ class DualLidarVisualizer:
         p2 = self.to_screen( hw, 0, offset_x)
         p3 = self.to_screen( hw, 3500, offset_x)
         p4 = self.to_screen(-hw, 3500, offset_x)
-        pygame.draw.polygon(self.screen, (22, 38, 30), [p1, p2, p3, p4], 1)
+        pygame.draw.polygon(self.screen, (28, 44, 34), [p1, p2, p3, p4], 1)
 
-        # Robot
-        pygame.draw.circle(self.screen, (0, 180, 255), (cx, cy), 7)
-        pygame.draw.line(self.screen, (0, 255, 180), (cx, cy), (cx, cy - 30), 3)
-
-        # Nadpis panelu
-        t_surf = self.font_big.render(title, True, accent_col)
-        self.screen.blit(t_surf, (offset_x + 20, 16))
+        # Robot ve středu (modrý kruh se směrovou šipkou)
+        pygame.draw.circle(self.screen, (0, 180, 255), (cx, cy), 8)
+        pygame.draw.line(self.screen, (0, 255, 180), (cx, cy), (cx, cy - 32), 3)
 
     def draw_left_live(self):
-        self.draw_panel_decorations(0, "1. ZIVY RADAR (REAL-TIME)", ACCENT_LIVE)
+        self.draw_panel_decorations(0, "1. ZIVY RADAR (REAL-TIME)", ACCENT_COLOR)
         scale = (PANEL_W / 2.0) / self.view_span_mm
 
         # Body mračna
@@ -395,35 +438,104 @@ class DualLidarVisualizer:
             pygame.draw.circle(self.screen, (100, 255, 160), p2, 3)
             mx = (p1[0] + p2[0]) // 2
             my = (p1[1] + p2[1]) // 2
-            lbl = self.font_main.render(f"{int(w[4])}mm", True, (0, 255, 120))
+            lbl = self.font_main.render(f"STĚNA {int(w[4])}mm", True, (0, 255, 120))
             self.screen.blit(lbl, (mx + 5, my - 6))
 
         # Živé svíčky
         for c in self.last_frame.get("candles", []):
             scx, scy = self.to_screen(c[0], c[1], 0)
             r_ring = int(200.0 * scale)
-            pygame.draw.circle(self.screen, (255, 60, 60, 50), (scx, scy), max(4, r_ring), 1)
-            pygame.draw.circle(self.screen, (255, 50, 50), (scx, scy), 6)
-            pygame.draw.circle(self.screen, (255, 230, 200), (scx, scy), 2)
+            pygame.draw.circle(self.screen, (255, 80, 80, 50), (scx, scy), max(4, r_ring), 1)
+            pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 6)
+            pygame.draw.circle(self.screen, (255, 220, 220), (scx, scy), 2)
             d = int(math.hypot(c[0], c[1]))
-            lbl = self.font_bold.render(f"SVICKA ({d}mm)", True, (255, 80, 80))
+            lbl = self.font_bold.render(f"SVÍČKA ({d}mm)", True, (255, 80, 80))
             self.screen.blit(lbl, (scx + 10, scy - 10))
 
-        # Parametry a telemetrie nahoře
-        f = self.last_frame
-        fps = f.get("fps", 0.0)
-        calc_us = f.get("calc_us", 0)
-        pts = f.get("pts", 0)
-        nw = len(f.get("walls", []))
-        nc = len(f.get("candles", []))
+        # ============================================================
+        # 1. PŮVODNÍ TELEMETRICKÝ PANEL (V LEVÉM HORNÍM ROHU)
+        # ============================================================
+        panel = pygame.Surface((340, 235))
+        panel.set_alpha(215)
+        panel.fill((10, 12, 16))
+        self.screen.blit(panel, (15, 15))
+        pygame.draw.rect(self.screen, (40, 48, 60), (15, 15, 340, 235), 1)
 
-        # Stavový pruh filtrů vlevo nahoře
-        p_str = f"FPS: {fps:.1f} Hz | Calc: {calc_us}µs | Pts: {pts} | Dosah: {self.min_range}-{self.max_range}mm | Int: {self.min_intensity}"
-        self.screen.blit(self.font_main.render(p_str, True, (0, 210, 255)), (20, 42))
+        f = self.last_frame
+        fps      = f.get("fps", 0.0)
+        pts      = f.get("pts", 0)
+        calc_us  = f.get("calc_us", 0)
+        heap     = f.get("heap", 0)
+        crc_err  = f.get("crc_err", 0)
+        n_walls  = len(f.get("walls", []))
+        n_cands  = len(f.get("candles", []))
+
+        y = 25
+        title = self.font_big.render("ESP32 D200 DETEKTOR", True, ACCENT_COLOR)
+        self.screen.blit(title, (25, y)); y += 26
+
+        def row(label, val, col=(200, 210, 225)):
+            nonlocal y
+            t1 = self.font_main.render(label, True, (130, 140, 155))
+            t2 = self.font_bold.render(str(val), True, col)
+            self.screen.blit(t1, (25, y))
+            self.screen.blit(t2, (180, y))
+            y += 20
+
+        row("Frekvence skenu:", f"{fps:.1f} Hz", (100, 255, 120) if fps > 4.5 else (255, 150, 0))
+        row("Filtrované body:", f"{pts} bodů")
+        row("Výpočet na ESP32:", f"{calc_us} µs ({calc_us/1000.0:.2f} ms)", (0, 220, 255))
+        row("Volná RAM ESP32:", f"{heap // 1024} kB")
+        row("CRC8 Chyby:", f"{crc_err}", (255, 80, 80) if crc_err > 0 else (120, 200, 120))
+        row("Nalezené stěny:", f"{n_walls} (zeleně)", (0, 255, 100))
+        row("Nalezené svíčky:", f"{n_cands} (červeně)", (255, 80, 80))
+
+        # Inspekce vybraného bodu (vpravo nahoře levého panelu)
+        if self.selected_object:
+            sel_panel = pygame.Surface((310, 68))
+            sel_panel.set_alpha(220)
+            sel_panel.fill((25, 20, 10))
+            self.screen.blit(sel_panel, (PANEL_W - 325, 15))
+            pygame.draw.rect(self.screen, (255, 180, 0), (PANEL_W - 325, 15, 310, 68), 1)
+
+            st = self.font_bold.render("INSPEKCE VYBRANÉHO BODU:", True, (255, 200, 50))
+            self.screen.blit(st, (PANEL_W - 315, 22))
+            sx_mm, sy_mm, s_dist = self.selected_object
+            s_info = self.font_main.render(f"X: {sx_mm:.0f} mm, Y: {sy_mm:.0f} mm | R: {s_dist:.0f} mm", True, (255, 255, 255))
+            self.screen.blit(s_info, (PANEL_W - 315, 45))
+
+        # ============================================================
+        # 2. PANEL OVLÁDÁNÍ A TLAČÍTEK (V LEVÉM DOLNÍM ROHU)
+        # ============================================================
+        cmd_panel = pygame.Surface((540, 168))
+        cmd_panel.set_alpha(220)
+        cmd_panel.fill((10, 12, 16))
+        self.screen.blit(cmd_panel, (15, PANEL_H - 180))
+        pygame.draw.rect(self.screen, (40, 48, 60), (15, PANEL_H - 180, 540, 168), 1)
+
+        cy = PANEL_H - 173
+        h_title = self.font_bold.render("LADĚNÍ ZA BĚHU (PŘÍKAZY DO ESP32):", True, (240, 200, 80))
+        self.screen.blit(h_title, (25, cy))
+
+        # Hodnoty dosahu a intenzity
+        r_lbl = self.font_main.render(f"Min dosah: {self.min_range} mm", True, (180, 190, 205))
+        self.screen.blit(r_lbl, (25, PANEL_H - 100))
+
+        r_max_lbl = self.font_main.render(f"Max dosah: {self.max_range} mm", True, (180, 190, 205))
+        self.screen.blit(r_max_lbl, (260, PANEL_H - 100))
+
+        int_lbl = self.font_main.render(f"Min intenzita: {self.min_intensity}", True, (180, 190, 205))
+        self.screen.blit(int_lbl, (25, PANEL_H - 68))
+
+        zoom_lbl = self.font_main.render(f"Zoom: ±300mm (nebo kolečko myši)", True, (135, 145, 160))
+        self.screen.blit(zoom_lbl, (260, PANEL_H - 68))
+
+        hint_lbl = self.font_main.render("• Změna parametrů vyčistí a nově vygeneruje stabilní mapu", True, (110, 125, 145))
+        self.screen.blit(hint_lbl, (25, PANEL_H - 36))
 
         # Vykreslení tlačítek
         for btn in self.buttons:
-            btn.draw(self.screen, self.font_bold)
+            btn.draw(self.screen, self.font_main if len(btn.label) > 7 else self.font_bold)
 
     def draw_right_stable(self):
         self.draw_panel_decorations(PANEL_W, "2. STABILNI MAPA HRISTE (WORLD MODEL)", ACCENT_MAP)
@@ -441,7 +553,7 @@ class DualLidarVisualizer:
             pygame.draw.circle(self.screen, (150, 255, 180), p2, 5)
             mx = (p1[0] + p2[0]) // 2
             my = (p1[1] + p2[1]) // 2
-            lbl = self.font_bold.render(f"STENA {int(w['len'])}mm", True, (80, 255, 140))
+            lbl = self.font_bold.render(f"STĚNA {int(w['len'])}mm", True, (80, 255, 140))
             self.screen.blit(lbl, (mx + 8, my - 8))
 
         # Stabilní svíčky
@@ -453,7 +565,7 @@ class DualLidarVisualizer:
             pygame.draw.circle(self.screen, (255, 240, 180), (scx, scy), 3)
 
             d = int(math.hypot(c['x'], c['y']))
-            lbl = self.font_bold.render(f"SVICKA #{idx+1} ({d}mm)", True, (255, 100, 100))
+            lbl = self.font_bold.render(f"SVÍČKA #{idx+1} ({d}mm)", True, (255, 100, 100))
             self.screen.blit(lbl, (scx + 12, scy - 12))
 
         # Trasa
@@ -481,19 +593,28 @@ class DualLidarVisualizer:
                 mid_y = (p_from[1] + p_to[1]) // 2
                 self.screen.blit(self.font_bold.render(f"-> {i}", True, (255, 230, 80)), (mid_x + 4, mid_y - 6))
 
-        # Info pruh pravého panelu
-        stat_str = f"Potvrzeno: {len(conf_candles)}/4 svicek | {len(conf_walls)}/6 sten | Skenu v modelovem poli: {self.model.total_scans}"
-        self.screen.blit(self.font_bold.render(stat_str, True, ACCENT_MAP), (PANEL_W + 20, 42))
+        # Horní panel stavu pravého okna
+        stat_box = pygame.Surface((490, 52))
+        stat_box.set_alpha(215)
+        stat_box.fill((10, 12, 16))
+        self.screen.blit(stat_box, (PANEL_W + 15, 15))
+        pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, 15, 490, 52), 1)
+
+        t_stat = self.font_big.render("STABILNÍ REKONSTRUKCE HŘIŠTĚ", True, ACCENT_MAP)
+        self.screen.blit(t_stat, (PANEL_W + 25, 21))
+        stat_str = f"Potvrzeno: {len(conf_candles)}/4 svíček | {len(conf_walls)}/6 stěn | Skenů: {self.model.total_scans}"
+        self.screen.blit(self.font_main.render(stat_str, True, (210, 215, 225)), (PANEL_W + 25, 43))
 
         # Nápověda vpravo dole
-        tip_box = pygame.Surface((340, 60))
-        tip_box.set_alpha(180)
+        tip_box = pygame.Surface((380, 80))
+        tip_box.set_alpha(210)
         tip_box.fill((10, 12, 16))
-        self.screen.blit(tip_box, (PANEL_W + 20, PANEL_H - 80))
-        pygame.draw.rect(self.screen, (50, 45, 30), (PANEL_W + 20, PANEL_H - 80, 340, 60), 1)
-        self.screen.blit(self.font_main.render("• Mapa se generuje ze souhlasnych mereni", True, (200, 205, 215)), (PANEL_W + 30, PANEL_H - 72))
-        self.screen.blit(self.font_main.render("• Pri zmene parametru se vycisti a prepocita", True, (240, 200, 80)), (PANEL_W + 30, PANEL_H - 52))
-        self.screen.blit(self.font_main.render("• Klavesa [C] pro okamzity manualni reset", True, (160, 170, 185)), (PANEL_W + 30, PANEL_H - 34))
+        self.screen.blit(tip_box, (PANEL_W + 15, PANEL_H - 95))
+        pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, PANEL_H - 95, 380, 80), 1)
+        self.screen.blit(self.font_bold.render("PRINCIP DLOUHODOBÉ MAPY:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 87))
+        self.screen.blit(self.font_main.render("• Akumuluje stabilní shodná měření bez šumu", True, (200, 205, 215)), (PANEL_W + 25, PANEL_H - 67))
+        self.screen.blit(self.font_main.render("• Při změně parametrů se automaticky vyčistí", True, (240, 200, 80)), (PANEL_W + 25, PANEL_H - 49))
+        self.screen.blit(self.font_main.render("• Klávesa [C] nebo tlačítko pro okamžitý manuální reset", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 31))
 
     def run(self):
         while self.running:
@@ -506,10 +627,14 @@ class DualLidarVisualizer:
                     self.running = False
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
+                        btn_clicked = False
                         for btn in self.buttons:
                             if btn.is_clicked(event.pos):
                                 self.handle_action(btn.action_tag)
+                                btn_clicked = True
                                 break
+                        if not btn_clicked:
+                            self.handle_click(event.pos)
                     elif event.button == 4: # Kolečko myši nahoru (zoom in)
                         self.handle_action("ZOOM_IN")
                     elif event.button == 5: # Kolečko myši dolů (zoom out)
@@ -548,7 +673,7 @@ class DualLidarVisualizer:
             self.draw_right_stable()
 
             # Vertikální předěl mezi panely
-            pygame.draw.line(self.screen, (50, 60, 75), (PANEL_W, 0), (PANEL_W, WIN_H), 2)
+            pygame.draw.line(self.screen, (40, 48, 60), (PANEL_W, 0), (PANEL_W, WIN_H), 2)
 
             pygame.display.flip()
             self.clock.tick(60)
