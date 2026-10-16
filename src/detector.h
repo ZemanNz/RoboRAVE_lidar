@@ -29,11 +29,11 @@ struct WallParams {
 };
 
 struct CandleParams {
-    float min_diameter_mm = 25.0f;
-    float max_diameter_mm = 75.0f;
-    int min_points = 3;
+    float min_diameter_mm = 20.0f;
+    float max_diameter_mm = 80.0f;
+    int min_points = 2;
     int max_points = 8;
-    float max_neighbor_dist_mm = 45.0f;
+    float max_neighbor_dist_mm = 55.0f;
     float min_dist_to_wall_mm = 40.0f;
 };
 
@@ -251,15 +251,37 @@ public:
         }
 
         // ========================================================
+        // 4.5 KROK: DETEKCE ROHŮ ZE DVOU KOLMÝCH STĚN (L-ROHY)
+        // A ZÁCHRANA/EXTRAKCE ROHOVÉ SVÍČKY (PRŮSEČÍK KOLMIC 2 STĚN)
+        // V pravidlech Kybernoidu stojí svíčka v 90° rohu ze dvou stěn.
+        // Hledáme L-rohy, spočteme průsečík nosných přímek a prozkoumáme kapse rohu.
+        // ========================================================
+        static bool isCornerCandle[MAX_DETECTED_CANDLES];
+        for (int c = 0; c < MAX_DETECTED_CANDLES; c++) isCornerCandle[c] = false;
+
+        extractCornerCandles(points, count, outWalls, wallCount,
+                             outCandles, candleCount, isCornerCandle);
+
+        // ========================================================
         // 5. KROK: Validace svíček vůči stěnám
         // Svíčka NESMÍ ležet v dráze stěny (nesmí být v přímce stěny ani na jejím rohu).
         // Skutečná svíčka stojí kolmo před stěnou s dostatečným odstupem (d_perp >= 55 mm).
+        // Rohová svíčka je před vyřazením chráněna, protože stojí uvnitř 90° rohu.
         // ========================================================
         static Candle validCandles[MAX_DETECTED_CANDLES];
         int validCandleCount = 0;
 
         for (int c = 0; c < candleCount; c++) {
             const Candle& cand = outCandles[c];
+
+            // Rohová svíčka je ověřena vůči rohu a nesmí být vyřazena chodbou
+            if (isCornerCandle[c]) {
+                if (validCandleCount < MAX_DETECTED_CANDLES) {
+                    validCandles[validCandleCount++] = cand;
+                }
+                continue;
+            }
+
             bool inWallPath = false;
 
             for (int w = 0; w < wallCount; w++) {
@@ -322,6 +344,133 @@ public:
     }
 
 private:
+    // Detekce rohů tvořených dvěma na sebe kolmými stěnami (L-rohy) a záchrana rohové svíčky
+    // Využívá průsečík kolmic obou stěn pro přesnou lokalizaci svíčky
+    static void extractCornerCandles(const LidarPoint* points, int count,
+                                     const WallSegment* walls, int wallCount,
+                                     Candle* outCandles, int& candleCount,
+                                     bool* isCornerCandle)
+    {
+        for (int i = 0; i < wallCount; i++) {
+            for (int j = i + 1; j < wallCount; j++) {
+                const WallSegment& w1 = walls[i];
+                const WallSegment& w2 = walls[j];
+                if (w1.length_mm < 160.0f || w2.length_mm < 160.0f) continue;
+
+                float u1x = (w1.x2 - w1.x1) / w1.length_mm;
+                float u1y = (w1.y2 - w1.y1) / w1.length_mm;
+                float u2x = (w2.x2 - w2.x1) / w2.length_mm;
+                float u2y = (w2.y2 - w2.y1) / w2.length_mm;
+
+                // 1. Kontrola kolmosti (skalární součin u1 a u2 kolem 0, tolerance cca +-25°)
+                float dot = fabsf(u1x * u2x + u1y * u2y);
+                if (dot > 0.42f) continue;
+
+                // 2. Vzdálenost nejbližších konců obou stěn (musí tvořit roh)
+                float d11 = hypotf(w1.x1 - w2.x1, w1.y1 - w2.y1);
+                float d12 = hypotf(w1.x1 - w2.x2, w1.y1 - w2.y2);
+                float d21 = hypotf(w1.x2 - w2.x1, w1.y2 - w2.y1);
+                float d22 = hypotf(w1.x2 - w2.x2, w1.y2 - w2.y2);
+                float minEndDist = fminf(fminf(d11, d12), fminf(d21, d22));
+                if (minEndDist > 250.0f) continue;
+
+                // 3. Průsečík nosných přímek obou stěn (Corner Point Pc)
+                float a1 = -u1y, b1 = u1x, c1 = -(a1 * w1.x1 + b1 * w1.y1);
+                float a2 = -u2y, b2 = u2x, c2 = -(a2 * w2.x1 + b2 * w2.y1);
+                float det = a1 * b2 - a2 * b1;
+                if (fabsf(det) < 0.1f) continue;
+
+                float pcX = (b1 * c2 - b2 * c1) / det;
+                float pcY = (c1 * a2 - c2 * a1) / det;
+
+                // 4. Ramena obou stěn směrem OD rohu do pole
+                float distW1_1 = hypotf(w1.x1 - pcX, w1.y1 - pcY);
+                float distW1_2 = hypotf(w1.x2 - pcX, w1.y2 - pcY);
+                float farW1X = (distW1_1 > distW1_2) ? w1.x1 : w1.x2;
+                float farW1Y = (distW1_1 > distW1_2) ? w1.y1 : w1.y2;
+                float lenV1 = hypotf(farW1X - pcX, farW1Y - pcY);
+                if (lenV1 < 30.0f) continue;
+                float arm1X = (farW1X - pcX) / lenV1;
+                float arm1Y = (farW1Y - pcY) / lenV1;
+
+                float distW2_1 = hypotf(w2.x1 - pcX, w2.y1 - pcY);
+                float distW2_2 = hypotf(w2.x2 - pcX, w2.y2 - pcY);
+                float farW2X = (distW2_1 > distW2_2) ? w2.x1 : w2.x2;
+                float farW2Y = (distW2_1 > distW2_2) ? w2.y1 : w2.y2;
+                float lenV2 = hypotf(farW2X - pcX, farW2Y - pcY);
+                if (lenV2 < 30.0f) continue;
+                float arm2X = (farW2X - pcX) / lenV2;
+                float arm2Y = (farW2Y - pcY) / lenV2;
+
+                // 5. Zkontrolujeme, zda v tomto rohu již máme svíčku z 1. kroku
+                bool candleFound = false;
+                for (int c = 0; c < candleCount; c++) {
+                    float cdx = outCandles[c].x - pcX;
+                    float cdy = outCandles[c].y - pcY;
+                    float cdist = hypotf(cdx, cdy);
+                    if (cdist < 350.0f) {
+                        float ct1 = cdx * arm1X + cdy * arm1Y;
+                        float ct2 = cdx * arm2X + cdy * arm2Y;
+                        if (ct1 > 20.0f && ct2 > 20.0f) {
+                            isCornerCandle[c] = true;
+                            candleFound = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (candleFound) continue;
+
+                // 6. Prohledáme body LiDARu ve vnitřní rohové kapse (průsečík kolmic obou stěn)
+                float sumX = 0.0f, sumY = 0.0f;
+                int inlierCount = 0;
+
+                for (int k = 0; k < count; k++) {
+                    if (!points[k].valid) continue;
+                    float px = points[k].x;
+                    float py = points[k].y;
+
+                    float rdx = px - pcX;
+                    float rdy = py - pcY;
+                    float rdist = hypotf(rdx, rdy);
+                    if (rdist < 60.0f || rdist > 350.0f) continue;
+
+                    // Projekce do vnitřního kvadrantu rohu
+                    float t1 = rdx * arm1X + rdy * arm1Y;
+                    float t2 = rdx * arm2X + rdy * arm2Y;
+                    if (t1 < 20.0f || t2 < 20.0f) continue;
+
+                    // Vzdálenost od nosných přímek stěn
+                    float d1 = fabsf((px - w1.x1) * (-u1y) + (py - w1.y1) * (u1x));
+                    float d2 = fabsf((px - w2.x1) * (-u2y) + (py - w2.y1) * (u2x));
+                    if (d1 < 40.0f || d1 > 280.0f || d2 < 40.0f || d2 > 280.0f) continue;
+
+                    sumX += px;
+                    sumY += py;
+                    inlierCount++;
+                }
+
+                // Pokud máme volné místo pro svíčku (max 4 svíčky na poli)
+                if (candleCount < MAX_DETECTED_CANDLES) {
+                    Candle nc;
+                    if (inlierCount >= 1) {
+                        nc.x = sumX / (float)inlierCount;
+                        nc.y = sumY / (float)inlierCount;
+                        nc.point_count = inlierCount;
+                    } else {
+                        // Geometrická syntéza z průsečíku kolmic stěn (střed rohu ~130 mm od stěn)
+                        nc.x = pcX + 130.0f * arm1X + 130.0f * arm2X;
+                        nc.y = pcY + 130.0f * arm1Y + 130.0f * arm2Y;
+                        nc.point_count = 0;
+                    }
+                    nc.diameter_mm = 50.0f;
+                    isCornerCandle[candleCount] = true;
+                    outCandles[candleCount++] = nc;
+                }
+            }
+        }
+    }
+
     // Cílené prokládání stěn v okolí svíčky
     // Najde i stěnu přerušenou svíčkou (stínem) na dvě části
     static void findWallsAroundCandle(const LidarPoint* points, const int* idxs, int nIdxs,
