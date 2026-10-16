@@ -367,9 +367,37 @@ class DualLidarVisualizer:
         pygame.draw.line(self.screen, (200, 60, 240), ep1, p1, 1)
         pygame.draw.line(self.screen, (200, 60, 240), p2, ep2, 1)
 
+    def draw_aiming_sector(self, offset_x):
+        r_mm = min(self.max_range, self.view_span_mm)
+        p_center = self.to_screen(0, 0, offset_x)
+
+        arc_pts = []
+        for deg in range(-10, 11, 2):
+            rad = math.radians(deg)
+            px, py = self.to_screen(r_mm * math.sin(rad), r_mm * math.cos(rad), offset_x)
+            arc_pts.append((px, py))
+
+        poly_pts = [p_center] + arc_pts + [p_center]
+
+        s = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
+        pygame.draw.polygon(s, (0, 150, 255, 30), [(pt[0] - offset_x, pt[1]) for pt in poly_pts])
+        pygame.draw.lines(s, (0, 210, 255, 150), False, [(pt[0] - offset_x, pt[1]) for pt in poly_pts], 1)
+
+        top_center = self.to_screen(0, r_mm, offset_x)
+        pygame.draw.line(s, (0, 230, 255, 90), (p_center[0] - offset_x, p_center[1]), (top_center[0] - offset_x, top_center[1]), 1)
+        self.screen.blit(s, (offset_x, 0))
+
+        lbl = self.font_main.render("ZÁMĚR ±10° (1. CÍL)", True, (0, 220, 255))
+        lx = top_center[0] - lbl.get_width() // 2
+        ly = max(180, top_center[1] - 18)
+        self.screen.blit(lbl, (lx, ly))
+
     def draw_left_live(self):
         self.draw_panel_decorations(0)
         scale = (PANEL_W / 2.0) / self.view_span_mm
+
+        # Modrý záměrný výsek 20° (+-10° dopředu)
+        self.draw_aiming_sector(0)
 
         # Body mračna
         cloud = self.last_frame.get("cloud", [])
@@ -400,12 +428,25 @@ class DualLidarVisualizer:
         for c in self.last_frame.get("candles", []):
             scx, scy = self.to_screen(c[0], c[1], 0)
             r_ring = int(200.0 * scale)
-            pygame.draw.circle(self.screen, (255, 80, 80, 50), (scx, scy), max(4, r_ring), 1)
-            pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 6)
-            pygame.draw.circle(self.screen, (255, 220, 220), (scx, scy), 2)
             d = int(math.hypot(c[0], c[1]))
-            lbl = self.font_bold.render(f"SVÍČKA ({d}mm)", True, (255, 80, 80))
-            self.screen.blit(lbl, (scx + 10, scy - 10))
+            ang_deg = math.degrees(math.atan2(c[0], c[1])) if c[1] != 0 else 0.0
+            in_sector = (abs(ang_deg) <= 10.0 and c[1] > 0)
+
+            if in_sector:
+                # Zvýraznění prioritního 1. cíle v záměrném výseku
+                pygame.draw.circle(self.screen, (0, 220, 255), (scx, scy), max(4, r_ring), 2)
+                pygame.draw.circle(self.screen, (0, 255, 255), (scx, scy), 8)
+                pygame.draw.circle(self.screen, (255, 255, 255), (scx, scy), 3)
+                pygame.draw.line(self.screen, (0, 255, 255), (scx - 14, scy), (scx + 14, scy), 1)
+                pygame.draw.line(self.screen, (0, 255, 255), (scx, scy - 14), (scx, scy + 14), 1)
+                lbl = self.font_bold.render(f"★ 1. CÍL ({d}mm, {ang_deg:+.1f}°)", True, (0, 240, 255))
+                self.screen.blit(lbl, (scx + 14, scy - 12))
+            else:
+                pygame.draw.circle(self.screen, (255, 80, 80, 50), (scx, scy), max(4, r_ring), 1)
+                pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 6)
+                pygame.draw.circle(self.screen, (255, 220, 220), (scx, scy), 2)
+                lbl = self.font_bold.render(f"SVÍČKA ({d}mm)", True, (255, 80, 80))
+                self.screen.blit(lbl, (scx + 10, scy - 10))
 
         # ============================================================
         # 1. PŮVODNÍ TELEMETRICKÝ PANEL (V LEVÉM HORNÍM ROHU)
@@ -484,6 +525,9 @@ class DualLidarVisualizer:
         self.draw_panel_decorations(PANEL_W)
         scale = (PANEL_W / 2.0) / self.view_span_mm
 
+        # Modrý záměrný výsek 20° (+-10° dopředu)
+        self.draw_aiming_sector(PANEL_W)
+
         conf_candles = self.model.get_confirmed_candles()
         conf_walls = self.model.get_confirmed_walls()
 
@@ -501,22 +545,42 @@ class DualLidarVisualizer:
             self.screen.blit(lbl, (mx + 8, my - 8))
 
         # Stabilní svíčky
+        target_cand = None
         for idx, c in enumerate(conf_candles):
             scx, scy = self.to_screen(c['x'], c['y'], PANEL_W)
             r_ring = int(200.0 * scale)
-            pygame.draw.circle(self.screen, (255, 80, 80), (scx, scy), max(4, r_ring), 2)
-            pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 8)
-            pygame.draw.circle(self.screen, (255, 240, 180), (scx, scy), 3)
-
             d = int(math.hypot(c['x'], c['y']))
-            lbl = self.font_bold.render(f"SVÍČKA #{idx+1} ({d}mm)", True, (255, 100, 100))
-            self.screen.blit(lbl, (scx + 12, scy - 12))
+            ang_deg = math.degrees(math.atan2(c['x'], c['y'])) if c['y'] != 0 else 0.0
+            in_sector = (abs(ang_deg) <= 10.0 and c['y'] > 0)
 
-        # Trasa mezi potvrzenými svíčkami
+            if in_sector:
+                if target_cand is None: target_cand = c
+                pygame.draw.circle(self.screen, (0, 220, 255), (scx, scy), max(4, r_ring), 2)
+                pygame.draw.circle(self.screen, (0, 255, 255), (scx, scy), 8)
+                pygame.draw.circle(self.screen, (255, 255, 255), (scx, scy), 3)
+                pygame.draw.line(self.screen, (0, 255, 255), (scx - 14, scy), (scx + 14, scy), 1)
+                pygame.draw.line(self.screen, (0, 255, 255), (scx, scy - 14), (scx, scy + 14), 1)
+                lbl = self.font_bold.render(f"★ 1. CÍL ({d}mm, {ang_deg:+.1f}°)", True, (0, 240, 255))
+                self.screen.blit(lbl, (scx + 14, scy - 12))
+            else:
+                pygame.draw.circle(self.screen, (255, 80, 80), (scx, scy), max(4, r_ring), 2)
+                pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 8)
+                pygame.draw.circle(self.screen, (255, 240, 180), (scx, scy), 3)
+                lbl = self.font_bold.render(f"SVÍČKA #{idx+1} ({d}mm)", True, (255, 100, 100))
+                self.screen.blit(lbl, (scx + 12, scy - 12))
+
+        # Trasa mezi potvrzenými svíčkami (1. cíl je svíčka v záměrném výseku)
         if len(conf_candles) >= 2:
             unvisited = list(conf_candles)
             route = [(0.0, 0.0)]
             curr = (0.0, 0.0)
+
+            # Pokud je detekována svíčka v záměrném výseku, navštívíme ji VŽDY jako první
+            if target_cand and target_cand in unvisited:
+                unvisited.remove(target_cand)
+                route.append((target_cand['x'], target_cand['y']))
+                curr = (target_cand['x'], target_cand['y'])
+
             while unvisited:
                 best_i = 0
                 best_d = 999999.0

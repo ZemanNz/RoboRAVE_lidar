@@ -298,6 +298,27 @@ public:
             outCandles[c] = validCandles[c];
         }
         candleCount = validCandleCount;
+
+        // ========================================================
+        // 6. KROK: Prioritizace svíčky v dopředném záměrném výseku (+-10° dopředu)
+        // Svíčka v tomto 20° výseku je primárním startovním cílem robota -> zařadíme ji jako #1
+        // ========================================================
+        int targetIdx = -1;
+        float minAngleDiff = 999.0f;
+        for (int c = 0; c < candleCount; c++) {
+            if (outCandles[c].y > 0.0f) {
+                float angDeg = fabsf(atan2f(outCandles[c].x, outCandles[c].y) * (180.0f / M_PI));
+                if (angDeg <= 10.0f && angDeg < minAngleDiff) {
+                    minAngleDiff = angDeg;
+                    targetIdx = c;
+                }
+            }
+        }
+        if (targetIdx > 0) {
+            Candle tmp = outCandles[0];
+            outCandles[0] = outCandles[targetIdx];
+            outCandles[targetIdx] = tmp;
+        }
     }
 
 private:
