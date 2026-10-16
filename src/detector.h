@@ -21,11 +21,11 @@
 
 struct WallParams {
     float expected_length_mm = 300.0f;
-    float max_length_mm = 330.0f;       // TVRDÝ STROP: nad 330 mm to NENÍ herní stěna!
-    float min_length_mm = 160.0f;       // Minimální detekovaná délka pro volnou stěnu
-    float max_point_dist_mm = 85.0f;    // Mezera mezi body
+    float max_length_mm = 360.0f;        // Tolerance: deska 300 mm se šikmým odrazem měří až 340-350 mm
+    float min_length_mm = 90.0f;         // Zmírněno pro zachycení i stíněného křídla za svíčkou
+    float max_point_dist_mm = 125.0f;    // Zvýšeno pro překlenutí stínu svíčky (cca 90-110 mm)
     float max_line_deviation_mm = 25.0f; // Max odchylka bodu od přímky
-    int min_points = 4;
+    int min_points = 3;                  // Stačí 3 body pro křídlo
 };
 
 struct CandleParams {
@@ -100,13 +100,13 @@ public:
             float cx = outCandles[c].x;
             float cy = outCandles[c].y;
 
-            // Vybereme body v okolí svíčky (100 až 400 mm od svíčky)
-            int localIdxs[60];
+            // Vybereme body v okolí svíčky (60 až 420 mm od svíčky)
+            int localIdxs[100];
             int localCount = 0;
-            for (int i = 0; i < count && localCount < 60; i++) {
+            for (int i = 0; i < count && localCount < 100; i++) {
                 if (!points[i].valid || usedInCandle[i]) continue;
                 float d = hypotf(points[i].x - cx, points[i].y - cy);
-                if (d >= 100.0f && d <= 400.0f) {
+                if (d >= 60.0f && d <= 420.0f) {
                     localIdxs[localCount++] = i;
                 }
             }
@@ -166,7 +166,7 @@ public:
 
         for (int i = 0; i < numCandidates; i++) {
             const WallSegment& w1 = candidates[i];
-            if (w1.length_mm > wParams.max_length_mm || w1.length_mm < 160.0f) continue;
+            if (w1.length_mm > wParams.max_length_mm || w1.length_mm < 130.0f) continue;
 
             float m1x = (w1.x1 + w1.x2) * 0.5f;
             float m1y = (w1.y1 + w1.y2) * 0.5f;
@@ -392,8 +392,8 @@ private:
             float dev = fabsf(vx * nx + vy * ny);
             if (dev <= wp.max_line_deviation_mm) {
                 float proj = vx * ux + vy * uy;
-                // Hledáme v dosahu až 160 mm před začátkem i za koncem stěny
-                if (proj >= -160.0f && proj <= (wall.length_mm + 160.0f)) {
+                // Hledáme v dosahu až 180 mm před začátkem i za koncem stěny
+                if (proj >= -180.0f && proj <= (wall.length_mm + 180.0f)) {
                     linePoints[numLinePoints].proj = proj;
                     linePoints[numLinePoints].idx = i;
                     numLinePoints++;
@@ -466,6 +466,17 @@ private:
             for (int k = bestStart; k <= bestEnd; k++) {
                 usedInWall[linePoints[k].idx] = true;
             }
+
+            // Pokud stěna zachytila body (např. obě křídla kolem stínu svíčky), ale délka je 220-295 mm,
+            // protáhneme ji podél osy symetricky na plnou nominální délku 300 mm
+            if (wall.length_mm >= 210.0f && wall.length_mm < 300.0f) {
+                float pad = (300.0f - wall.length_mm) * 0.5f;
+                wall.x1 -= pad * ux;
+                wall.y1 -= pad * uy;
+                wall.x2 += pad * ux;
+                wall.y2 += pad * uy;
+                wall.length_mm = 300.0f;
+            }
         }
     }
 
@@ -480,7 +491,7 @@ private:
             for (int j = i + 1; j < wallCount; j++) {
                 const WallSegment& w1 = walls[i];
                 const WallSegment& w2 = walls[j];
-                if (w1.length_mm < 160.0f || w2.length_mm < 160.0f) continue;
+                if (w1.length_mm < 130.0f || w2.length_mm < 130.0f) continue;
 
                 float u1x = (w1.x2 - w1.x1) / w1.length_mm;
                 float u1y = (w1.y2 - w1.y1) / w1.length_mm;
@@ -612,8 +623,8 @@ private:
                 float dy = points[ib].y - points[ia].y;
                 float distAB = hypotf(dx, dy);
 
-                // Hledáme úseky, které by mohly tvořit kraje 30cm desky (cca 200 až 320 mm)
-                if (distAB < 180.0f || distAB > 325.0f) continue;
+                // Hledáme úseky, které by mohly tvořit kraje nebo ramena desky (cca 120 až 365 mm)
+                if (distAB < 120.0f || distAB > 365.0f) continue;
 
                 float invD = 1.0f / distAB;
                 float nx = -dy * invD;
@@ -622,7 +633,7 @@ private:
                 // Spočteme body ležící na této přímce (inliery)
                 int inliers = 0;
                 float minProj = 1e9f, maxProj = -1e9f;
-                int inlierIdxs[30];
+                int inlierIdxs[40];
 
                 for (int k = 0; k < nIdxs; k++) {
                     int ik = idxs[k];
@@ -631,14 +642,14 @@ private:
                         float proj = (points[ik].x - points[ia].x) * (dx * invD) + (points[ik].y - points[ia].y) * (dy * invD);
                         if (proj < minProj) minProj = proj;
                         if (proj > maxProj) maxProj = proj;
-                        if (inliers < 30) inlierIdxs[inliers] = ik;
+                        if (inliers < 40) inlierIdxs[inliers] = ik;
                         inliers++;
                     }
                 }
 
                 float wallLen = maxProj - minProj;
-                // Pokud inliery pokrývají 220 až 330 mm a je jich dostatek
-                if (inliers >= 5 && wallLen >= 200.0f && wallLen <= wp.max_length_mm) {
+                // Pokud inliery pokrývají alespoň 130 mm (i stíněné rameno) a nepřesahují max_length_mm
+                if (inliers >= 4 && wallLen >= 130.0f && wallLen <= wp.max_length_mm) {
                     if (wallCount < MAX_CANDIDATES) {
                         WallSegment seg;
                         float ux = dx * invD;
@@ -653,6 +664,17 @@ private:
                         // Označíme inliery
                         for (int k = 0; k < inliers; k++) {
                             usedInWall[inlierIdxs[k]] = true;
+                        }
+
+                        // Pokud stěna zachytila body, ale ještě nedosáhla 300 mm (např. 210-295 mm),
+                        // protáhneme ji podél osy symetricky na plnou nominální délku 300 mm
+                        if (seg.length_mm >= 200.0f && seg.length_mm < 300.0f) {
+                            float pad = (300.0f - seg.length_mm) * 0.5f;
+                            seg.x1 -= pad * ux;
+                            seg.y1 -= pad * uy;
+                            seg.x2 += pad * ux;
+                            seg.y2 += pad * uy;
+                            seg.length_mm = 300.0f;
                         }
 
                         outWalls[wallCount++] = seg;
