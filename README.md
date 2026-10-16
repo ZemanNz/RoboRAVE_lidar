@@ -98,3 +98,15 @@ Při testování v pokoji / na koberci mimo soutěžní arénu doporučujeme ná
    - Tolerance: **$\pm 60\text{ mm}$** (při zešikmeném úhlu pohledu LiDAR vidí jen část stěny nebo je okraj zanořený).
 4. **Rozpoznání svíčky:**
    - Shluk 2 až 8 bodů o průměru **$30\text{ až }90\text{ mm}$** ve vzdálenosti alespoň **$90\text{ mm}$** od nejbližší stěny.
+
+---
+
+## 6. Historie verzí a osvědčené commity
+
+Detailní rozpis všech verzí, vlastností, změn parametrů a verzí výslovně pochválených uživatelem nalezneš v samostatném průvodci:
+👉 **[COMMITS_GUIDE.md](file:///home/nik/Plocha/Programing/C++/Platformio/LIDAR_SVICKY_27/COMMITS_GUIDE.md)**
+
+- **`v1.1-latest-backup` (`11fbd60`)**: Plné protažení 300mm stěn přes stín svíčky, detekce rohů a ±10° zaměřovač
+- **`3a030e5`**: Verze se záměrným modrým výsekem 20° a prioritou 1. cíle
+- **`v1.0-user-approved` (`e501734`)**: Zlatá stabilní verze (klasický HUD, stabilní mapa hřiště)
+- **`890ef73`**: Původní osvědčená detekce stěn prokládáním kolem svíček
