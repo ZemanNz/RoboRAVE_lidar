@@ -68,13 +68,15 @@ class StableFieldModel:
         self.total_scans += 1
 
         # 1. SVÍČKY (párování do 150 mm)
-        matched_c = [False] * len(self.candles)
+        matched_c = set()
         for lc in live_candles:
             # lc = [x, y, diam]
             cx, cy = lc[0], lc[1]
             best_idx = -1
             best_dist = 150.0  # max posun svíčky
             for idx, sc in enumerate(self.candles):
+                if idx in matched_c:
+                    continue
                 d = math.hypot(sc['x'] - cx, sc['y'] - cy)
                 if d < best_dist:
                     best_dist = d
@@ -87,23 +89,25 @@ class StableFieldModel:
                 sc['y'] = 0.85 * sc['y'] + 0.15 * cy
                 sc['hits'] += 1
                 sc['missed'] = 0
-                matched_c[best_idx] = True
+                matched_c.add(best_idx)
             else:
                 if len(self.candles) < 8:
+                    new_idx = len(self.candles)
                     self.candles.append({
                         'x': cx, 'y': cy,
                         'hits': 1, 'missed': 0
                     })
+                    matched_c.add(new_idx)
 
         for idx, sc in enumerate(self.candles):
-            if not matched_c[idx]:
+            if idx not in matched_c:
                 sc['missed'] += 1
 
         # Mazání svíček s velkým missed
         self.candles = [c for c in self.candles if c['missed'] < 25 or (c['hits'] > 15 and c['missed'] < 80)]
 
         # 2. STĚNY (párování podle středu a úhlu)
-        matched_w = [False] * len(self.walls)
+        matched_w = set()
         for lw in live_walls:
             # lw = [x1, y1, x2, y2, len]
             x1, y1, x2, y2 = lw[0], lw[1], lw[2], lw[3]
@@ -114,6 +118,8 @@ class StableFieldModel:
             best_idx = -1
             best_dist = 140.0
             for idx, sw in enumerate(self.walls):
+                if idx in matched_w:
+                    continue
                 d = math.hypot(sw['mx'] - mx, sw['my'] - my)
                 if d < best_dist:
                     best_dist = d
@@ -130,17 +136,19 @@ class StableFieldModel:
                 sw['len'] = math.hypot(sw['x2'] - sw['x1'], sw['y2'] - sw['y1'])
                 sw['hits'] += 1
                 sw['missed'] = 0
-                matched_w[best_idx] = True
+                matched_w.add(best_idx)
             else:
                 if len(self.walls) < 12:
+                    new_w_idx = len(self.walls)
                     self.walls.append({
                         'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
                         'mx': mx, 'my': my, 'len': wlen,
                         'hits': 1, 'missed': 0
                     })
+                    matched_w.add(new_w_idx)
 
         for idx, sw in enumerate(self.walls):
-            if not matched_w[idx]:
+            if idx not in matched_w:
                 sw['missed'] += 1
 
         self.walls = [w for w in self.walls if w['missed'] < 20 or (w['hits'] > 12 and w['missed'] < 60)]
