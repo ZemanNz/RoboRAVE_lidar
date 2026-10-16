@@ -249,6 +249,55 @@ public:
                 }
             }
         }
+
+        // ========================================================
+        // 5. KROK: Validace svíček vůči stěnám
+        // Svíčka NESMÍ ležet v dráze stěny (nesmí být v přímce stěny ani na jejím rohu).
+        // Skutečná svíčka stojí kolmo před stěnou s dostatečným odstupem (d_perp >= 55 mm).
+        // ========================================================
+        static Candle validCandles[MAX_DETECTED_CANDLES];
+        int validCandleCount = 0;
+
+        for (int c = 0; c < candleCount; c++) {
+            const Candle& cand = outCandles[c];
+            bool inWallPath = false;
+
+            for (int w = 0; w < wallCount; w++) {
+                const WallSegment& wall = outWalls[w];
+                float dx = wall.x2 - wall.x1;
+                float dy = wall.y2 - wall.y1;
+                float wLen = wall.length_mm;
+                if (wLen < 10.0f) continue;
+
+                float invL = 1.0f / wLen;
+                float ux = dx * invL;
+                float uy = dy * invL;
+                float nx = -uy;
+                float ny = ux;
+
+                float vx = cand.x - wall.x1;
+                float vy = cand.y - wall.y1;
+
+                float projT = vx * ux + vy * uy;
+                float distToLine = fabsf(vx * nx + vy * ny);
+
+                // Pokud je svíčka v bezprostřední dráze přímky stěny (d_perp < 55 mm)
+                // v rámci délky stěny nebo na jejím rohu/prodloužení (-60 mm až +60 mm):
+                if (distToLine < 55.0f && projT >= -60.0f && projT <= (wLen + 60.0f)) {
+                    inWallPath = true;
+                    break;
+                }
+            }
+
+            if (!inWallPath && validCandleCount < MAX_DETECTED_CANDLES) {
+                validCandles[validCandleCount++] = cand;
+            }
+        }
+
+        for (int c = 0; c < validCandleCount; c++) {
+            outCandles[c] = validCandles[c];
+        }
+        candleCount = validCandleCount;
     }
 
 private:

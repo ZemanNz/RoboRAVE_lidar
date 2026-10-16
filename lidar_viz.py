@@ -144,9 +144,33 @@ class StableFieldModel:
         self.walls = [w for w in self.walls if w['missed'] < 20 or (w['hits'] > 12 and w['missed'] < 60)]
 
     def get_confirmed_candles(self):
-        valid = [c for c in self.candles if c['hits'] >= 5]
-        valid.sort(key=lambda c: c['hits'], reverse=True)
-        return valid[:4]
+        valid = [c for c in self.candles if c['hits'] >= 4]
+        conf_walls = self.get_confirmed_walls()
+        filtered = []
+        for c in valid:
+            in_wall = False
+            for w in conf_walls:
+                dx = w['x2'] - w['x1']
+                dy = w['y2'] - w['y1']
+                L = math.hypot(dx, dy)
+                if L < 10.0: continue
+                ux = dx / L
+                uy = dy / L
+                nx = -uy
+                ny = ux
+                vx = c['x'] - w['x1']
+                vy = c['y'] - w['y1']
+                proj_t = vx * ux + vy * uy
+                d_perp = abs(vx * nx + vy * ny)
+                # Svíčka nesmí ležet v dráze stěny ani na jejím bezprostředním rohu
+                if d_perp < 55.0 and -60.0 <= proj_t <= L + 60.0:
+                    in_wall = True
+                    break
+            if not in_wall:
+                filtered.append(c)
+
+        filtered.sort(key=lambda c: c['hits'], reverse=True)
+        return filtered[:4]
 
     def get_confirmed_walls(self):
         valid = [w for w in self.walls if w['hits'] >= 4]
