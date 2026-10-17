@@ -35,6 +35,7 @@ struct CandleParams {
     int max_points = 8;
     float max_neighbor_dist_mm = 55.0f;
     float min_dist_to_wall_mm = 40.0f;
+    float min_candle_separation_mm = 800.0f; // Minimální vzdálenost mezi dvěma svíčkami
 };
 
 class GeometryDetector {
@@ -287,11 +288,12 @@ public:
             scores[i] = score;
         }
 
-        // Seřazení podle skóre a výběr nejlepších stěn (max MAX_DETECTED_WALLS)
+        // Seřazení podle skóre a výběr nejlepších nekonfliktních stěn (max MAX_DETECTED_WALLS)
+        // PRAVIDLO: Stěny se nesmí překrývat! Výjimka: pouze pokud jsou na sebe velice kolmé (70° až 110°).
         bool picked[MAX_CANDIDATES];
         for (int i = 0; i < numUnique; i++) picked[i] = false;
 
-        for (int k = 0; k < MAX_DETECTED_WALLS && k < numUnique; k++) {
+        for (int k = 0; k < numUnique && wallCount < MAX_DETECTED_WALLS; k++) {
             int bestIdx = -1;
             float bestScore = -9999.0f;
             for (int i = 0; i < numUnique; i++) {
@@ -300,9 +302,19 @@ public:
                     bestIdx = i;
                 }
             }
-            if (bestIdx >= 0) {
-                picked[bestIdx] = true;
-                outWalls[wallCount++] = uniqueWalls[bestIdx];
+            if (bestIdx < 0 || bestScore <= 0.0f) break;
+            picked[bestIdx] = true;
+
+            const WallSegment& candWall = uniqueWalls[bestIdx];
+            bool conflict = false;
+            for (int j = 0; j < wallCount; j++) {
+                if (areWallsConflicting(candWall, outWalls[j])) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (!conflict) {
+                outWalls[wallCount++] = candWall;
             }
         }
 
@@ -316,29 +328,88 @@ public:
         for (int c = 0; c < MAX_DETECTED_CANDLES; c++) isCornerCandle[c] = false;
 
         extractCornerCandles(points, count, outWalls, wallCount,
-                             outCandles, candleCount, isCornerCandle);
+                              outCandles, candleCount, isCornerCandle);
 
         // ========================================================
-        // 5. KROK: Validace svíček vůči stěnám
-        // Svíčka NESMÍ ležet v dráze stěny (nesmí být v přímce stěny ani na jejím rohu).
-        // Skutečná svíčka stojí kolmo před stěnou s dostatečným odstupem (d_perp >= 55 mm).
-        // Rohová svíčka a svíčka na kolmici stěny jsou před vyřazením chráněny.
+        // 4.6 KROK: DOPLNĚNÍ SVÍČKY PRO KAŽDOU SAMOSTATNOU STĚNU (~300 mm)
+        // Každá překážková deska 300 mm na hřišti kryje svíčku. Pokud u sebe dosud žádnou nemá,
+        // vyhledáme body nebo syntetizujeme svíčku 130 mm před jejím středem směrem k robotu.
         // ========================================================
-        static Candle validCandles[MAX_DETECTED_CANDLES];
-        int validCandleCount = 0;
+        for (int w = 0; w < wallCount && candleCount < MAX_DETECTED_CANDLES; w++) {
+            const WallSegment& wall = outWalls[w];
+            if (wall.length_mm < 240.0f || wall.length_mm > 350.0f) continue;
 
-        for (int c = 0; c < candleCount; c++) {
-            const Candle& cand = outCandles[c];
+            float wmx = (wall.x1 + wall.x2) * 0.5f;
+            float wmy = (wall.y1 + wall.y2) * 0.5f;
 
-            // Rohová svíčka a svíčka na kolmici stěny jsou ověřeny a nesmí být vyřazeny chodbou
-            if (isCornerCandle[c] || isPerpCandle[c]) {
-                if (validCandleCount < MAX_DETECTED_CANDLES) {
-                    validCandles[validCandleCount++] = cand;
+            bool hasCandle = false;
+            for (int c = 0; c < candleCount; c++) {
+                if (hypotf(outCandles[c].x - wmx, outCandles[c].y - wmy) <= 260.0f) {
+                    hasCandle = true;
+                    break;
                 }
-                continue;
             }
 
+            if (!hasCandle) {
+                float dx = wall.x2 - wall.x1;
+                float dy = wall.y2 - wall.y1;
+                float invL = 1.0f / wall.length_mm;
+                float ux = dx * invL;
+                float uy = dy * invL;
+                float nx = -uy;
+                float ny = ux;
+                // Normála směrem k robotovi (0, 0)
+                if ((wmx * nx + wmy * ny) > 0.0f) {
+                    nx = -nx;
+                    ny = -ny;
+                }
+
+                float sumX = 0, sumY = 0;
+                int inliers = 0;
+                for (int i = 0; i < count; i++) {
+                    if (!points[i].valid || usedInCandle[i] || usedInWall[i]) continue;
+                    float d = hypotf(points[i].x - (wmx + 130.0f * nx), points[i].y - (wmy + 130.0f * ny));
+                    if (d < 65.0f) {
+                        sumX += points[i].x;
+                        sumY += points[i].y;
+                        inliers++;
+                    }
+                }
+
+                Candle sc;
+                if (inliers >= 2) {
+                    sc.x = sumX / (float)inliers;
+                    sc.y = sumY / (float)inliers;
+                    sc.point_count = inliers;
+                } else {
+                    sc.x = wmx + 130.0f * nx;
+                    sc.y = wmy + 130.0f * ny;
+                    sc.point_count = 0;
+                }
+                sc.diameter_mm = 50.0f;
+                isPerpCandle[candleCount] = true;
+                outCandles[candleCount++] = sc;
+            }
+        }
+
+        // ========================================================
+        // 5. KROK: Validace svíček vůči stěnám a ohodnocení vazby ke stěnám
+        // PRAVIDLA:
+        // 1. Svíčky se stěnou mají masivní přednost před osamocenými shluky bodů.
+        // 2. Maximálně JEDNA svíčka bez stěny (ta před námi; druhá bez stěny je vyloučena).
+        // 3. Svíčky od sebe musí být vzdáleny alespoň 80 cm (800 mm).
+        // ========================================================
+        static Candle candPool[MAX_DETECTED_CANDLES * 2];
+        static float candScores[MAX_DETECTED_CANDLES * 2];
+        static int candNearbyWalls[MAX_DETECTED_CANDLES * 2];
+        int poolCount = 0;
+
+        for (int c = 0; c < candleCount && poolCount < (MAX_DETECTED_CANDLES * 2); c++) {
+            const Candle& cand = outCandles[c];
+
             bool inWallPath = false;
+            int wallsNearby = 0;
+            float closestWallDist = 9999.0f;
 
             for (int w = 0; w < wallCount; w++) {
                 const WallSegment& wall = outWalls[w];
@@ -359,23 +430,88 @@ public:
                 float projT = vx * ux + vy * uy;
                 float distToLine = fabsf(vx * nx + vy * ny);
 
-                // Zakázaný koridor stěny (prodloužený o 150 mm před i za stěnu):
-                // Svíčka nesmí ležet v přímce stěny ani v mezeře/rohu mezi stěnami (d_perp <= 55 mm)
-                if (distToLine <= 55.0f && projT >= -150.0f && projT <= (wLen + 150.0f)) {
+                // Zakázaný koridor těla stěny (nesmí ležet přímo v materiálu)
+                if (!isCornerCandle[c] && !isPerpCandle[c] && distToLine <= 55.0f && projT >= -150.0f && projT <= (wLen + 150.0f)) {
                     inWallPath = true;
+                    break;
+                }
+
+                // Vzdálenost středu svíčky k úsečce stěny
+                float tClamped = fmaxf(0.0f, fminf(wLen, projT));
+                float closeX = wall.x1 + tClamped * ux;
+                float closeY = wall.y1 + tClamped * uy;
+                float distToSeg = hypotf(cand.x - closeX, cand.y - closeY);
+
+                if (distToSeg < closestWallDist) {
+                    closestWallDist = distToSeg;
+                }
+
+                // Poloměr 25 cm (250 mm)
+                if (distToSeg <= 250.0f) {
+                    wallsNearby++;
+                }
+            }
+
+            if (inWallPath) continue;
+
+            if (isCornerCandle[c] && wallsNearby < 2) wallsNearby = 2;
+            if (isPerpCandle[c] && wallsNearby < 1) wallsNearby = 1;
+
+            float score = (float)wallsNearby * 2000.0f;
+            if (wallsNearby > 0 && closestWallDist < 250.0f) {
+                score += (250.0f - closestWallDist);
+            }
+            score += (float)cand.point_count * 5.0f;
+
+            candPool[poolCount] = cand;
+            candScores[poolCount] = score;
+            candNearbyWalls[poolCount] = wallsNearby;
+            poolCount++;
+        }
+
+        // Seřazení podle skóre
+        for (int a = 0; a < poolCount - 1; a++) {
+            for (int b = a + 1; b < poolCount; b++) {
+                if (candScores[b] > candScores[a]) {
+                    Candle cTmp = candPool[a]; candPool[a] = candPool[b]; candPool[b] = cTmp;
+                    float sTmp = candScores[a]; candScores[a] = candScores[b]; candScores[b] = sTmp;
+                    int wTmp = candNearbyWalls[a]; candNearbyWalls[a] = candNearbyWalls[b]; candNearbyWalls[b] = wTmp;
+                }
+            }
+        }
+
+        // Výběr: max 1 svíčka bez stěny a rozestup 80 cm
+        static Candle filteredCandles[MAX_DETECTED_CANDLES];
+        int filteredCount = 0;
+        int isolatedCount = 0;
+        float minDistSq = cParams.min_candle_separation_mm * cParams.min_candle_separation_mm;
+
+        for (int i = 0; i < poolCount && filteredCount < MAX_DETECTED_CANDLES; i++) {
+            bool isIsolated = (candNearbyWalls[i] == 0);
+            if (isIsolated && isolatedCount >= 1) {
+                continue; // Další svíčka bez stěny je zakázána!
+            }
+
+            bool tooClose = false;
+            for (int j = 0; j < filteredCount; j++) {
+                float ddx = candPool[i].x - filteredCandles[j].x;
+                float ddy = candPool[i].y - filteredCandles[j].y;
+                if ((ddx * ddx + ddy * ddy) < minDistSq) {
+                    tooClose = true;
                     break;
                 }
             }
 
-            if (!inWallPath && validCandleCount < MAX_DETECTED_CANDLES) {
-                validCandles[validCandleCount++] = cand;
+            if (!tooClose) {
+                if (isIsolated) isolatedCount++;
+                filteredCandles[filteredCount++] = candPool[i];
             }
         }
 
-        for (int c = 0; c < validCandleCount; c++) {
-            outCandles[c] = validCandles[c];
+        for (int c = 0; c < filteredCount; c++) {
+            outCandles[c] = filteredCandles[c];
         }
-        candleCount = validCandleCount;
+        candleCount = filteredCount;
 
         // ========================================================
         // 6. KROK: Prioritizace svíčky v dopředném záměrném výseku (+-10° dopředu)
@@ -400,6 +536,56 @@ public:
     }
 
 private:
+    // Kontrola kolizí a překryvu dvou stěn:
+    // Pravidlo: Stěny se nesmí překrývat ani křížit! Výjimka: pouze pokud jsou na sebe velice kolmé (70° až 110°).
+    static bool areWallsConflicting(const WallSegment& a, const WallSegment& b) {
+        if (a.length_mm < 10.0f || b.length_mm < 10.0f) return false;
+
+        float adx = (a.x2 - a.x1) / a.length_mm;
+        float ady = (a.y2 - a.y1) / a.length_mm;
+        float bdx = (b.x2 - b.x1) / b.length_mm;
+        float bdy = (b.y2 - b.y1) / b.length_mm;
+
+        float amx = (a.x1 + a.x2) * 0.5f;
+        float amy = (a.y1 + a.y2) * 0.5f;
+        float bmx = (b.x1 + b.x2) * 0.5f;
+        float bmy = (b.y1 + b.y2) * 0.5f;
+
+        float centerDist = hypotf(amx - bmx, amy - bmy);
+
+        // |dot| blízko 0 = cca 90° (kolmé), |dot| blízko 1 = rovnoběžné
+        float dot = fabsf(adx * bdx + ady * bdy);
+
+        // Kolmé stěny (cca 70° až 110° -> cos(70°) = 0.342)
+        bool isPerpendicular = (dot <= 0.35f);
+
+        if (isPerpendicular) {
+            // Kolmé stěny tvoří rohy L nebo U-boxy, dotýkají se v rozích.
+            // Konflikt by byl pouze, pokud by jejich středy ležely téměř na sobě (< 70 mm)
+            return (centerDist < 70.0f);
+        }
+
+        // Pokud stěny NEJSOU kolmé (jsou rovnoběžné, šikmé nebo pod úhlem např. 40-60°):
+        // NESMÍ SE PŘEKRÝVAT!
+        if (centerDist < 200.0f) return true;
+
+        // Vzdálenost středu B od nosné přímky A a podélný překryv
+        float perpDistB = fabsf((bmx - a.x1) * (-ady) + (bmy - a.y1) * (adx));
+        float projLongB = (bmx - a.x1) * adx + (bmy - a.y1) * ady;
+        if (perpDistB < 150.0f && projLongB >= -60.0f && projLongB <= (a.length_mm + 60.0f)) {
+            return true;
+        }
+
+        // Vzdálenost středu A od nosné přímky B a podélný překryv
+        float perpDistA = fabsf((amx - b.x1) * (-bdy) + (amy - b.y1) * (bdx));
+        float projLongA = (amx - b.x1) * bdx + (amy - b.y1) * bdy;
+        if (perpDistA < 150.0f && projLongA >= -60.0f && projLongA <= (b.length_mm + 60.0f)) {
+            return true;
+        }
+
+        return false;
+    }
+
     // Kontrola kolmice: Zda se před kandidátem na stěnu nachází svíčka (bod / shluk bodů)
     // na kolmici ze středu nebo těla stěny ve vzdálenosti cca 50 až 280 mm.
     // Ověřuje jak již detekované svíčky v outCandles, tak případné surové body LiDARu.
