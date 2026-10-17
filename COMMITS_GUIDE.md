@@ -8,7 +8,8 @@ Tento dokument slouží jako rychlý přehled historie vývoje, vlastností jedn
 
 | Verze / Git Tag | Commit Hash | Uživatelské hodnocení | Klíčové vlastnosti |
 | :--- | :--- | :--- | :--- |
-| **`v1.1-latest-backup`** (HEAD) | `11fbd60` | 🔥 *Nejnovější plná verze* | Překlenutí stínů svíček, detekce rohové svíčky průsečíkem, 300mm stěny, modrý záměrný kužel ±10°. |
+| **`v1.2`** (HEAD) | `HEAD` | 🎯 *Nové pravidlo kolmice* | Kontrola svíčky na kolmici stěny (+400 b. priorita před zdmi pokoje), záchrana stíněných/krátkých stěn od 75 mm, symetrické dotažení na 300 mm. |
+| **`v1.1-latest-backup`** | `11fbd60` | 🔥 *Předchozí plná verze* | Překlenutí stínů svíček, detekce rohové svíčky průsečíkem, 300mm stěny, modrý záměrný kužel ±10°. |
 | **`3a030e5`** | `3a030e5` | ⭐ *"Tohle už je taky dost dobrý"* | Přidán 20° dopředný záměrný výsek (modrý kužel) a priorita 1. cíle. |
 | **`v1.0-user-approved`** | `e501734` | ⭐⭐⭐ *"Už to byla ta verze, kde jsem ti říkal, že je to fakt super / v Gitu se mi to velice líbilo"* | **Zlatá stabilní verze**: čistý původní textový HUD, stabilní World Model (pravý panel), osvědčená detekce. |
 | **`890ef73`** | `890ef73` | ⭐⭐⭐ *"Už to vypadá mnohem lépe, vypadá to fakt dobře... tam ta detekce stěn byla lepší"* | Původní průlomová verze s candle-centric prokládáním stěn za svíčkou. |
@@ -16,6 +17,16 @@ Tento dokument slouží jako rychlý přehled historie vývoje, vlastností jedn
 ---
 
 ## 📋 Detailní přehled commitů (od nejnovějšího k nejstaršímu)
+
+### 0. Commit (Verze `v1.2`)
+- **Popis:** *Detector: Add perpendicular candle validation rule, prioritize obstacle walls (+400 pts), and restore 300 mm walls*
+- **V čem je dobrý:**
+  - Přidáno nové pravidlo kontroly kolmice (`checkCandleOnPerpendicular`): Pokud u kandidáta na stěnu leží na kolmici ze středu/těla stěny body reprezentující svíčku (vzdálenost 50 až 280 mm), stěna získá masivní prioritu (+400 bodů ve skórování).
+  - Tím se spolehlivě odliší skutečná 30cm stěna překážky se svíčkou od náhodných zdí a rohů místnosti.
+  - Záchrana neúplných/stíněných stěn: pro stěny s ověřenou svíčkou na kolmici postačí naměřená délka od 75 mm (místo původních 130 mm).
+  - Takto ověřená stěna se automaticky symetricky protáhne na nominálních 300 mm.
+  - Zmírněn minimální průměr svíčky z 20 mm na 12 mm pro spolehlivou detekci 2-bodových svíček na větší vzdálenost.
+  - Svíčka ověřená na kolmici je stoprocentně chráněna před vyřazením chodbou.
 
 ### 1. Commit `11fbd60` (Tag: `v1.1-latest-backup`, Větev: `backup_v1.1_latest`)
 - **Popis:** *Detector: Bridge candle shadows to detect full 300 mm walls and pad to 300 mm*

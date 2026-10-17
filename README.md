@@ -106,6 +106,7 @@ Při testování v pokoji / na koberci mimo soutěžní arénu doporučujeme ná
 Detailní rozpis všech verzí, vlastností, změn parametrů a verzí výslovně pochválených uživatelem nalezneš v samostatném průvodci:
 👉 **[COMMITS_GUIDE.md](file:///home/nik/Plocha/Programing/C++/Platformio/LIDAR_SVICKY_27/COMMITS_GUIDE.md)**
 
+- **`v1.2` (HEAD)**: Nové pravidlo kontroly kolmice na svíčku (+400 b. priorita pro stěny se svíčkou před zdmi pokoje), záchrana a 300mm dotažení stíněných stěn od 75 mm
 - **`v1.1-latest-backup` (`11fbd60`)**: Plné protažení 300mm stěn přes stín svíčky, detekce rohů a ±10° zaměřovač
 - **`3a030e5`**: Verze se záměrným modrým výsekem 20° a prioritou 1. cíle
 - **`v1.0-user-approved` (`e501734`)**: Zlatá stabilní verze (klasický HUD, stabilní mapa hřiště)
