@@ -51,69 +51,67 @@ def get_baudrate():
 
 
 # ============================================================
-#  Pokročilý lokalizátor robota (Hybrid Candle Constellation + RANSAC)
+#  Map-to-Map Lokalizátor robota (Porovnání stabilních map hřiště)
 # ============================================================
 class RobotLocalizer:
     """
-    Vysoce robustní lokalizátor robota na hřišti:
-    1. Primární kotvy = SVÍČKY (Candle Constellation Matching):
-       Svíčky jsou válce o průměru 5 cm – jejich střed je neměnný nezávisle na úhlu pohledu.
-       Vzdálenosti mezi všemi dvojicemi svíček tvoří unikátní geometrický otisk (fingerprint).
-       Jakmile robot vidí alespoň 2 svíčky, jejich vzájemná vzdálenost okamžitě a jednoznačně
-       určí jejich identitu a z nich analyticky polohu (x, y) i orientaci (theta).
-    2. Sekundární kotvy = STĚNY (Type-Aware RANSAC + Procrustes):
-       Pokud robot vidí méně než 2 svíčky, použije se osvědčený RANSAC, ale s typovou kontrolou
-       (svíčka se páruje výhradně se svíčkou, stěna se stěnou) a kontrolou geometrické vzdálenosti.
-    3. Analytické zpřesnění (Procrustes Least-Squares):
-       Ze všech potvrzených inlierů se spočítá optimální tuhý 2D transform bez jakéhokoliv driftu.
-    4. Časový filtr (EMA + Hold) a záznam ujeté trajektorie robota.
+    Čistý a spolehlivý Map-to-Map Matching:
+    1. Při zamknutí [L] se uloží REFERENČNÍ MAPA (vyfiltrované svíčky a stěny z počátku).
+       Změří se všechny vzájemné vzdálenosti mezi body (tyto vzdálenosti jsou absolutně
+       neměnné bez ohledu na to, kam robot popojede a jak se otočí).
+    2. Při pohybu robota se vezme AKTUÁLNÍ STABILNÍ MAPA (vyfiltrovaná z cca 15-20 měření)
+       a porovná se s referenční mapou:
+       - Změří se vzdálenosti mezi aktuálními body.
+       - Najde se shoda se vzdálenostmi v referenční mapě -> jednoznačná identita bodů.
+       - Z rozdílu směrů se spočítá přesný úhel natočení theta.
+       - Z posunu bodů se spočítá přesná poloha (X, Y) robota od startu.
+    3. Žádné umělé blokování podle vzdálenosti skoku – robot se může posunout o kolik chce!
+    4. Výsledek je díky porovnávání dvou stabilních map naprosto klidný, přesný a bez šumu.
     """
 
     def __init__(self):
         self.locked           = False
-        self.ref_candles      = []   # Uložené referenční svíčky ve světových souřadnicích
-        self.ref_walls        = []   # Uložené referenční stěny ve světových souřadnicích
-        self.candle_dists     = []   # [(i, j, dist_mm)] pro všechny dvojice referenčních svíček
-        self.wall_dists       = []   # [(i, j, dist_mm)] pro středy stěn
+        self.ref_candles      = []   # Referenční svíčky ve světových souřadnicích
+        self.ref_walls        = []   # Referenční stěny ve světových souřadnicích
+        self.ref_candle_dists = []   # [(i, j, dist_mm)] mezi referenčními svíčkami
+        self.ref_cw_dists     = []   # [(c_idx, w_idx, dist_mm)] mezi svíčkami a středy stěn
 
-        self.robot_x          = 0.0  # mm ve světových souřadnicích (start = [0,0])
+        self.robot_x          = 0.0  # mm ve světě (START = [0,0])
         self.robot_y          = 0.0
-        self.robot_deg        = 0.0  # 0° = robot se dívá ve směru světového Y+
+        self.robot_deg        = 0.0  # orientace ve stupních
         self.pose_confidence  = 0.0  # 0.0 – 1.0
-        self.trajectory       = [(0.0, 0.0)] # Ujetá trasa od startu
-        self.pose_history     = []   # Klouzavé okno posledních měření [(tx, ty, theta_rad, quality)]
-        self.is_stationary    = True # Příznak, zda robot stojí na místě (statická poloha)
+        self.trajectory       = [(0.0, 0.0)]
+        self.is_stationary    = True
+        self.candle_tracker   = []   # Krátkodobý tracker svíček (vyhlazení chvění, rozpad za 4 snímky)
 
     def lock_map(self, conf_candles, conf_walls):
-        """Uloží aktuální potvrzené svíčky a stěny jako fixní referenční svět."""
+        """Uloží aktuální potvrzené svíčky a stěny jako fixní referenční mapu světa."""
         self.ref_candles = [dict(c) for c in conf_candles]
         self.ref_walls   = [dict(w) for w in conf_walls]
-        self.candle_dists = []
-        self.wall_dists   = []
+        self.ref_candle_dists = []
+        self.ref_cw_dists     = []
+        self.candle_tracker   = []
 
-        # Vzdálenosti mezi všemi dvojicemi svíček
+        # Invariantní vzdálenosti mezi všemi svíčkami
         for i in range(len(self.ref_candles)):
             for j in range(i + 1, len(self.ref_candles)):
                 d = math.hypot(self.ref_candles[i]['x'] - self.ref_candles[j]['x'],
                                self.ref_candles[i]['y'] - self.ref_candles[j]['y'])
-                self.candle_dists.append((i, j, d))
+                self.ref_candle_dists.append((i, j, d))
 
-        # Vzdálenosti mezi středy stěn
-        for i in range(len(self.ref_walls)):
-            for j in range(i + 1, len(self.ref_walls)):
-                d = math.hypot(self.ref_walls[i]['mx'] - self.ref_walls[j]['mx'],
-                               self.ref_walls[i]['my'] - self.ref_walls[j]['my'])
-                self.wall_dists.append((i, j, d))
+        # Invariantní vzdálenosti mezi svíčkami a středy stěn
+        for ci, c in enumerate(self.ref_candles):
+            for wi, w in enumerate(self.ref_walls):
+                d = math.hypot(c['x'] - w['mx'], c['y'] - w['my'])
+                self.ref_cw_dists.append((ci, wi, d))
 
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_deg = 0.0
         self.pose_confidence = 1.0
         self.trajectory = [(0.0, 0.0)]
-        self.pose_history = [(0.0, 0.0, 0.0, 1.0)] * 5
         self.is_stationary = True
 
-        # Vyžadujeme alespoň 1 svíčku + 1 stěnu nebo 2 stěny
         self.locked = (len(self.ref_candles) + len(self.ref_walls)) >= 2
         return self.locked
 
@@ -122,19 +120,19 @@ class RobotLocalizer:
         self.locked = False
         self.ref_candles = []
         self.ref_walls = []
-        self.candle_dists = []
-        self.wall_dists = []
+        self.ref_candle_dists = []
+        self.ref_cw_dists = []
+        self.candle_tracker = []
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_deg = 0.0
         self.pose_confidence = 0.0
         self.trajectory = [(0.0, 0.0)]
-        self.pose_history = []
         self.is_stationary = True
 
     @staticmethod
     def _rigid_transform_2d(src, dst):
-        """Analytický 2D Procrustes fit (rotace + posun) ze seznamu dvojic bodů."""
+        """Metoda nejmenších čtverců (Procrustes) pro analytický výpočet (tx, ty, theta)."""
         n = len(src)
         if n == 0: return 0.0, 0.0, 0.0
         if n == 1:
@@ -161,197 +159,221 @@ class RobotLocalizer:
 
     def estimate_pose(self, live_candles, live_walls):
         """
-        Odhad polohy robota v reálném čase se silnou setrvačností,
-        odmítáním odlehlých měření (outlierů) a klidovým filtrem stání na místě.
+        Určí pozici a orientaci robota (x, y, theta) vůči referenční mapě
+        pomocí invariantních vzdáleností mezi svíčkami a stěnami.
+        Funguje při jakémkoliv pohybu i přemístění robota.
         """
         if not self.locked or (len(self.ref_candles) + len(self.ref_walls)) < 2:
             return False
 
-        # Získání bodů ze senzoru (sensor frame)
-        cur_cands = [(c[0], c[1]) for c in live_candles]
-        cur_walls = [((w[0]+w[2])*0.5, (w[1]+w[3])*0.5) for w in live_walls]
+        # Převod na standardní formát (x, y) pro svíčky a (mx, my) pro stěny
+        raw_cands = []
+        for c in live_candles:
+            if isinstance(c, (list, tuple)):
+                raw_cands.append((float(c[0]), float(c[1])))
+            elif isinstance(c, dict):
+                raw_cands.append((float(c['x']), float(c['y'])))
 
-        raw_tx = None
-        raw_ty = None
-        raw_theta = None
-        best_quality = 0.0
+        raw_walls = []
+        for w in live_walls:
+            if isinstance(w, (list, tuple)):
+                mx = (float(w[0]) + float(w[2])) * 0.5
+                my = (float(w[1]) + float(w[3])) * 0.5
+                raw_walls.append((mx, my))
+            elif isinstance(w, dict):
+                raw_walls.append((float(w['mx']), float(w['my'])))
+
+        # Krátkodobý tracker svíček (vyhlazuje chvění měření a překlenuje krátké výpadky na 1-2 snímky)
+        matched_tracker = set()
+        for cx, cy in raw_cands:
+            best_idx = -1
+            best_d = 100.0
+            for idx, tc in enumerate(self.candle_tracker):
+                if idx in matched_tracker: continue
+                d = math.hypot(tc['x'] - cx, tc['y'] - cy)
+                if d < best_d:
+                    best_d = d
+                    best_idx = idx
+            if best_idx >= 0:
+                self.candle_tracker[best_idx]['x'] = 0.7 * self.candle_tracker[best_idx]['x'] + 0.3 * cx
+                self.candle_tracker[best_idx]['y'] = 0.7 * self.candle_tracker[best_idx]['y'] + 0.3 * cy
+                self.candle_tracker[best_idx]['hits'] += 1
+                self.candle_tracker[best_idx]['missed'] = 0
+                matched_tracker.add(best_idx)
+            else:
+                self.candle_tracker.append({'x': cx, 'y': cy, 'hits': 1, 'missed': 0})
+                matched_tracker.add(len(self.candle_tracker) - 1)
+
+        for idx, tc in enumerate(self.candle_tracker):
+            if idx not in matched_tracker:
+                tc['missed'] += 1
+
+        # Rychlý rozpad (max 4 missed snímky = 0.6 s) -> při posunu robota nezůstávají duchové!
+        self.candle_tracker = [c for c in self.candle_tracker if c['missed'] <= 4]
+
+        # Výběr kandidátů na svíčky:
+        # Preferujeme stabilizované body z trackeru, případně přímo živé ze snímku
+        tracked_cands = [(c['x'], c['y']) for c in self.candle_tracker if c['hits'] >= 2]
+        cands = tracked_cands if len(tracked_cands) >= 2 else raw_cands
+        walls = raw_walls
+
+        best_tx = None
+        best_ty = None
+        best_theta = None
+        best_inliers = 0
+        best_error = 9999.0
 
         # ========================================================
-        # METODA 1: Geometrická konstelace svíček (přesnost na mm)
+        # 1. PÁROVÁNÍ PODLE INVARIANTNÍCH VZDÁLENOSTÍ MEZI SVÍČKAMI
         # ========================================================
-        if len(cur_cands) >= 2 and len(self.ref_candles) >= 2:
-            for a in range(len(cur_cands)):
-                for b in range(a + 1, len(cur_cands)):
-                    d_cur = math.hypot(cur_cands[a][0] - cur_cands[b][0],
-                                       cur_cands[a][1] - cur_cands[b][1])
+        if len(cands) >= 2 and len(self.ref_candles) >= 2:
+            for a in range(len(cands)):
+                for b in range(a + 1, len(cands)):
+                    d_cur = math.hypot(cands[a][0] - cands[b][0], cands[a][1] - cands[b][1])
 
-                    # Hledáme odpovídající dvojici v referenci
-                    for (ri, rj, d_ref) in self.candle_dists:
-                        if abs(d_cur - d_ref) < 85.0:  # Tolerance do 85 mm na rozteč svíček
-                            pA = cur_cands[a]; pB = cur_cands[b]
+                    # Hledáme odpovídající dvojici svíček v referenční mapě
+                    for (ri, rj, d_ref) in self.ref_candle_dists:
+                        if abs(d_cur - d_ref) < 130.0:  # tolerance 13 cm na rozestup
                             rI = (self.ref_candles[ri]['x'], self.ref_candles[ri]['y'])
                             rJ = (self.ref_candles[rj]['x'], self.ref_candles[rj]['y'])
 
-                            # Vyzkoušíme obě orientace (A->I, B->J) i (A->J, B->I)
-                            for (c1, c2, ref1, ref2) in [(pA, pB, rI, rJ), (pA, pB, rJ, rI)]:
-                                tx, ty, th = self._rigid_transform_2d([c1, c2], [ref1, ref2])
+                            # Dvě možné orientace přiřazení: (a->ri, b->rj) a (a->rj, b->ri)
+                            for (p1, p2, ref1, ref2) in [(cands[a], cands[b], rI, rJ), (cands[a], cands[b], rJ, rI)]:
+                                v_ref_x = ref2[0] - ref1[0]; v_ref_y = ref2[1] - ref1[1]
+                                v_cur_x = p2[0] - p1[0];     v_cur_y = p2[1] - p1[1]
+                                th = math.atan2(v_ref_y, v_ref_x) - math.atan2(v_cur_y, v_cur_x)
+                                cos_t = math.cos(th); sin_t = math.sin(th)
+
+                                tx = ref1[0] - (p1[0]*cos_t - p1[1]*sin_t)
+                                ty = ref1[1] - (p1[0]*sin_t + p1[1]*cos_t)
+
+                                # Ověříme shodu se všemi svíčkami a stěnami v mapě
+                                inliers = 0
+                                err_sum = 0.0
+                                inlier_src = []
+                                inlier_dst = []
+
+                                for cp in cands:
+                                    wx = cp[0]*cos_t - cp[1]*sin_t + tx
+                                    wy = cp[0]*sin_t + cp[1]*cos_t + ty
+                                    min_d = 9999.0
+                                    best_rc = None
+                                    for rc in self.ref_candles:
+                                        d = math.hypot(wx - rc['x'], wy - rc['y'])
+                                        if d < min_d: min_d = d; best_rc = rc
+                                    if min_d < 180.0 and best_rc:
+                                        inliers += 2 # Svíčka má váhu 2
+                                        err_sum += min_d
+                                        inlier_src.append(cp)
+                                        inlier_dst.append((best_rc['x'], best_rc['y']))
+
+                                for wp in walls:
+                                    wx = wp[0]*cos_t - wp[1]*sin_t + tx
+                                    wy = wp[0]*sin_t + wp[1]*cos_t + ty
+                                    min_d = min((math.hypot(wx - rw['mx'], wy - rw['my']) for rw in self.ref_walls), default=9999.0)
+                                    if min_d < 220.0:
+                                        inliers += 1
+                                        err_sum += min_d
+
+                                avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
+
+                                if inliers > best_inliers or (inliers == best_inliers and avg_err < best_error):
+                                    best_inliers = inliers
+                                    best_error = avg_err
+                                    if len(inlier_src) >= 2:
+                                        rtx, rty, rth = self._rigid_transform_2d(inlier_src, inlier_dst)
+                                        best_tx = rtx; best_ty = rty; best_theta = rth
+                                    else:
+                                        best_tx = tx; best_ty = ty; best_theta = th
+
+        # ========================================================
+        # 2. ZÁLOŽNÍ METODA: PÁROVÁNÍ SVÍČKA-STĚNA / STĚNA-STĚNA
+        # ========================================================
+        if best_inliers < 2:
+            all_cur = [(c[0], c[1], 'c') for c in cands] + [(w[0], w[1], 'w') for w in walls]
+            all_ref = [(c['x'], c['y'], 'c') for c in self.ref_candles] + [(w['mx'], w['my'], 'w') for w in self.ref_walls]
+
+            for i in range(len(all_cur)):
+                for j in range(i + 1, len(all_cur)):
+                    d_cur = math.hypot(all_cur[i][0] - all_cur[j][0], all_cur[i][1] - all_cur[j][1])
+                    if d_cur < 150.0: continue
+
+                    for ri in range(len(all_ref)):
+                        if all_cur[i][2] != all_ref[ri][2]: continue
+                        for rj in range(len(all_ref)):
+                            if rj == ri or all_cur[j][2] != all_ref[rj][2]: continue
+
+                            d_ref = math.hypot(all_ref[ri][0] - all_ref[rj][0], all_ref[ri][1] - all_ref[rj][1])
+                            if abs(d_cur - d_ref) < 130.0:
+                                p1 = (all_cur[i][0], all_cur[i][1])
+                                p2 = (all_cur[j][0], all_cur[j][1])
+                                r1 = (all_ref[ri][0], all_ref[ri][1])
+                                r2 = (all_ref[rj][0], all_ref[rj][1])
+
+                                tx, ty, th = self._rigid_transform_2d([p1, p2], [r1, r2])
                                 cos_t = math.cos(th); sin_t = math.sin(th)
 
                                 inliers = 0
                                 err_sum = 0.0
-                                for cp in cur_cands:
-                                    wx = cp[0]*cos_t - cp[1]*sin_t + tx
-                                    wy = cp[0]*sin_t + cp[1]*cos_t + ty
-                                    min_d = min(math.hypot(wx - rc['x'], wy - rc['y']) for rc in self.ref_candles)
-                                    if min_d < 160.0:
+                                for p in all_cur:
+                                    wx = p[0]*cos_t - p[1]*sin_t + tx
+                                    wy = p[0]*sin_t + p[1]*cos_t + ty
+                                    min_d = min((math.hypot(wx - rp[0], wy - rp[1]) for rp in all_ref if rp[2] == p[2]), default=9999.0)
+                                    if min_d < 200.0:
                                         inliers += 1
                                         err_sum += min_d
 
-                                if inliers >= 2:
-                                    quality = (inliers / len(self.ref_candles)) * max(0.1, 1.0 - (err_sum / inliers) / 160.0)
-                                    if quality > best_quality:
-                                        best_quality = quality
-                                        raw_tx = tx
-                                        raw_ty = ty
-                                        raw_theta = th
+                                avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
+                                if inliers > best_inliers or (inliers == best_inliers and avg_err < best_error):
+                                    best_inliers = inliers
+                                    best_error = avg_err
+                                    best_tx = tx; best_ty = ty; best_theta = th
 
         # ========================================================
-        # METODA 2: Typově uvědomělý RANSAC + Procrustes zpřesnění
-        # (Pokud metoda 1 nenašla shodu – např. vidíme jen 1 svíčku a stěny)
+        # 3. APLIKACE VÝSLEDKU: STATICKÁ POLOHA, SETRVAČNOST A TRAJEKTORIE
         # ========================================================
-        if best_quality < 0.35:
-            cur_pts = [(c[0], c[1], 'c') for c in cur_cands]
-            cur_pts += [(w[0], w[1], 'w') for w in cur_walls]
-
-            ref_pts = [(rc['x'], rc['y'], 'c') for rc in self.ref_candles]
-            ref_pts += [(rw['mx'], rw['my'], 'w') for rw in self.ref_walls]
-
-            n_cur = len(cur_pts)
-            n_ref = len(ref_pts)
-
-            if n_cur >= 2 and n_ref >= 2:
-                MAX_C = min(n_cur, 8)
-                for i in range(MAX_C):
-                    for j in range(i + 1, MAX_C):
-                        d_cur = math.hypot(cur_pts[i][0] - cur_pts[j][0],
-                                           cur_pts[i][1] - cur_pts[j][1])
-                        if d_cur < 200.0: continue
-
-                        for ri in range(n_ref):
-                            if cur_pts[i][2] != ref_pts[ri][2]: continue
-                            for rj in range(n_ref):
-                                if rj == ri: continue
-                                if cur_pts[j][2] != ref_pts[rj][2]: continue
-
-                                d_ref = math.hypot(ref_pts[ri][0] - ref_pts[rj][0],
-                                                   ref_pts[ri][1] - ref_pts[rj][1])
-                                if abs(d_cur - d_ref) > 130.0: continue
-
-                                p1 = (cur_pts[i][0], cur_pts[i][1])
-                                p2 = (cur_pts[j][0], cur_pts[j][1])
-                                r1 = (ref_pts[ri][0], ref_pts[ri][1])
-                                r2 = (ref_pts[rj][0], ref_pts[rj][1])
-                                tx, ty, th = self._rigid_transform_2d([p1, p2], [r1, r2])
-                                cos_t = math.cos(th); sin_t = math.sin(th)
-
-                                inlier_src = []
-                                inlier_dst = []
-                                total_err = 0.0
-
-                                for cp in cur_pts:
-                                    wx = cp[0]*cos_t - cp[1]*sin_t + tx
-                                    wy = cp[0]*sin_t + cp[1]*cos_t + ty
-                                    best_match_d = 9999.0
-                                    best_rp = None
-                                    for rp in ref_pts:
-                                        if cp[2] == rp[2]:
-                                            d = math.hypot(wx - rp[0], wy - rp[1])
-                                            if d < best_match_d:
-                                                best_match_d = d
-                                                best_rp = rp
-
-                                    if best_match_d < 180.0 and best_rp is not None:
-                                        inlier_src.append((cp[0], cp[1]))
-                                        inlier_dst.append((best_rp[0], best_rp[1]))
-                                        total_err += best_match_d
-
-                                if len(inlier_src) >= 2:
-                                    quality = (len(inlier_src) / max(n_cur, n_ref)) * max(0.1, 1.0 - (total_err / len(inlier_src)) / 180.0)
-                                    if quality > best_quality:
-                                        ref_tx, ref_ty, ref_th = self._rigid_transform_2d(inlier_src, inlier_dst)
-                                        best_quality = quality
-                                        raw_tx = ref_tx
-                                        raw_ty = ref_ty
-                                        raw_theta = ref_th
-
-        # ========================================================
-        # METODA 3: Outlier Filter, Klouzavý medián a Klidový zámek
-        # ========================================================
-        if best_quality >= 0.25 and raw_tx is not None:
-            # 1. OUTLIER GATE: Odmítnutí nerealistických skoků (blbostí)
-            if self.pose_confidence > 0.40:
-                jump_dist = math.hypot(raw_tx - self.robot_x, raw_ty - self.robot_y)
-                cur_rad = math.radians(self.robot_deg)
-                diff_ang = abs(math.atan2(math.sin(raw_theta - cur_rad), math.cos(raw_theta - cur_rad)))
-                if jump_dist > 300.0 or diff_ang > math.radians(35.0):
-                    # Zjevná anomálie / haluz z jednoho špatného snímku -> ignorujeme!
-                    self.pose_confidence = max(0.1, self.pose_confidence - 0.02)
-                    return True
-
-            # 2. Uložení do klouzavého okna posledních odhadů
-            self.pose_history.append((raw_tx, raw_ty, raw_theta, best_quality))
-            if len(self.pose_history) > 7:
-                self.pose_history.pop(0)
-
-            # 3. ROBUSTNÍ MEDIÁN přes klouzavé okno (odstraní jakýkoliv jednotlivý šum)
-            all_x = sorted([m[0] for m in self.pose_history])
-            all_y = sorted([m[1] for m in self.pose_history])
-            mid_idx = len(all_x) // 2
-            med_tx = all_x[mid_idx]
-            med_ty = all_y[mid_idx]
-
-            # Medián úhlu vzhledem k aktuální orientaci
+        if best_inliers >= 2 and best_tx is not None:
             cur_rad = math.radians(self.robot_deg)
-            ang_diffs = sorted([math.atan2(math.sin(m[2] - cur_rad), math.cos(m[2] - cur_rad)) for m in self.pose_history])
-            med_theta = cur_rad + ang_diffs[len(ang_diffs) // 2]
+            dist_diff = math.hypot(best_tx - self.robot_x, best_ty - self.robot_y)
+            ang_diff = abs(math.atan2(math.sin(best_theta - cur_rad), math.cos(best_theta - cur_rad)))
 
-            # 4. DEADBAND: Detekce stání na místě (Statická poloha lidaru)
-            # Pokud je odchylka mediánu od stávající polohy malá (< 32 mm a < 2.0°),
-            # robot STOJÍ NA MÍSTĚ a jeho poloha je zafixována (žádný třes ani skákání)!
-            dist_to_med = math.hypot(med_tx - self.robot_x, med_ty - self.robot_y)
-            ang_to_med = abs(math.atan2(math.sin(med_theta - cur_rad), math.cos(med_theta - cur_rad)))
-
-            if dist_to_med < 32.0 and ang_to_med < math.radians(2.0):
-                # Robot stojí na místě -> držíme absolutně statickou polohu!
+            # Klidový zámek: pokud se poloha liší o méně než 20 mm a 1.5°, robot stojí na místě
+            # (Absolutně statická poloha lidaru bez sebemenšího třesu!)
+            if dist_diff < 20.0 and ang_diff < math.radians(1.5):
                 self.is_stationary = True
                 self.pose_confidence = min(1.0, self.pose_confidence + 0.05)
             else:
-                # Robot se skutečně pohnul -> plynulý setrvačný posun (hladké EMA s nízkým alpha)
                 self.is_stationary = False
-                alpha = 0.14  # Silná setrvačnost (hladký přirozený pohyb bez trhání)
 
-                self.robot_x = (1.0 - alpha) * self.robot_x + alpha * med_tx
-                self.robot_y = (1.0 - alpha) * self.robot_y + alpha * med_ty
+                # Pokud došlo k velkému přemístění (např. uživatel zvedl a posunul LiDAR o > 300 mm),
+                # reagujeme rychleji (alpha = 0.50), při normálním pohybu plynule setrvačně (alpha = 0.22)
+                alpha = 0.50 if dist_diff > 300.0 else 0.22
 
-                # Hladké dotočení úhlu
-                sin_b = (1.0 - alpha) * math.sin(cur_rad) + alpha * math.sin(med_theta)
-                cos_b = (1.0 - alpha) * math.cos(cur_rad) + alpha * math.cos(med_theta)
+                self.robot_x = (1.0 - alpha) * self.robot_x + alpha * best_tx
+                self.robot_y = (1.0 - alpha) * self.robot_y + alpha * best_ty
+
+                # Hladké vyhlazení úhlu na jednotkové kružnici
+                sin_b = (1.0 - alpha) * math.sin(cur_rad) + alpha * math.sin(best_theta)
+                cos_b = (1.0 - alpha) * math.cos(cur_rad) + alpha * math.cos(best_theta)
                 self.robot_deg = math.degrees(math.atan2(sin_b, cos_b))
 
-                self.pose_confidence = min(1.0, 0.70 * self.pose_confidence + 0.30 * (best_quality + 0.3))
+                quality = min(1.0, best_inliers / max(2, len(self.ref_candles) + len(self.ref_walls)))
+                self.pose_confidence = min(1.0, 0.7 * self.pose_confidence + 0.3 * quality)
 
-                # Záznam trajektorie (pokud se robot posunul aspoň o 30 mm)
+                # Záznam do projeté trajektorie (každých 25 mm)
                 last_pt = self.trajectory[-1]
-                if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 30.0:
+                if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 25.0:
                     self.trajectory.append((self.robot_x, self.robot_y))
-                    if len(self.trajectory) > 250:
+                    if len(self.trajectory) > 300:
                         self.trajectory.pop(0)
 
             return True
         else:
-            # Ztráta signálu / zakrytí – robot pevně drží pozici, jistota jemně klesá
-            self.pose_confidence = max(0.0, self.pose_confidence - 0.03)
+            # Krátkodobý výpadek měření – držíme pozici, jistota jemně klesá
+            self.pose_confidence = max(0.0, self.pose_confidence - 0.02)
             return False
+
+    update_pose = estimate_pose
 
 
 # ============================================================
@@ -402,7 +424,7 @@ class StableFieldModel:
             if idx not in matched_c:
                 sc['missed'] += 1
 
-        self.candles = [c for c in self.candles if c['missed'] < 25 or (c['hits'] > 15 and c['missed'] < 80)]
+        self.candles = [c for c in self.candles if c['missed'] < 16 or (c['hits'] > 10 and c['missed'] < 25)]
 
         # 2. STĚNY (párování do 140 mm)
         matched_w = set()
@@ -447,7 +469,7 @@ class StableFieldModel:
             if idx not in matched_w:
                 sw['missed'] += 1
 
-        self.walls = [w for w in self.walls if w['missed'] < 20 or (w['hits'] > 12 and w['missed'] < 60)]
+        self.walls = [w for w in self.walls if w['missed'] < 14 or (w['hits'] > 8 and w['missed'] < 22)]
 
     def get_confirmed_candles(self):
         valid = [c for c in self.candles if c['hits'] >= 4]
@@ -1059,6 +1081,19 @@ class DualLidarVisualizer:
                 mid_x = (p_from[0] + p_to[0]) // 2
                 mid_y = (p_from[1] + p_to[1]) // 2
                 self.screen.blit(self.font_bold.render(f"-> {i}", True, (255, 230, 80)), (mid_x + 4, mid_y - 6))
+
+        # Živé detekce přetransformované do souřadnic hřiště (fialovo-růžové body potvrzující shodu)
+        if loc.locked and self.last_frame:
+            h_rad = math.radians(loc.robot_deg)
+            c_h = math.cos(h_rad)
+            s_h = math.sin(h_rad)
+            for lc in self.last_frame.get("candles", []):
+                cx, cy = float(lc[0]), float(lc[1])
+                wx = loc.robot_x + cx * c_h - cy * s_h
+                wy = loc.robot_y + cx * s_h + cy * c_h
+                lsx, lsy = self.to_screen(wx, wy, PANEL_W)
+                pygame.draw.circle(self.screen, (255, 120, 220), (lsx, lsy), 6, 1)
+                pygame.draw.circle(self.screen, (255, 240, 255), (lsx, lsy), 2)
 
         # ============================================================
         # POHYBLIVÝ RŮŽOVÝ ROBOT (ZOBRAZEN HNED OD ZAČÁTKU)

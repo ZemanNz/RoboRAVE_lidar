@@ -30,9 +30,9 @@ struct WallParams {
 
 struct CandleParams {
     float min_diameter_mm = 12.0f;       // Zmírněno na 12 mm pro spolehlivé zachycení i 2-bodových clusterů
-    float max_diameter_mm = 80.0f;
+    float max_diameter_mm = 100.0f;      // Zvýšeno na 100 mm pro spolehlivou detekci zblízka (20-40 cm)
     int min_points = 2;
-    int max_points = 8;
+    int max_points = 24;                 // Zvýšeno na 24 pro spolehlivou detekci zblízka (20-40 cm)
     float max_neighbor_dist_mm = 55.0f;
     float min_dist_to_wall_mm = 40.0f;
     float min_candle_separation_mm = 800.0f; // Minimální vzdálenost mezi dvěma svíčkami
@@ -629,9 +629,9 @@ private:
         // Hledáme malý shluk bodů (2 až 8 bodů) v zóně kolmice.
         float sumX = 0.0f, sumY = 0.0f;
         int rawInliers = 0;
-        int rawIndices[16];
+        int rawIndices[32];
 
-        for (int k = 0; k < count && rawInliers < 16; k++) {
+        for (int k = 0; k < count && rawInliers < 32; k++) {
             if (!points[k].valid || usedInWall[k]) continue;
 
             float vx = points[k].x - wall.x1;
@@ -648,11 +648,11 @@ private:
             }
         }
 
-        if (rawInliers >= 2 && rawInliers <= 8) {
+        if (rawInliers >= 2 && rawInliers <= 24) {
             float avgX = sumX / (float)rawInliers;
             float avgY = sumY / (float)rawInliers;
 
-            // Kontrola kompaktnosti shluku (svíčka má průměr 50 mm, body do cca 75 mm)
+            // Kontrola kompaktnosti shluku (svíčka má průměr 50 mm, body do cca 90 mm zblízka)
             float maxDistSq = 0.0f;
             for (int a = 0; a < rawInliers; a++) {
                 int ia = rawIndices[a];
@@ -665,7 +665,7 @@ private:
                 }
             }
 
-            if (maxDistSq <= (75.0f * 75.0f)) {
+            if (maxDistSq <= (90.0f * 90.0f)) {
                 if (outPerpDist) *outPerpDist = fabsf((avgX - wall.x1) * nx + (avgY - wall.y1) * ny);
                 if (outProjT) *outProjT = (avgX - wall.x1) * ux + (avgY - wall.y1) * uy;
 
