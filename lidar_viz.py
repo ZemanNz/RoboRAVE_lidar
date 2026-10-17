@@ -24,10 +24,10 @@ import pygame
 import serial
 from serial.tools import list_ports
 
-# Rozměry
-PANEL_W     = 840
-PANEL_H     = 850
-WIN_W       = PANEL_W * 2
+# Rozměry (Třípanelový vizualizér pro monitor 1920x1080)
+PANEL_W     = 600
+PANEL_H     = 820
+WIN_W       = PANEL_W * 3
 WIN_H       = PANEL_H
 
 # Barvy
@@ -83,6 +83,7 @@ class RobotLocalizer:
         self.trajectory       = [(0.0, 0.0)]
         self.is_stationary    = True
         self.candle_tracker   = []   # Krátkodobý tracker svíček (vyhlazení chvění, rozpad za 4 snímky)
+        self.last_match_info  = None # Informace o geometrickém rozhodování pro 3. panel
 
     def lock_map(self, conf_candles, conf_walls):
         """Uloží aktuální potvrzené svíčky a stěny jako fixní referenční mapu světa."""
@@ -91,6 +92,7 @@ class RobotLocalizer:
         self.ref_candle_dists = []
         self.ref_cw_dists     = []
         self.candle_tracker   = []
+        self.last_match_info  = None
 
         # Invariantní vzdálenosti mezi všemi svíčkami
         for i in range(len(self.ref_candles)):
@@ -123,6 +125,7 @@ class RobotLocalizer:
         self.ref_candle_dists = []
         self.ref_cw_dists = []
         self.candle_tracker = []
+        self.last_match_info = None
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_deg = 0.0
@@ -222,6 +225,7 @@ class RobotLocalizer:
         best_theta = None
         best_inliers = 0
         best_error = 9999.0
+        best_match_info = None
 
         # ========================================================
         # 1. PÁROVÁNÍ PODLE INVARIANTNÍCH VZDÁLENOSTÍ MEZI SVÍČKAMI
@@ -252,6 +256,7 @@ class RobotLocalizer:
                                 err_sum = 0.0
                                 inlier_src = []
                                 inlier_dst = []
+                                inlier_pairs = []
 
                                 for cp in cands:
                                     wx = cp[0]*cos_t - cp[1]*sin_t + tx
@@ -266,14 +271,21 @@ class RobotLocalizer:
                                         err_sum += min_d
                                         inlier_src.append(cp)
                                         inlier_dst.append((best_rc['x'], best_rc['y']))
+                                        inlier_pairs.append(((best_rc['x'], best_rc['y']), (wx, wy), min_d))
 
+                                matched_walls = []
                                 for wp in walls:
                                     wx = wp[0]*cos_t - wp[1]*sin_t + tx
                                     wy = wp[0]*sin_t + wp[1]*cos_t + ty
-                                    min_d = min((math.hypot(wx - rw['mx'], wy - rw['my']) for rw in self.ref_walls), default=9999.0)
-                                    if min_d < 220.0:
+                                    best_rw = None
+                                    min_d = 9999.0
+                                    for rw in self.ref_walls:
+                                        d = math.hypot(wx - rw['mx'], wy - rw['my'])
+                                        if d < min_d: min_d = d; best_rw = rw
+                                    if min_d < 220.0 and best_rw:
                                         inliers += 1
                                         err_sum += min_d
+                                        matched_walls.append(((best_rw['mx'], best_rw['my']), (wx, wy), min_d))
 
                                 avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
 
@@ -285,6 +297,20 @@ class RobotLocalizer:
                                         best_tx = rtx; best_ty = rty; best_theta = rth
                                     else:
                                         best_tx = tx; best_ty = ty; best_theta = th
+
+                                    best_match_info = {
+                                        'anchor_ref': (ref1, ref2),
+                                        'anchor_cur': (p1, p2),
+                                        'd_ref': d_ref,
+                                        'd_cur': d_cur,
+                                        'inlier_pairs': inlier_pairs,
+                                        'matched_walls': matched_walls,
+                                        'inliers': inliers,
+                                        'avg_error': avg_err,
+                                        'tx': best_tx,
+                                        'ty': best_ty,
+                                        'theta': best_theta
+                                    }
 
         # ========================================================
         # 2. ZÁLOŽNÍ METODA: PÁROVÁNÍ SVÍČKA-STĚNA / STĚNA-STĚNA
@@ -315,6 +341,8 @@ class RobotLocalizer:
 
                                 inliers = 0
                                 err_sum = 0.0
+                                inlier_pairs = []
+                                matched_walls = []
                                 for p in all_cur:
                                     wx = p[0]*cos_t - p[1]*sin_t + tx
                                     wy = p[0]*sin_t + p[1]*cos_t + ty
@@ -322,17 +350,35 @@ class RobotLocalizer:
                                     if min_d < 200.0:
                                         inliers += 1
                                         err_sum += min_d
+                                        if p[2] == 'c':
+                                            inlier_pairs.append(((r1[0], r1[1]), (wx, wy), min_d))
+                                        else:
+                                            matched_walls.append(((r2[0], r2[1]), (wx, wy), min_d))
 
                                 avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
                                 if inliers > best_inliers or (inliers == best_inliers and avg_err < best_error):
                                     best_inliers = inliers
                                     best_error = avg_err
                                     best_tx = tx; best_ty = ty; best_theta = th
+                                    best_match_info = {
+                                        'anchor_ref': (r1, r2),
+                                        'anchor_cur': (p1, p2),
+                                        'd_ref': d_ref,
+                                        'd_cur': d_cur,
+                                        'inlier_pairs': inlier_pairs,
+                                        'matched_walls': matched_walls,
+                                        'inliers': inliers,
+                                        'avg_error': avg_err,
+                                        'tx': best_tx,
+                                        'ty': best_ty,
+                                        'theta': best_theta
+                                    }
 
         # ========================================================
         # 3. APLIKACE VÝSLEDKU: STATICKÁ POLOHA, SETRVAČNOST A TRAJEKTORIE
         # ========================================================
         if best_inliers >= 2 and best_tx is not None:
+            self.last_match_info = best_match_info
             cur_rad = math.radians(self.robot_deg)
             dist_diff = math.hypot(best_tx - self.robot_x, best_ty - self.robot_y)
             ang_diff = abs(math.atan2(math.sin(best_theta - cur_rad), math.cos(best_theta - cur_rad)))
@@ -772,7 +818,7 @@ class DualLidarVisualizer:
         else:
             self.selected_object = (click_x_mm, click_y_mm, math.hypot(click_x_mm, click_y_mm))
 
-    def draw_panel_decorations(self, offset_x, is_right_panel=False):
+    def draw_panel_decorations(self, offset_x, panel_idx=0):
         cx = offset_x + PANEL_W // 2
         cy = PANEL_H // 2
         scale = (PANEL_W / 2.0) / self.view_span_mm
@@ -797,16 +843,24 @@ class DualLidarVisualizer:
         p4 = self.to_screen(-hw, 3500, offset_x)
         pygame.draw.polygon(self.screen, (28, 44, 34), [p1, p2, p3, p4], 1)
 
-        if not is_right_panel:
-            # LEVÝ RADAR: Robot pevně ve středu se směrovou šipkou dopředu
+        if panel_idx == 0:
+            # 1. PANEL (ŽIVÝ RADAR): Robot pevně ve středu se směrovou šipkou dopředu
             pygame.draw.circle(self.screen, (0, 180, 255), (cx, cy), 8)
             pygame.draw.line(self.screen, (0, 255, 180), (cx, cy), (cx, cy - 35), 3)
-        else:
-            # PRAVÁ GLOBÁLNÍ MAPA: Bod START (0,0) – výchozí pozice robota
+        elif panel_idx == 1:
+            # 2. PANEL (PŮVODNÍ STATICKÁ MAPA): Výchozí bod START (0,0) + orientační šipka
             pygame.draw.circle(self.screen, (0, 180, 220), (cx, cy), 7, 1)
             pygame.draw.line(self.screen, (0, 220, 255), (cx - 5, cy), (cx + 5, cy), 1)
             pygame.draw.line(self.screen, (0, 220, 255), (cx, cy - 5), (cx, cy + 5), 1)
+            pygame.draw.line(self.screen, (0, 220, 150), (cx, cy), (cx, cy - 25), 2)
             lbl_start = self.font_main.render("START (0,0)", True, (0, 220, 255))
+            self.screen.blit(lbl_start, (cx + 9, cy - 7))
+        else:
+            # 3. PANEL (NOVÁ MAPA & POROVNÁNÍ): Původní počátek START (0,0)
+            pygame.draw.circle(self.screen, (0, 180, 220), (cx, cy), 7, 1)
+            pygame.draw.line(self.screen, (0, 220, 255), (cx - 5, cy), (cx + 5, cy), 1)
+            pygame.draw.line(self.screen, (0, 220, 255), (cx, cy - 5), (cx, cy + 5), 1)
+            lbl_start = self.font_main.render("START (0,0)", True, (0, 190, 220))
             self.screen.blit(lbl_start, (cx + 9, cy - 7))
 
 
@@ -868,8 +922,12 @@ class DualLidarVisualizer:
         self.screen.blit(lbl, (lx, ly))
 
     def draw_left_live(self):
-        self.draw_panel_decorations(0, is_right_panel=False)
+        self.draw_panel_decorations(0, panel_idx=0)
         scale = (PANEL_W / 2.0) / self.view_span_mm
+
+        # Záhlaví panelu 1
+        lbl_p1 = self.font_big.render("1. ŽIVÝ RADAR (SENZOR)", True, (0, 220, 255))
+        self.screen.blit(lbl_p1, (295, 18))
 
         # Modrý záměrný výsek 20° (+-10° dopředu)
         self.draw_aiming_sector(0)
@@ -924,12 +982,13 @@ class DualLidarVisualizer:
                 self.screen.blit(lbl, (scx + 10, scy - 10))
 
         # ============================================================
-        # 1. PŮVODNÍ TELEMETRICKÝ PANEL (V LEVÉM HORNÍM ROHU)
+        # 1. TELEMETRICKÝ PANEL (V LEVÉM HORNÍM ROHU)
         # ============================================================
-        panel = pygame.Surface((340, 240))
-        panel.set_alpha(210)
+        panel = pygame.Surface((260, 200))
+        panel.set_alpha(215)
         panel.fill((10, 12, 16))
-        self.screen.blit(panel, (15, 15))
+        self.screen.blit(panel, (12, 12))
+        pygame.draw.rect(self.screen, (30, 45, 60), (12, 12, 260, 200), 1)
 
         f = self.last_frame
         fps      = f.get("fps", 0.0)
@@ -940,37 +999,38 @@ class DualLidarVisualizer:
         n_walls  = len(f.get("walls", []))
         n_cands  = len(f.get("candles", []))
 
-        y = 25
+        y = 20
         title = self.font_big.render("ESP32 D200 DETEKTOR", True, ACCENT_COLOR)
-        self.screen.blit(title, (25, y)); y += 26
+        self.screen.blit(title, (22, y)); y += 24
 
         def row(label, val, col=(200, 210, 225)):
             nonlocal y
             t1 = self.font_main.render(label, True, (130, 140, 155))
             t2 = self.font_bold.render(str(val), True, col)
-            self.screen.blit(t1, (25, y))
-            self.screen.blit(t2, (180, y))
-            y += 20
+            self.screen.blit(t1, (22, y))
+            self.screen.blit(t2, (155, y))
+            y += 18
 
         row("Frekvence skenu:", f"{fps:.1f} Hz", (100, 255, 120) if fps > 4.5 else (255, 150, 0))
         row("Filtrované body:", f"{pts} bodů")
-        row("Výpočet na ESP32:", f"{calc_us} µs ({calc_us/1000.0:.2f} ms)", (0, 220, 255))
+        row("Výpočet ESP32:", f"{calc_us/1000.0:.2f} ms", (0, 220, 255))
         row("Volná RAM ESP32:", f"{heap // 1024} kB")
         row("CRC8 Chyby:", f"{crc_err}", (255, 80, 80) if crc_err > 0 else (120, 200, 120))
         row("Nalezené stěny:", f"{n_walls} (zeleně)", (0, 255, 100))
         row("Nalezené svíčky:", f"{n_cands} (červeně)", (255, 80, 80))
 
         # ============================================================
-        # 2. PŮVODNÍ PANEL OVLÁDÁNÍ (V LEVÉM DOLNÍM ROHU) - PŘESNĚ DLE SCREENSHOTU
+        # 2. PANEL OVLÁDÁNÍ (V LEVÉM DOLNÍM ROHU)
         # ============================================================
-        cmd_panel = pygame.Surface((440, 120))
-        cmd_panel.set_alpha(200)
+        cmd_panel = pygame.Surface((576, 95))
+        cmd_panel.set_alpha(210)
         cmd_panel.fill((10, 12, 16))
-        self.screen.blit(cmd_panel, (15, PANEL_H - 135))
+        self.screen.blit(cmd_panel, (12, PANEL_H - 105))
+        pygame.draw.rect(self.screen, (55, 45, 30), (12, PANEL_H - 105, 576, 95), 1)
 
-        cy = PANEL_H - 128
+        cy = PANEL_H - 99
         h_title = self.font_bold.render("LADĚNÍ ZA BĚHU (PŘÍKAZY DO ESP32):", True, (240, 200, 80))
-        self.screen.blit(h_title, (25, cy)); cy += 22
+        self.screen.blit(h_title, (22, cy)); cy += 20
 
         fov_txt = "[F] Režim: 180° Kužel" if self.fov_limited else "[F] Režim: 360° Celé pole"
         freeze_txt = "[MEZERNÍK] ODMRAZIT" if self.frozen else "[MEZERNÍK] ZMRAZIT SKEN"
@@ -978,29 +1038,30 @@ class DualLidarVisualizer:
         c1 = self.font_main.render(f"{fov_txt} | {freeze_txt}", True, (220, 220, 220))
         c2 = self.font_main.render(f"Rozsah: [R/E] Min: {self.min_range} mm | [T/G] Max: {self.max_range} mm", True, (170, 180, 195))
         c3 = self.font_main.render(f"Odrazivost: [I/K] Min Intenzita: {self.min_intensity}", True, (170, 180, 195))
-        self.screen.blit(c1, (25, cy)); cy += 18
-        self.screen.blit(c2, (25, cy)); cy += 18
-        self.screen.blit(c3, (25, cy))
+        self.screen.blit(c1, (22, cy)); cy += 17
+        self.screen.blit(c2, (22, cy)); cy += 17
+        self.screen.blit(c3, (22, cy))
 
         # Info o vybraném bodě po kliknutí
         if self.selected_object:
-            sel_panel = pygame.Surface((320, 70))
+            sel_panel = pygame.Surface((250, 60))
             sel_panel.set_alpha(220)
             sel_panel.fill((25, 20, 10))
-            self.screen.blit(sel_panel, (PANEL_W - 335, 15))
-            pygame.draw.rect(self.screen, (255, 180, 0), (PANEL_W - 335, 15, 320, 70), 1)
+            self.screen.blit(sel_panel, (PANEL_W - 262, 12))
+            pygame.draw.rect(self.screen, (255, 180, 0), (PANEL_W - 262, 12, 250, 60), 1)
 
-            st = self.font_bold.render("INSPEKCE VYBRANÉHO BODU:", True, (255, 200, 50))
-            self.screen.blit(st, (PANEL_W - 325, 22))
+            st = self.font_bold.render("INSPEKCE BODU:", True, (255, 200, 50))
+            self.screen.blit(st, (PANEL_W - 254, 18))
             sx_mm, sy_mm, s_dist = self.selected_object
-            s_info = self.font_main.render(f"X: {sx_mm:.0f} mm, Y: {sy_mm:.0f} mm | R: {s_dist:.0f} mm", True, (255, 255, 255))
-            self.screen.blit(s_info, (PANEL_W - 325, 45))
+            s_info = self.font_main.render(f"X:{sx_mm:.0f} Y:{sy_mm:.0f} | R:{s_dist:.0f}mm", True, (255, 255, 255))
+            self.screen.blit(s_info, (PANEL_W - 254, 40))
 
-    def draw_right_stable(self):
-        self.draw_panel_decorations(PANEL_W, is_right_panel=True)
+    def draw_mid_original(self):
+        """2. PANEL: Původní statická mapa (referenční etalon hřiště nasbíraný z výchozího bodu)."""
+        offset_x = PANEL_W
+        self.draw_panel_decorations(offset_x, panel_idx=1)
         scale = (PANEL_W / 2.0) / self.view_span_mm
 
-        # Získání objektů: po uzamčení bereme PEVNÝ referenční svět, před uzamčením živý model
         loc = self.localizer
         if loc.locked:
             conf_candles = loc.ref_candles
@@ -1009,59 +1070,72 @@ class DualLidarVisualizer:
             conf_candles = self.model.get_confirmed_candles()
             conf_walls   = self.model.get_confirmed_walls()
 
-        # Stabilní stěny a fialový koridor
+        # 1. Stěny a koridory původní referenční mapy
         for w in conf_walls:
-            self.draw_wall_corridor(w['x1'], w['y1'], w['x2'], w['y2'], w['len'], PANEL_W)
-            p1 = self.to_screen(w['x1'], w['y1'], PANEL_W)
-            p2 = self.to_screen(w['x2'], w['y2'], PANEL_W)
-            pygame.draw.line(self.screen, (80, 255, 140), p1, p2, 6)
-            pygame.draw.circle(self.screen, (150, 255, 180), p1, 5)
-            pygame.draw.circle(self.screen, (150, 255, 180), p2, 5)
+            self.draw_wall_corridor(w['x1'], w['y1'], w['x2'], w['y2'], w['len'], offset_x)
+            p1 = self.to_screen(w['x1'], w['y1'], offset_x)
+            p2 = self.to_screen(w['x2'], w['y2'], offset_x)
+            pygame.draw.line(self.screen, (60, 230, 120), p1, p2, 5)
+            pygame.draw.circle(self.screen, (130, 255, 170), p1, 4)
+            pygame.draw.circle(self.screen, (130, 255, 170), p2, 4)
             mx = (p1[0] + p2[0]) // 2
             my = (p1[1] + p2[1]) // 2
-            lbl = self.font_bold.render(f"STĚNA {int(w['len'])}mm", True, (80, 255, 140))
-            self.screen.blit(lbl, (mx + 8, my - 8))
+            lbl = self.font_bold.render(f"STĚNA {int(w['len'])}mm", True, (60, 230, 120))
+            self.screen.blit(lbl, (mx + 6, my - 7))
 
-        # Stabilní svíčky
+        # 2. Invariantní rozměry a vzdálenosti (zlaté spojnice) mezi svíčkami
+        if len(conf_candles) >= 2:
+            for i in range(len(conf_candles)):
+                for j in range(i + 1, len(conf_candles)):
+                    c1 = conf_candles[i]
+                    c2 = conf_candles[j]
+                    d_mm = math.hypot(c1['x'] - c2['x'], c1['y'] - c2['y'])
+                    p1 = self.to_screen(c1['x'], c1['y'], offset_x)
+                    p2 = self.to_screen(c2['x'], c2['y'], offset_x)
+                    pygame.draw.line(self.screen, (130, 110, 35), p1, p2, 1)
+                    mid_x = (p1[0] + p2[0]) // 2
+                    mid_y = (p1[1] + p2[1]) // 2
+                    lbl_d = self.font_main.render(f"{d_mm:.0f} mm", True, (215, 185, 60))
+                    self.screen.blit(lbl_d, (mid_x + 3, mid_y - 6))
+
+        # 3. Svíčky původní referenční mapy
         target_cand = None
         for idx, c in enumerate(conf_candles):
-            scx, scy = self.to_screen(c['x'], c['y'], PANEL_W)
-            r_ring = int(250.0 * scale) # Zóna dosahu 25 cm kolem svíčky
+            scx, scy = self.to_screen(c['x'], c['y'], offset_x)
+            r_ring = int(220.0 * scale)
             d = int(math.hypot(c['x'], c['y']))
             ang_deg = math.degrees(math.atan2(c['x'], c['y'])) if c['y'] != 0 else 0.0
             in_sector = (abs(ang_deg) <= 10.0 and c['y'] > 0)
             walls_cnt = c.get('walls_count', 0)
             wall_info = f"[{walls_cnt} stěn]" if walls_cnt > 0 else "[BEZ STĚNY]"
 
-            if in_sector:
-                if target_cand is None: target_cand = c
+            if in_sector and target_cand is None:
+                target_cand = c
                 pygame.draw.circle(self.screen, (0, 180, 220), (scx, scy), max(4, r_ring), 1)
                 pygame.draw.circle(self.screen, (0, 255, 255), (scx, scy), 8)
                 pygame.draw.circle(self.screen, (255, 255, 255), (scx, scy), 3)
-                pygame.draw.line(self.screen, (0, 255, 255), (scx - 14, scy), (scx + 14, scy), 1)
-                pygame.draw.line(self.screen, (0, 255, 255), (scx, scy - 14), (scx, scy + 14), 1)
+                pygame.draw.line(self.screen, (0, 255, 255), (scx - 12, scy), (scx + 12, scy), 1)
+                pygame.draw.line(self.screen, (0, 255, 255), (scx, scy - 12), (scx, scy + 12), 1)
                 lbl = self.font_bold.render(f"★ 1. CÍL ({d}mm, {ang_deg:+.1f}°) {wall_info}", True, (0, 240, 255))
                 self.screen.blit(lbl, (scx + 14, scy - 12))
             else:
-                ring_color = (255, 140, 80) if walls_cnt > 0 else (255, 60, 60)
-                pygame.draw.circle(self.screen, ring_color, (scx, scy), max(4, r_ring), 1)
-                pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 8)
+                ring_col = (255, 140, 80) if walls_cnt > 0 else (255, 60, 60)
+                pygame.draw.circle(self.screen, ring_col, (scx, scy), max(4, r_ring), 1)
+                pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 7)
                 pygame.draw.circle(self.screen, (255, 240, 180), (scx, scy), 3)
                 lbl_color = (255, 130, 130) if walls_cnt > 0 else (255, 80, 80)
                 lbl = self.font_bold.render(f"SVÍČKA #{idx+1} ({d}mm) {wall_info}", True, lbl_color)
                 self.screen.blit(lbl, (scx + 12, scy - 12))
 
-        # Trasa mezi potvrzenými svíčkami (1. cíl je svíčka v záměrném výseku)
+        # 4. Trasa mezi potvrzenými svíčkami
         if len(conf_candles) >= 2:
             unvisited = list(conf_candles)
             route = [(0.0, 0.0)]
             curr = (0.0, 0.0)
-
             if target_cand and target_cand in unvisited:
                 unvisited.remove(target_cand)
                 route.append((target_cand['x'], target_cand['y']))
                 curr = (target_cand['x'], target_cand['y'])
-
             while unvisited:
                 best_i = 0
                 best_d = 999999.0
@@ -1073,83 +1147,213 @@ class DualLidarVisualizer:
                 next_c = unvisited.pop(best_i)
                 route.append((next_c['x'], next_c['y']))
                 curr = (next_c['x'], next_c['y'])
-
             for i in range(1, len(route)):
-                p_from = self.to_screen(route[i-1][0], route[i-1][1], PANEL_W)
-                p_to   = self.to_screen(route[i][0], route[i][1], PANEL_W)
+                p_from = self.to_screen(route[i-1][0], route[i-1][1], offset_x)
+                p_to   = self.to_screen(route[i][0], route[i][1], offset_x)
                 pygame.draw.line(self.screen, (255, 215, 0), p_from, p_to, 2)
                 mid_x = (p_from[0] + p_to[0]) // 2
                 mid_y = (p_from[1] + p_to[1]) // 2
                 self.screen.blit(self.font_bold.render(f"-> {i}", True, (255, 230, 80)), (mid_x + 4, mid_y - 6))
 
-        # Živé detekce přetransformované do souřadnic hřiště (fialovo-růžové body potvrzující shodu)
-        if loc.locked and self.last_frame:
-            h_rad = math.radians(loc.robot_deg)
-            c_h = math.cos(h_rad)
-            s_h = math.sin(h_rad)
-            for lc in self.last_frame.get("candles", []):
-                cx, cy = float(lc[0]), float(lc[1])
-                wx = loc.robot_x + cx * c_h - cy * s_h
-                wy = loc.robot_y + cx * s_h + cy * c_h
-                lsx, lsy = self.to_screen(wx, wy, PANEL_W)
-                pygame.draw.circle(self.screen, (255, 120, 220), (lsx, lsy), 6, 1)
-                pygame.draw.circle(self.screen, (255, 240, 255), (lsx, lsy), 2)
+        # 5. Horní stavový box Panelu 2
+        stat_box = pygame.Surface((570, 56))
+        stat_box.set_alpha(220)
+        stat_box.fill((10, 12, 16))
+        self.screen.blit(stat_box, (offset_x + 15, 12))
+        border_col = (80, 255, 160) if loc.locked else (240, 180, 40)
+        pygame.draw.rect(self.screen, border_col, (offset_x + 15, 12, 570, 56), 1)
 
-        # ============================================================
-        # POHYBLIVÝ RŮŽOVÝ ROBOT (ZOBRAZEN HNED OD ZAČÁTKU)
-        # ============================================================
-        PINK_MAIN = (255, 70, 180)
-        PINK_BG   = (65, 15, 45)
-        PINK_LITE = (255, 150, 215)
+        if loc.locked:
+            t_stat = self.font_big.render("2. PŮVODNÍ STATICKÁ MAPA 🔒 ZAMČENA", True, (80, 255, 160))
+            sub_str = f"Referenční etalon: {len(conf_candles)} svíček, {len(conf_walls)} stěn | Pevná geometrie uložena"
+        else:
+            t_stat = self.font_big.render("2. PŮVODNÍ STATICKÁ MAPA [SBĚR]", True, (240, 180, 40))
+            sub_str = f"Svíčky: {len(conf_candles)}/4 | Stěny: {len(conf_walls)}/6 | Skenů: {self.model.total_scans} (stiskni [L] pro zamknutí)"
+        self.screen.blit(t_stat, (offset_x + 25, 17))
+        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 40))
 
-        # 1. Trajektorie pohybu (projetá trasa od startu)
+        # 6. Spodní nápověda Panelu 2
+        tip_box = pygame.Surface((570, 75))
+        tip_box.set_alpha(210)
+        tip_box.fill((10, 12, 16))
+        self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
+        pygame.draw.rect(self.screen, (50, 45, 30), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
+        self.screen.blit(self.font_bold.render("REFERENČNÍ MAPA HŘIŠTĚ:", True, (240, 200, 80)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Slouží jako pevný souřadnicový systém vygenerovaný na výchozím místě robota.", True, (200, 210, 225)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• [L] Zamknout mapu jako etalon | [C] Resetovat a sbírat znovu", True, (150, 160, 180)), (offset_x + 25, PANEL_H - 43))
+
+    def draw_right_comparison(self):
+        """3. PANEL: Nová statická mapa & Porovnání s referenční mapou a rozhodovací prvky."""
+        offset_x = PANEL_W * 2
+        self.draw_panel_decorations(offset_x, panel_idx=2)
+        scale = (PANEL_W / 2.0) / self.view_span_mm
+        loc = self.localizer
+
+        if not loc.locked:
+            # Informační panel o neaktivní lokalizaci (čeká na [L])
+            msg_box = pygame.Surface((540, 130))
+            msg_box.set_alpha(220)
+            msg_box.fill((12, 14, 18))
+            bx = offset_x + 30
+            by = PANEL_H // 2 - 65
+            self.screen.blit(msg_box, (bx, by))
+            pygame.draw.rect(self.screen, (70, 60, 40), (bx, by, 540, 130), 1)
+            
+            t1 = self.font_big.render("3. NOVÁ MAPA & POROVNÁNÍ", True, (200, 200, 200))
+            t2 = self.font_bold.render("Čekám na zamknutí výchozí mapy...", True, (240, 180, 50))
+            t3 = self.font_main.render("1. Nechte na výchozím místě stabilizovat mapu v panelu 2.", True, (160, 170, 185))
+            t4 = self.font_main.render("2. Stiskněte [L] pro zamknutí etalonu a aktivaci lokalizace robota.", True, (80, 255, 160))
+            t5 = self.font_main.render("3. Po posunu robota se zde zobrazí poloha a rozhodovací přímky.", True, (255, 120, 220))
+            self.screen.blit(t1, (bx + 20, by + 12))
+            self.screen.blit(t2, (bx + 20, by + 36))
+            self.screen.blit(t3, (bx + 20, by + 60))
+            self.screen.blit(t4, (bx + 20, by + 80))
+            self.screen.blit(t5, (bx + 20, by + 100))
+            return
+
+        # ========================================================
+        # LOKALIZACE JE AKTIVNÍ: ZOBRAZENÍ SROVNÁNÍ
+        # ========================================================
+
+        # 1. Tlumená referenční mapa na pozadí (ground truth etalon)
+        for rw in loc.ref_walls:
+            p1 = self.to_screen(rw['x1'], rw['y1'], offset_x)
+            p2 = self.to_screen(rw['x2'], rw['y2'], offset_x)
+            pygame.draw.line(self.screen, (25, 75, 45), p1, p2, 3)
+            pygame.draw.circle(self.screen, (40, 110, 65), p1, 3)
+            pygame.draw.circle(self.screen, (40, 110, 65), p2, 3)
+
+        for rc in loc.ref_candles:
+            scx, scy = self.to_screen(rc['x'], rc['y'], offset_x)
+            pygame.draw.circle(self.screen, (100, 50, 50), (scx, scy), 8, 1)
+            pygame.draw.line(self.screen, (100, 50, 50), (scx - 4, scy), (scx + 4, scy), 1)
+            pygame.draw.line(self.screen, (100, 50, 50), (scx, scy - 4), (scx, scy + 4), 1)
+
+        # 2. Vektor posunu od počátku START (0,0) k robotu
+        p_start = self.to_screen(0, 0, offset_x)
+        p_rob   = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
+        dist_from_start = math.hypot(loc.robot_x, loc.robot_y)
+
+        if dist_from_start > 15.0:
+            pygame.draw.line(self.screen, (150, 70, 170), p_start, p_rob, 2)
+            vmx = (p_start[0] + p_rob[0]) // 2
+            vmy = (p_start[1] + p_rob[1]) // 2
+            lbl_posun = self.font_bold.render(f"Δ {dist_from_start:.0f} mm", True, (220, 120, 255))
+            self.screen.blit(lbl_posun, (vmx + 6, vmy - 8))
+
+        # 3. Trajektorie pohybu robota
         if len(loc.trajectory) >= 2:
-            traj_px = [self.to_screen(tp[0], tp[1], PANEL_W) for tp in loc.trajectory]
+            traj_px = [self.to_screen(tp[0], tp[1], offset_x) for tp in loc.trajectory]
             pygame.draw.lines(self.screen, (220, 50, 140), False, traj_px, 2)
             for tpt in traj_px[::4]:
                 pygame.draw.circle(self.screen, (255, 100, 180), tpt, 2)
 
-        # 2. Souřadnice a rotace robota
-        rx, ry = self.to_screen(loc.robot_x, loc.robot_y, PANEL_W)
+        # 4. Transformované objekty ze senzoru do světových souřadnic hřiště
         heading_rad = math.radians(loc.robot_deg)
         cos_h = math.cos(heading_rad)
         sin_h = math.sin(heading_rad)
 
-        # 3. Zorný vějíř LiDARu dopředu (průhledný kužel ukazující kam se dívá senzor)
+        # Transformované stěny (čerstvě viděné senzorem z polohy robota)
+        for w in self.last_frame.get("walls", []):
+            tw_x1 = loc.robot_x + w[0] * cos_h - w[1] * sin_h
+            tw_y1 = loc.robot_y + w[0] * sin_h + w[1] * cos_h
+            tw_x2 = loc.robot_x + w[2] * cos_h - w[3] * sin_h
+            tw_y2 = loc.robot_y + w[2] * sin_h + w[3] * cos_h
+
+            self.draw_wall_corridor(tw_x1, tw_y1, tw_x2, tw_y2, w[4], offset_x)
+            p1 = self.to_screen(tw_x1, tw_y1, offset_x)
+            p2 = self.to_screen(tw_x2, tw_y2, offset_x)
+            pygame.draw.line(self.screen, (0, 255, 120), p1, p2, 4)
+            pygame.draw.circle(self.screen, (100, 255, 160), p1, 3)
+            pygame.draw.circle(self.screen, (100, 255, 160), p2, 3)
+
+        # Transformované svíčky (ze senzoru)
+        for c in self.last_frame.get("candles", []):
+            tc_x = loc.robot_x + c[0] * cos_h - c[1] * sin_h
+            tc_y = loc.robot_y + c[0] * sin_h + c[1] * cos_h
+            scx, scy = self.to_screen(tc_x, tc_y, offset_x)
+            pygame.draw.circle(self.screen, (255, 50, 120), (scx, scy), 8)
+            pygame.draw.circle(self.screen, (255, 230, 255), (scx, scy), 3)
+
+        # ========================================================
+        # 5. BAREVNÉ ROZHODOVACÍ PŘÍMKY A KORESPONDENCE (MATCHING)
+        # ========================================================
+        match = loc.last_match_info or {}
+
+        # A) Zlatá kotevní přímka (Anchor baseline)
+        anchor_ref = match.get('anchor_ref')
+        if anchor_ref and len(anchor_ref) == 2:
+            ar1, ar2 = anchor_ref
+            ap1 = self.to_screen(ar1[0], ar1[1], offset_x)
+            ap2 = self.to_screen(ar2[0], ar2[1], offset_x)
+            pygame.draw.line(self.screen, (255, 215, 0), ap1, ap2, 3)
+            pygame.draw.circle(self.screen, (255, 235, 100), ap1, 6, 2)
+            pygame.draw.circle(self.screen, (255, 235, 100), ap2, 6, 2)
+            amx = (ap1[0] + ap2[0]) // 2
+            amy = (ap1[1] + ap2[1]) // 2
+            d_ref = match.get('d_ref', 0.0)
+            d_cur = match.get('d_cur', 0.0)
+            lbl_k = self.font_bold.render(f"★ KOTVA ({d_cur:.0f} mm ≈ {d_ref:.0f} mm)", True, (255, 220, 50))
+            self.screen.blit(lbl_k, (amx + 6, amy - 8))
+
+        # B) Tyrkysové/azurové paprsky korespondence mezi referencí a novou pozicí
+        for (ref_pt, cur_world_pt, err_mm) in match.get('inlier_pairs', []):
+            rp = self.to_screen(ref_pt[0], ref_pt[1], offset_x)
+            cp = self.to_screen(cur_world_pt[0], cur_world_pt[1], offset_x)
+            pygame.draw.line(self.screen, (0, 240, 255), rp, cp, 2)
+            pygame.draw.circle(self.screen, (0, 255, 255), cp, 4)
+            if err_mm > 5.0:
+                mid_x = (rp[0] + cp[0]) // 2
+                mid_y = (rp[1] + cp[1]) // 2
+                lbl_e = self.font_main.render(f"±{err_mm:.0f}mm", True, (0, 240, 255))
+                self.screen.blit(lbl_e, (mid_x + 4, mid_y - 6))
+
+        # C) Zelené paprsky korespondence pro stěny
+        for (ref_pt, cur_world_pt, err_mm) in match.get('matched_walls', []):
+            rp = self.to_screen(ref_pt[0], ref_pt[1], offset_x)
+            cp = self.to_screen(cur_world_pt[0], cur_world_pt[1], offset_x)
+            pygame.draw.line(self.screen, (80, 255, 140), rp, cp, 1)
+
+        # ========================================================
+        # 6. POHYBLIVÝ RŮŽOVÝ ROBOT
+        # ========================================================
+        PINK_MAIN = (255, 70, 180)
+        PINK_BG   = (65, 15, 45)
+        PINK_LITE = (255, 150, 215)
+        rx, ry = p_rob
+
+        # Zorný kužel LiDARu dopředu
         cone_r_mm = 650.0
         cone_pts = [(rx, ry)]
         for deg_off in range(-20, 21, 5):
             a_rad = heading_rad + math.radians(deg_off)
             kx = loc.robot_x + cone_r_mm * math.sin(a_rad)
             ky = loc.robot_y + cone_r_mm * math.cos(a_rad)
-            cone_pts.append(self.to_screen(kx, ky, PANEL_W))
+            cone_pts.append(self.to_screen(kx, ky, offset_x))
         if len(cone_pts) > 2:
             s_cone = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
-            cone_local = [(pt[0] - PANEL_W, pt[1]) for pt in cone_pts]
+            cone_local = [(pt[0] - offset_x, pt[1]) for pt in cone_pts]
             pygame.draw.polygon(s_cone, (255, 60, 170, 25), cone_local)
             pygame.draw.lines(s_cone, (255, 80, 190, 80), False, cone_local, 1)
-            self.screen.blit(s_cone, (PANEL_W, 0))
+            self.screen.blit(s_cone, (offset_x, 0))
 
-        # 4. Tělo robota: Růžový čtverec / šasi (240 x 240 mm v reálném měřítku hřiště)
+        # Tělo robota: Růžový čtverec / šasi (240 x 240 mm)
         hw_mm = 120.0
         local_box = [(-hw_mm, -hw_mm), (hw_mm, -hw_mm), (hw_mm, hw_mm), (-hw_mm, hw_mm)]
         box_px = []
         for (bx, by) in local_box:
-            # Otočení v rovině
             gx = loc.robot_x + bx * cos_h + by * sin_h
             gy = loc.robot_y - bx * sin_h + by * cos_h
-            box_px.append(self.to_screen(gx, gy, PANEL_W))
+            box_px.append(self.to_screen(gx, gy, offset_x))
 
         pygame.draw.polygon(self.screen, PINK_BG, box_px, 0)
         pygame.draw.polygon(self.screen, PINK_MAIN, box_px, 2)
 
-        # 5. Výrazná růžová šipka pohledu dopředu
+        # Šipka pohledu dopředu
         arrow_len = 26
         tip_x = int(rx + arrow_len * sin_h)
         tip_y = int(ry - arrow_len * cos_h)
         pygame.draw.line(self.screen, PINK_MAIN, (rx, ry), (tip_x, tip_y), 3)
-
-        # Křídla šipky
         wing_len = 8
         wing_rad = math.radians(145)
         for sgn in [-1, 1]:
@@ -1158,66 +1362,53 @@ class DualLidarVisualizer:
             wy2 = int(tip_y - wing_len * math.cos(w_ang))
             pygame.draw.line(self.screen, PINK_MAIN, (tip_x, tip_y), (wx2, wy2), 2)
 
-        # 6. Malý LiDAR senzor uprostřed těla
         pygame.draw.circle(self.screen, PINK_LITE, (rx, ry), 5)
         pygame.draw.circle(self.screen, (255, 255, 255), (rx, ry), 2)
 
-        # 7. Textový popisek u robota
+        # Text u robota
         conf_pct = int(loc.pose_confidence * 100)
-        d_from_start = math.hypot(loc.robot_x, loc.robot_y)
         stat_tag = " [KLID]" if loc.is_stationary else " [POHYB]"
         lbl_rob = self.font_bold.render(
-            f"ROBOT ({loc.robot_x:+.0f}, {loc.robot_y:+.0f}mm) {loc.robot_deg:+.0f}°{stat_tag} [{conf_pct}%]",
-            True, PINK_LITE if loc.locked else (190, 150, 180))
-        lbl_x = min(rx + 18, PANEL_W * 2 - lbl_rob.get_width() - 8)
+            f"ROBOT ({loc.robot_x:+.0f}, {loc.robot_y:+.0f}mm) {loc.robot_deg:+.0f}°{stat_tag}",
+            True, PINK_LITE)
+        lbl_x = min(rx + 16, offset_x + PANEL_W - lbl_rob.get_width() - 8)
         self.screen.blit(lbl_rob, (lbl_x, ry - 10))
 
-        # ============================================================
-        # HORNÍ STAVOVÝ PANEL
-        # ============================================================
-        stat_box = pygame.Surface((490, 56))
+        # ========================================================
+        # 7. HORNÍ STAVOVÝ PANEL PANELU 3
+        # ========================================================
+        stat_box = pygame.Surface((570, 56))
         stat_box.set_alpha(220)
         stat_box.fill((10, 12, 16))
-        self.screen.blit(stat_box, (PANEL_W + 15, 15))
-        border_col = (80, 255, 160) if loc.locked else (60, 50, 30)
-        pygame.draw.rect(self.screen, border_col, (PANEL_W + 15, 15, 490, 56), 1)
+        self.screen.blit(stat_box, (offset_x + 15, 12))
+        pygame.draw.rect(self.screen, (80, 255, 160), (offset_x + 15, 12, 570, 56), 1)
 
-        if loc.locked:
-            mode_txt = " 🔒 STATICKÁ POLOHA (KLID)" if loc.is_stationary else " 🔒 POHYB ROBOTA"
-        else:
-            mode_txt = " [L] ZAMKNOUT MAPU"
-        t_stat = self.font_big.render(f"MAPA HŘIŠTĚ{mode_txt}", True,
-                                      (80, 255, 160) if loc.locked else ACCENT_MAP)
-        self.screen.blit(t_stat, (PANEL_W + 25, 20))
+        inliers_cnt = match.get('inliers', 0)
+        avg_err_val = match.get('avg_error', 0.0)
+        t_stat = self.font_big.render("3. NOVÁ MAPA & POROVNÁNÍ 🔒 AKTIVNÍ", True, (80, 255, 160))
+        self.screen.blit(t_stat, (offset_x + 25, 17))
+        sub_str = f"Shoda: {inliers_cnt} inlierů | Chyba: {avg_err_val:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
+        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 40))
 
-        if loc.locked:
-            sub_str = f"Kotvy: {len(conf_candles)} svíček, {len(conf_walls)} stěn | Posun: {d_from_start:.0f} mm | Jistota: {conf_pct}%"
-            # Barevný pruh jistoty
-            bar_w = 460
-            fill_w = int(bar_w * loc.pose_confidence)
-            pygame.draw.rect(self.screen, (35, 20, 30), (PANEL_W + 25, 54, bar_w, 6))
-            bar_col = (min(255, int(255 * (1.0 - loc.pose_confidence))),
-                       min(255, int(80 + 175 * loc.pose_confidence)), 120)
-            pygame.draw.rect(self.screen, bar_col, (PANEL_W + 25, 54, fill_w, 6))
-        else:
-            sub_str = f"Svíčky: {len(conf_candles)}/4 | Stěny: {len(conf_walls)}/6 | Skenů: {self.model.total_scans}"
+        # Barevný pruh jistoty
+        bar_w = 540
+        fill_w = int(bar_w * loc.pose_confidence)
+        pygame.draw.rect(self.screen, (35, 20, 30), (offset_x + 25, 54, bar_w, 6))
+        bar_col = (min(255, int(255 * (1.0 - loc.pose_confidence))),
+                   min(255, int(80 + 175 * loc.pose_confidence)), 120)
+        pygame.draw.rect(self.screen, bar_col, (offset_x + 25, 54, fill_w, 6))
 
-        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (PANEL_W + 25, 38))
-
-        # ============================================================
-        # SPODNÍ NÁPOVĚDA
-        # ============================================================
-        tip_box = pygame.Surface((440, 95))
+        # ========================================================
+        # 8. SPODNÍ NÁPOVĚDA A LEGENDA ROZHODOVÁNÍ
+        # ========================================================
+        tip_box = pygame.Surface((570, 75))
         tip_box.set_alpha(210)
         tip_box.fill((10, 12, 16))
-        self.screen.blit(tip_box, (PANEL_W + 15, PANEL_H - 110))
-        pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, PANEL_H - 110, 440, 95), 1)
-        self.screen.blit(self.font_bold.render("ORIENTACE A LOKALIZACE ROBOTA:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 102))
-        self.screen.blit(self.font_main.render("• [L] Zamknout mapu: uloží svíčky jako pevné body hřiště", True, (80, 255, 160)), (PANEL_W + 25, PANEL_H - 82))
-        self.screen.blit(self.font_main.render("• Růžový robot ukazuje aktuální polohu [X, Y] a směr senzoru", True, PINK_LITE), (PANEL_W + 25, PANEL_H - 64))
-        self.screen.blit(self.font_main.render("• [C] Resetovat mapu | Bod START zůstává v počátku (0,0)", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 46))
-
-
+        self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
+        pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
+        self.screen.blit(self.font_bold.render("ROZHODOVACÍ ELEMENTY MAP-MATCHINGU:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Zlatá přímka: Kotevní dvojice se shodnou vzdáleností (invariant)", True, (255, 220, 60)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Tyrkysové paprsky: Korespondence mezi původní a novou svíčkou", True, (0, 240, 255)), (offset_x + 25, PANEL_H - 43))
 
     def run(self):
         while self.running:
@@ -1286,10 +1477,12 @@ class DualLidarVisualizer:
 
             self.screen.fill(BG_COLOR)
             self.draw_left_live()
-            self.draw_right_stable()
+            self.draw_mid_original()
+            self.draw_right_comparison()
 
-            # Vertikální předěl mezi panely
+            # Vertikální předěly mezi 3 panely
             pygame.draw.line(self.screen, (40, 48, 60), (PANEL_W, 0), (PANEL_W, WIN_H), 2)
+            pygame.draw.line(self.screen, (40, 48, 60), (PANEL_W * 2, 0), (PANEL_W * 2, WIN_H), 2)
 
             pygame.display.flip()
             self.clock.tick(60)
