@@ -81,6 +81,8 @@ class RobotLocalizer:
         self.robot_deg        = 0.0  # 0° = robot se dívá ve směru světového Y+
         self.pose_confidence  = 0.0  # 0.0 – 1.0
         self.trajectory       = [(0.0, 0.0)] # Ujetá trasa od startu
+        self.pose_history     = []   # Klouzavé okno posledních měření [(tx, ty, theta_rad, quality)]
+        self.is_stationary    = True # Příznak, zda robot stojí na místě (statická poloha)
 
     def lock_map(self, conf_candles, conf_walls):
         """Uloží aktuální potvrzené svíčky a stěny jako fixní referenční svět."""
@@ -108,6 +110,8 @@ class RobotLocalizer:
         self.robot_deg = 0.0
         self.pose_confidence = 1.0
         self.trajectory = [(0.0, 0.0)]
+        self.pose_history = [(0.0, 0.0, 0.0, 1.0)] * 5
+        self.is_stationary = True
 
         # Vyžadujeme alespoň 1 svíčku + 1 stěnu nebo 2 stěny
         self.locked = (len(self.ref_candles) + len(self.ref_walls)) >= 2
@@ -125,6 +129,8 @@ class RobotLocalizer:
         self.robot_deg = 0.0
         self.pose_confidence = 0.0
         self.trajectory = [(0.0, 0.0)]
+        self.pose_history = []
+        self.is_stationary = True
 
     @staticmethod
     def _rigid_transform_2d(src, dst):
@@ -155,9 +161,8 @@ class RobotLocalizer:
 
     def estimate_pose(self, live_candles, live_walls):
         """
-        Odhad polohy robota v reálném čase.
-        live_candles: pole svíček ze senzoru [ [x, y, ...], ... ]
-        live_walls:   pole stěn ze senzoru   [ [x1, y1, x2, y2, len, ...], ... ]
+        Odhad polohy robota v reálném čase se silnou setrvačností,
+        odmítáním odlehlých měření (outlierů) a klidovým filtrem stání na místě.
         """
         if not self.locked or (len(self.ref_candles) + len(self.ref_walls)) < 2:
             return False
@@ -166,16 +171,15 @@ class RobotLocalizer:
         cur_cands = [(c[0], c[1]) for c in live_candles]
         cur_walls = [((w[0]+w[2])*0.5, (w[1]+w[3])*0.5) for w in live_walls]
 
-        best_tx = None
-        best_ty = None
-        best_theta = None
+        raw_tx = None
+        raw_ty = None
+        raw_theta = None
         best_quality = 0.0
 
         # ========================================================
         # METODA 1: Geometrická konstelace svíček (přesnost na mm)
         # ========================================================
         if len(cur_cands) >= 2 and len(self.ref_candles) >= 2:
-            cand_matches = []
             for a in range(len(cur_cands)):
                 for b in range(a + 1, len(cur_cands)):
                     d_cur = math.hypot(cur_cands[a][0] - cur_cands[b][0],
@@ -193,13 +197,11 @@ class RobotLocalizer:
                                 tx, ty, th = self._rigid_transform_2d([c1, c2], [ref1, ref2])
                                 cos_t = math.cos(th); sin_t = math.sin(th)
 
-                                # Ověříme počet inlierů napříč všemi svíčkami
                                 inliers = 0
                                 err_sum = 0.0
                                 for cp in cur_cands:
                                     wx = cp[0]*cos_t - cp[1]*sin_t + tx
                                     wy = cp[0]*sin_t + cp[1]*cos_t + ty
-                                    # Nejbližší ref svíčka
                                     min_d = min(math.hypot(wx - rc['x'], wy - rc['y']) for rc in self.ref_candles)
                                     if min_d < 160.0:
                                         inliers += 1
@@ -209,16 +211,15 @@ class RobotLocalizer:
                                     quality = (inliers / len(self.ref_candles)) * max(0.1, 1.0 - (err_sum / inliers) / 160.0)
                                     if quality > best_quality:
                                         best_quality = quality
-                                        best_tx = tx
-                                        best_ty = ty
-                                        best_theta = th
+                                        raw_tx = tx
+                                        raw_ty = ty
+                                        raw_theta = th
 
         # ========================================================
         # METODA 2: Typově uvědomělý RANSAC + Procrustes zpřesnění
         # (Pokud metoda 1 nenašla shodu – např. vidíme jen 1 svíčku a stěny)
         # ========================================================
         if best_quality < 0.35:
-            # Sestavíme typované body
             cur_pts = [(c[0], c[1], 'c') for c in cur_cands]
             cur_pts += [(w[0], w[1], 'w') for w in cur_walls]
 
@@ -234,10 +235,10 @@ class RobotLocalizer:
                     for j in range(i + 1, MAX_C):
                         d_cur = math.hypot(cur_pts[i][0] - cur_pts[j][0],
                                            cur_pts[i][1] - cur_pts[j][1])
-                        if d_cur < 200.0: continue # Příliš blízko u sebe
+                        if d_cur < 200.0: continue
 
                         for ri in range(n_ref):
-                            if cur_pts[i][2] != ref_pts[ri][2]: continue # Typ musí sedět (svíčka-svíčka, stěna-stěna)
+                            if cur_pts[i][2] != ref_pts[ri][2]: continue
                             for rj in range(n_ref):
                                 if rj == ri: continue
                                 if cur_pts[j][2] != ref_pts[rj][2]: continue
@@ -246,7 +247,6 @@ class RobotLocalizer:
                                                    ref_pts[ri][1] - ref_pts[rj][1])
                                 if abs(d_cur - d_ref) > 130.0: continue
 
-                                # Spočítáme počáteční transformaci
                                 p1 = (cur_pts[i][0], cur_pts[i][1])
                                 p2 = (cur_pts[j][0], cur_pts[j][1])
                                 r1 = (ref_pts[ri][0], ref_pts[ri][1])
@@ -264,7 +264,7 @@ class RobotLocalizer:
                                     best_match_d = 9999.0
                                     best_rp = None
                                     for rp in ref_pts:
-                                        if cp[2] == rp[2]: # stejný typ
+                                        if cp[2] == rp[2]:
                                             d = math.hypot(wx - rp[0], wy - rp[1])
                                             if d < best_match_d:
                                                 best_match_d = d
@@ -278,42 +278,79 @@ class RobotLocalizer:
                                 if len(inlier_src) >= 2:
                                     quality = (len(inlier_src) / max(n_cur, n_ref)) * max(0.1, 1.0 - (total_err / len(inlier_src)) / 180.0)
                                     if quality > best_quality:
-                                        # Procrustes zpřesnění ze VŠECH inlierů!
                                         ref_tx, ref_ty, ref_th = self._rigid_transform_2d(inlier_src, inlier_dst)
                                         best_quality = quality
-                                        best_tx = ref_tx
-                                        best_ty = ref_ty
-                                        best_theta = ref_th
+                                        raw_tx = ref_tx
+                                        raw_ty = ref_ty
+                                        raw_theta = ref_th
 
         # ========================================================
-        # METODA 3: Časový filtr (EMA + Hold) a plynulý update
+        # METODA 3: Outlier Filter, Klouzavý medián a Klidový zámek
         # ========================================================
-        if best_quality >= 0.25 and best_tx is not None:
-            # Odhad byl úspěšný – hladce vyhladíme
-            alpha = 0.40  # 40% čerstvý odhad, 60% historie pro eliminaci třesu
+        if best_quality >= 0.25 and raw_tx is not None:
+            # 1. OUTLIER GATE: Odmítnutí nerealistických skoků (blbostí)
+            if self.pose_confidence > 0.40:
+                jump_dist = math.hypot(raw_tx - self.robot_x, raw_ty - self.robot_y)
+                cur_rad = math.radians(self.robot_deg)
+                diff_ang = abs(math.atan2(math.sin(raw_theta - cur_rad), math.cos(raw_theta - cur_rad)))
+                if jump_dist > 300.0 or diff_ang > math.radians(35.0):
+                    # Zjevná anomálie / haluz z jednoho špatného snímku -> ignorujeme!
+                    self.pose_confidence = max(0.1, self.pose_confidence - 0.02)
+                    return True
 
-            self.robot_x = (1.0 - alpha) * self.robot_x + alpha * best_tx
-            self.robot_y = (1.0 - alpha) * self.robot_y + alpha * best_ty
+            # 2. Uložení do klouzavého okna posledních odhadů
+            self.pose_history.append((raw_tx, raw_ty, raw_theta, best_quality))
+            if len(self.pose_history) > 7:
+                self.pose_history.pop(0)
 
-            # Hladké vyhlazení orientace přes sin/cos
-            cur_th = math.radians(self.robot_deg)
-            sin_blend = (1.0 - alpha) * math.sin(cur_th) + alpha * math.sin(best_theta)
-            cos_blend = (1.0 - alpha) * math.cos(cur_th) + alpha * math.cos(best_theta)
-            self.robot_deg = math.degrees(math.atan2(sin_blend, cos_blend))
+            # 3. ROBUSTNÍ MEDIÁN přes klouzavé okno (odstraní jakýkoliv jednotlivý šum)
+            all_x = sorted([m[0] for m in self.pose_history])
+            all_y = sorted([m[1] for m in self.pose_history])
+            mid_idx = len(all_x) // 2
+            med_tx = all_x[mid_idx]
+            med_ty = all_y[mid_idx]
 
-            self.pose_confidence = min(1.0, 0.65 * self.pose_confidence + 0.35 * (best_quality + 0.3))
+            # Medián úhlu vzhledem k aktuální orientaci
+            cur_rad = math.radians(self.robot_deg)
+            ang_diffs = sorted([math.atan2(math.sin(m[2] - cur_rad), math.cos(m[2] - cur_rad)) for m in self.pose_history])
+            med_theta = cur_rad + ang_diffs[len(ang_diffs) // 2]
 
-            # Ukládání bodů trajektorie (pokud se robot posunul aspoň o 25 mm)
-            last_pt = self.trajectory[-1]
-            if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 25.0:
-                self.trajectory.append((self.robot_x, self.robot_y))
-                if len(self.trajectory) > 250:
-                    self.trajectory.pop(0)
+            # 4. DEADBAND: Detekce stání na místě (Statická poloha lidaru)
+            # Pokud je odchylka mediánu od stávající polohy malá (< 32 mm a < 2.0°),
+            # robot STOJÍ NA MÍSTĚ a jeho poloha je zafixována (žádný třes ani skákání)!
+            dist_to_med = math.hypot(med_tx - self.robot_x, med_ty - self.robot_y)
+            ang_to_med = abs(math.atan2(math.sin(med_theta - cur_rad), math.cos(med_theta - cur_rad)))
+
+            if dist_to_med < 32.0 and ang_to_med < math.radians(2.0):
+                # Robot stojí na místě -> držíme absolutně statickou polohu!
+                self.is_stationary = True
+                self.pose_confidence = min(1.0, self.pose_confidence + 0.05)
+            else:
+                # Robot se skutečně pohnul -> plynulý setrvačný posun (hladké EMA s nízkým alpha)
+                self.is_stationary = False
+                alpha = 0.14  # Silná setrvačnost (hladký přirozený pohyb bez trhání)
+
+                self.robot_x = (1.0 - alpha) * self.robot_x + alpha * med_tx
+                self.robot_y = (1.0 - alpha) * self.robot_y + alpha * med_ty
+
+                # Hladké dotočení úhlu
+                sin_b = (1.0 - alpha) * math.sin(cur_rad) + alpha * math.sin(med_theta)
+                cos_b = (1.0 - alpha) * math.cos(cur_rad) + alpha * math.cos(med_theta)
+                self.robot_deg = math.degrees(math.atan2(sin_b, cos_b))
+
+                self.pose_confidence = min(1.0, 0.70 * self.pose_confidence + 0.30 * (best_quality + 0.3))
+
+                # Záznam trajektorie (pokud se robot posunul aspoň o 30 mm)
+                last_pt = self.trajectory[-1]
+                if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 30.0:
+                    self.trajectory.append((self.robot_x, self.robot_y))
+                    if len(self.trajectory) > 250:
+                        self.trajectory.pop(0)
 
             return True
         else:
-            # Ztráta signálu / zakrytí – robot drží pozici, jistota jemně klesá
-            self.pose_confidence = max(0.0, self.pose_confidence - 0.04)
+            # Ztráta signálu / zakrytí – robot pevně drží pozici, jistota jemně klesá
+            self.pose_confidence = max(0.0, self.pose_confidence - 0.03)
             return False
 
 
@@ -1093,8 +1130,9 @@ class DualLidarVisualizer:
         # 7. Textový popisek u robota
         conf_pct = int(loc.pose_confidence * 100)
         d_from_start = math.hypot(loc.robot_x, loc.robot_y)
+        stat_tag = " [KLID]" if loc.is_stationary else " [POHYB]"
         lbl_rob = self.font_bold.render(
-            f"ROBOT ({loc.robot_x:+.0f}, {loc.robot_y:+.0f}mm) {loc.robot_deg:+.0f}° [{conf_pct}%]",
+            f"ROBOT ({loc.robot_x:+.0f}, {loc.robot_y:+.0f}mm) {loc.robot_deg:+.0f}°{stat_tag} [{conf_pct}%]",
             True, PINK_LITE if loc.locked else (190, 150, 180))
         lbl_x = min(rx + 18, PANEL_W * 2 - lbl_rob.get_width() - 8)
         self.screen.blit(lbl_rob, (lbl_x, ry - 10))
@@ -1109,8 +1147,11 @@ class DualLidarVisualizer:
         border_col = (80, 255, 160) if loc.locked else (60, 50, 30)
         pygame.draw.rect(self.screen, border_col, (PANEL_W + 15, 15, 490, 56), 1)
 
-        loc_status = " 🔒 LOKALIZACE AKTIVNÍ" if loc.locked else " [L] ZAMKNOUT MAPU"
-        t_stat = self.font_big.render(f"MAPA HŘIŠTĚ{loc_status}", True,
+        if loc.locked:
+            mode_txt = " 🔒 STATICKÁ POLOHA (KLID)" if loc.is_stationary else " 🔒 POHYB ROBOTA"
+        else:
+            mode_txt = " [L] ZAMKNOUT MAPU"
+        t_stat = self.font_big.render(f"MAPA HŘIŠTĚ{mode_txt}", True,
                                       (80, 255, 160) if loc.locked else ACCENT_MAP)
         self.screen.blit(t_stat, (PANEL_W + 25, 20))
 
