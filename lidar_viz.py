@@ -51,96 +51,94 @@ def get_baudrate():
 
 
 # ============================================================
-#  Lokalizátor robota – 3 pevné kotvy (trilateration + Procrustes)
+#  Pokročilý lokalizátor robota (Hybrid Candle Constellation + RANSAC)
 # ============================================================
 class RobotLocalizer:
     """
-    Vybere 3 nejstabilnější stěny jako pevné kotvy A, B, C.
-    Uloží jejich vzájemné vzdálenosti d_AB, d_AC, d_BC jako "otisk" mapy.
-    Při pohybu robota hledá v aktuálním skenu trojici stěn, jejichž vzájemné
-    vzdálenosti nejlépe souhlasí s uloženým otiskem, a z korespondence
-    A↔A', B↔B', C↔C' vypočítá tuhý transform (posun + rotace).
-
-    Proč stěny (ne svíčky)?
-    - Střed stěny (midpoint) je určen z mnoha LiDAR bodů → nižší šum
-    - Stěny jsou velké objekty, nejsou přerušeny překážkami
-    - Svíčky mohou být občas zakryty nebo zaměněny
+    Vysoce robustní lokalizátor robota na hřišti:
+    1. Primární kotvy = SVÍČKY (Candle Constellation Matching):
+       Svíčky jsou válce o průměru 5 cm – jejich střed je neměnný nezávisle na úhlu pohledu.
+       Vzdálenosti mezi všemi dvojicemi svíček tvoří unikátní geometrický otisk (fingerprint).
+       Jakmile robot vidí alespoň 2 svíčky, jejich vzájemná vzdálenost okamžitě a jednoznačně
+       určí jejich identitu a z nich analyticky polohu (x, y) i orientaci (theta).
+    2. Sekundární kotvy = STĚNY (Type-Aware RANSAC + Procrustes):
+       Pokud robot vidí méně než 2 svíčky, použije se osvědčený RANSAC, ale s typovou kontrolou
+       (svíčka se páruje výhradně se svíčkou, stěna se stěnou) a kontrolou geometrické vzdálenosti.
+    3. Analytické zpřesnění (Procrustes Least-Squares):
+       Ze všech potvrzených inlierů se spočítá optimální tuhý 2D transform bez jakéhokoliv driftu.
+    4. Časový filtr (EMA + Hold) a záznam ujeté trajektorie robota.
     """
 
     def __init__(self):
-        self.locked          = False
-        # 3 referenční kotvy ve světovém souřadnicovém systému
-        self.anchors         = []   # [{'x','y','label','hits'}]  – max 3
-        # Vzdálenosti mezi kotvami: [(i,j,dist_mm), ...]
-        self.anchor_dists    = []
-        # Odhadovaná pozice robota ve světovém rámci
-        self.robot_x         = 0.0
-        self.robot_y         = 0.0
-        self.robot_deg       = 0.0   # 0° = robot se dívá ve směru Y+
-        self.pose_confidence = 0.0   # 0.0 – 1.0
-        self._history        = []    # EMA buffer posledních 8 odhadů
+        self.locked           = False
+        self.ref_candles      = []   # Uložené referenční svíčky ve světových souřadnicích
+        self.ref_walls        = []   # Uložené referenční stěny ve světových souřadnicích
+        self.candle_dists     = []   # [(i, j, dist_mm)] pro všechny dvojice referenčních svíček
+        self.wall_dists       = []   # [(i, j, dist_mm)] pro středy stěn
 
-    # ------------------------------------------------------------------
+        self.robot_x          = 0.0  # mm ve světových souřadnicích (start = [0,0])
+        self.robot_y          = 0.0
+        self.robot_deg        = 0.0  # 0° = robot se dívá ve směru světového Y+
+        self.pose_confidence  = 0.0  # 0.0 – 1.0
+        self.trajectory       = [(0.0, 0.0)] # Ujetá trasa od startu
+
     def lock_map(self, conf_candles, conf_walls):
-        """
-        Vybere 3 nejlepší kotvy z potvrzených stěn (fallback na svíčky)
-        a uloží jejich světové souřadnice + vzájemné vzdálenosti.
-        """
+        """Uloží aktuální potvrzené svíčky a stěny jako fixní referenční svět."""
+        self.ref_candles = [dict(c) for c in conf_candles]
+        self.ref_walls   = [dict(w) for w in conf_walls]
+        self.candle_dists = []
+        self.wall_dists   = []
+
+        # Vzdálenosti mezi všemi dvojicemi svíček
+        for i in range(len(self.ref_candles)):
+            for j in range(i + 1, len(self.ref_candles)):
+                d = math.hypot(self.ref_candles[i]['x'] - self.ref_candles[j]['x'],
+                               self.ref_candles[i]['y'] - self.ref_candles[j]['y'])
+                self.candle_dists.append((i, j, d))
+
+        # Vzdálenosti mezi středy stěn
+        for i in range(len(self.ref_walls)):
+            for j in range(i + 1, len(self.ref_walls)):
+                d = math.hypot(self.ref_walls[i]['mx'] - self.ref_walls[j]['mx'],
+                               self.ref_walls[i]['my'] - self.ref_walls[j]['my'])
+                self.wall_dists.append((i, j, d))
+
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_deg = 0.0
+        self.pose_confidence = 1.0
+        self.trajectory = [(0.0, 0.0)]
+
+        # Vyžadujeme alespoň 1 svíčku + 1 stěnu nebo 2 stěny
+        self.locked = (len(self.ref_candles) + len(self.ref_walls)) >= 2
+        return self.locked
+
+    def unlock_map(self):
+        """Odemkne mapu a vrátí robota na start."""
         self.locked = False
-        self.anchors = []
-        self.anchor_dists = []
-        self._history = []
-        self.robot_x = self.robot_y = self.robot_deg = 0.0
+        self.ref_candles = []
+        self.ref_walls = []
+        self.candle_dists = []
+        self.wall_dists = []
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_deg = 0.0
         self.pose_confidence = 0.0
+        self.trajectory = [(0.0, 0.0)]
 
-        # Kotvy = top-3 stěny řazené dle počtu hitů (nejjistější stěny)
-        sorted_walls = sorted(conf_walls, key=lambda w: w.get('hits', 0), reverse=True)
-        labels = ['A', 'B', 'C']
-        for w in sorted_walls[:3]:
-            lbl = labels[len(self.anchors)]
-            self.anchors.append({'x': w['mx'], 'y': w['my'],
-                                 'label': lbl, 'hits': w.get('hits', 0)})
-
-        # Pokud máme méně než 3 stěny, doplníme svíčkami
-        if len(self.anchors) < 3:
-            sorted_c = sorted(conf_candles, key=lambda c: c.get('hits', 0), reverse=True)
-            for c in sorted_c:
-                if len(self.anchors) >= 3: break
-                lbl = labels[len(self.anchors)]
-                self.anchors.append({'x': c['x'], 'y': c['y'],
-                                     'label': lbl, 'hits': c.get('hits', 0)})
-
-        if len(self.anchors) < 2:
-            return False
-
-        # Uložení vzájemných vzdáleností (fingerprint mapy)
-        for i in range(len(self.anchors)):
-            for j in range(i + 1, len(self.anchors)):
-                d = math.hypot(self.anchors[i]['x'] - self.anchors[j]['x'],
-                               self.anchors[i]['y'] - self.anchors[j]['y'])
-                self.anchor_dists.append((i, j, d))
-
-        self.locked = True
-        return True
-
-    # ------------------------------------------------------------------
     @staticmethod
     def _rigid_transform_2d(src, dst):
-        """
-        Vypočítá nejlepší tuhý 2D transform (rotace + translace) z N korespondencí
-        src[i] → dst[i] pomocí Procrustes analýzy (uzavřený tvar pro 2D).
-        Vrací (dx, dy, theta_rad).
-        """
+        """Analytický 2D Procrustes fit (rotace + posun) ze seznamu dvojic bodů."""
         n = len(src)
         if n == 0: return 0.0, 0.0, 0.0
+        if n == 1:
+            return dst[0][0] - src[0][0], dst[0][1] - src[0][1], 0.0
 
-        # Centroidy
         cx_s = sum(p[0] for p in src) / n
         cy_s = sum(p[1] for p in src) / n
         cx_d = sum(p[0] for p in dst) / n
         cy_d = sum(p[1] for p in dst) / n
 
-        # Kovarianční matice H = Σ (src_c)^T (dst_c)  (2×2 → skaláry)
         h00 = h01 = h10 = h11 = 0.0
         for (sx, sy), (dx, dy) in zip(src, dst):
             scx = sx - cx_s; scy = sy - cy_s
@@ -148,96 +146,175 @@ class RobotLocalizer:
             h00 += scx * dcx; h01 += scx * dcy
             h10 += scy * dcx; h11 += scy * dcy
 
-        # Pro 2D: sin(θ) = h10-h01, cos(θ) = h00+h11  (analytická SVD)
         theta = math.atan2(h10 - h01, h00 + h11)
         cos_t = math.cos(theta); sin_t = math.sin(theta)
 
-        # Translace: dst_centroid = R * src_centroid + t
         tx = cx_d - (cx_s * cos_t - cy_s * sin_t)
         ty = cy_d - (cx_s * sin_t + cy_s * cos_t)
         return tx, ty, theta
 
-    # ------------------------------------------------------------------
-    def _match_to_anchors(self, cur_walls, cur_candles):
+    def estimate_pose(self, live_candles, live_walls):
         """
-        Hledá trojici aktuálních landmarků, jejichž vzájemné vzdálenosti
-        nejlépe souhlasí s uloženým otiskem kotev.
-        Vrací seznam korespondencí [(cur_pt, ref_anchor), ...] nebo None.
+        Odhad polohy robota v reálném čase.
+        live_candles: pole svíček ze senzoru [ [x, y, ...], ... ]
+        live_walls:   pole stěn ze senzoru   [ [x1, y1, x2, y2, len, ...], ... ]
         """
-        import itertools
-
-        # Sestavíme seznam aktuálních landmarků (stěny mají přednost)
-        cur_lm = [(w['mx'], w['my']) for w in sorted(cur_walls,
-                   key=lambda w: w.get('hits', 0), reverse=True)]
-        cur_lm += [(c['x'], c['y']) for c in sorted(cur_candles,
-                    key=lambda c: c.get('hits', 0), reverse=True)]
-
-        n_anc = len(self.anchors)
-        if len(cur_lm) < n_anc: return None
-
-        ref_pts = [(a['x'], a['y']) for a in self.anchors]
-
-        best_err = 9999.0
-        best_corr = None
-
-        # Zkusíme všechny permutace n_anc aktuálních bodů mapovaných na kotvy
-        for combo in itertools.combinations(range(len(cur_lm)), n_anc):
-            for perm in itertools.permutations(combo):
-                # Zkontrolujeme shodu vzdáleností (fingerprint matching)
-                err = 0.0
-                for (ai, aj, ref_d) in self.anchor_dists:
-                    pi = cur_lm[perm[ai]]
-                    pj = cur_lm[perm[aj]]
-                    cur_d = math.hypot(pi[0] - pj[0], pi[1] - pj[1])
-                    err += abs(cur_d - ref_d)
-                err /= max(1, len(self.anchor_dists))
-
-                if err < best_err:
-                    best_err = err
-                    best_corr = [(cur_lm[perm[i]], ref_pts[i]) for i in range(n_anc)]
-
-        # Přijmeme jen pokud průměrná vzdálenostní chyba < 300 mm
-        if best_corr is None or best_err > 300.0:
-            return None
-        return best_corr, best_err
-
-    # ------------------------------------------------------------------
-    def estimate_pose(self, conf_candles, conf_walls):
-        """Odhad polohy robota. Volá se každý frame po zamknutí mapy."""
-        if not self.locked or len(self.anchors) < 2:
+        if not self.locked or (len(self.ref_candles) + len(self.ref_walls)) < 2:
             return False
 
-        result = self._match_to_anchors(conf_walls, conf_candles)
-        if result is None:
-            self.pose_confidence = max(0.0, self.pose_confidence - 0.05)
+        # Získání bodů ze senzoru (sensor frame)
+        cur_cands = [(c[0], c[1]) for c in live_candles]
+        cur_walls = [((w[0]+w[2])*0.5, (w[1]+w[3])*0.5) for w in live_walls]
+
+        best_tx = None
+        best_ty = None
+        best_theta = None
+        best_quality = 0.0
+
+        # ========================================================
+        # METODA 1: Geometrická konstelace svíček (přesnost na mm)
+        # ========================================================
+        if len(cur_cands) >= 2 and len(self.ref_candles) >= 2:
+            cand_matches = []
+            for a in range(len(cur_cands)):
+                for b in range(a + 1, len(cur_cands)):
+                    d_cur = math.hypot(cur_cands[a][0] - cur_cands[b][0],
+                                       cur_cands[a][1] - cur_cands[b][1])
+
+                    # Hledáme odpovídající dvojici v referenci
+                    for (ri, rj, d_ref) in self.candle_dists:
+                        if abs(d_cur - d_ref) < 85.0:  # Tolerance do 85 mm na rozteč svíček
+                            pA = cur_cands[a]; pB = cur_cands[b]
+                            rI = (self.ref_candles[ri]['x'], self.ref_candles[ri]['y'])
+                            rJ = (self.ref_candles[rj]['x'], self.ref_candles[rj]['y'])
+
+                            # Vyzkoušíme obě orientace (A->I, B->J) i (A->J, B->I)
+                            for (c1, c2, ref1, ref2) in [(pA, pB, rI, rJ), (pA, pB, rJ, rI)]:
+                                tx, ty, th = self._rigid_transform_2d([c1, c2], [ref1, ref2])
+                                cos_t = math.cos(th); sin_t = math.sin(th)
+
+                                # Ověříme počet inlierů napříč všemi svíčkami
+                                inliers = 0
+                                err_sum = 0.0
+                                for cp in cur_cands:
+                                    wx = cp[0]*cos_t - cp[1]*sin_t + tx
+                                    wy = cp[0]*sin_t + cp[1]*cos_t + ty
+                                    # Nejbližší ref svíčka
+                                    min_d = min(math.hypot(wx - rc['x'], wy - rc['y']) for rc in self.ref_candles)
+                                    if min_d < 160.0:
+                                        inliers += 1
+                                        err_sum += min_d
+
+                                if inliers >= 2:
+                                    quality = (inliers / len(self.ref_candles)) * max(0.1, 1.0 - (err_sum / inliers) / 160.0)
+                                    if quality > best_quality:
+                                        best_quality = quality
+                                        best_tx = tx
+                                        best_ty = ty
+                                        best_theta = th
+
+        # ========================================================
+        # METODA 2: Typově uvědomělý RANSAC + Procrustes zpřesnění
+        # (Pokud metoda 1 nenašla shodu – např. vidíme jen 1 svíčku a stěny)
+        # ========================================================
+        if best_quality < 0.35:
+            # Sestavíme typované body
+            cur_pts = [(c[0], c[1], 'c') for c in cur_cands]
+            cur_pts += [(w[0], w[1], 'w') for w in cur_walls]
+
+            ref_pts = [(rc['x'], rc['y'], 'c') for rc in self.ref_candles]
+            ref_pts += [(rw['mx'], rw['my'], 'w') for rw in self.ref_walls]
+
+            n_cur = len(cur_pts)
+            n_ref = len(ref_pts)
+
+            if n_cur >= 2 and n_ref >= 2:
+                MAX_C = min(n_cur, 8)
+                for i in range(MAX_C):
+                    for j in range(i + 1, MAX_C):
+                        d_cur = math.hypot(cur_pts[i][0] - cur_pts[j][0],
+                                           cur_pts[i][1] - cur_pts[j][1])
+                        if d_cur < 200.0: continue # Příliš blízko u sebe
+
+                        for ri in range(n_ref):
+                            if cur_pts[i][2] != ref_pts[ri][2]: continue # Typ musí sedět (svíčka-svíčka, stěna-stěna)
+                            for rj in range(n_ref):
+                                if rj == ri: continue
+                                if cur_pts[j][2] != ref_pts[rj][2]: continue
+
+                                d_ref = math.hypot(ref_pts[ri][0] - ref_pts[rj][0],
+                                                   ref_pts[ri][1] - ref_pts[rj][1])
+                                if abs(d_cur - d_ref) > 130.0: continue
+
+                                # Spočítáme počáteční transformaci
+                                p1 = (cur_pts[i][0], cur_pts[i][1])
+                                p2 = (cur_pts[j][0], cur_pts[j][1])
+                                r1 = (ref_pts[ri][0], ref_pts[ri][1])
+                                r2 = (ref_pts[rj][0], ref_pts[rj][1])
+                                tx, ty, th = self._rigid_transform_2d([p1, p2], [r1, r2])
+                                cos_t = math.cos(th); sin_t = math.sin(th)
+
+                                inlier_src = []
+                                inlier_dst = []
+                                total_err = 0.0
+
+                                for cp in cur_pts:
+                                    wx = cp[0]*cos_t - cp[1]*sin_t + tx
+                                    wy = cp[0]*sin_t + cp[1]*cos_t + ty
+                                    best_match_d = 9999.0
+                                    best_rp = None
+                                    for rp in ref_pts:
+                                        if cp[2] == rp[2]: # stejný typ
+                                            d = math.hypot(wx - rp[0], wy - rp[1])
+                                            if d < best_match_d:
+                                                best_match_d = d
+                                                best_rp = rp
+
+                                    if best_match_d < 180.0 and best_rp is not None:
+                                        inlier_src.append((cp[0], cp[1]))
+                                        inlier_dst.append((best_rp[0], best_rp[1]))
+                                        total_err += best_match_d
+
+                                if len(inlier_src) >= 2:
+                                    quality = (len(inlier_src) / max(n_cur, n_ref)) * max(0.1, 1.0 - (total_err / len(inlier_src)) / 180.0)
+                                    if quality > best_quality:
+                                        # Procrustes zpřesnění ze VŠECH inlierů!
+                                        ref_tx, ref_ty, ref_th = self._rigid_transform_2d(inlier_src, inlier_dst)
+                                        best_quality = quality
+                                        best_tx = ref_tx
+                                        best_ty = ref_ty
+                                        best_theta = ref_th
+
+        # ========================================================
+        # METODA 3: Časový filtr (EMA + Hold) a plynulý update
+        # ========================================================
+        if best_quality >= 0.25 and best_tx is not None:
+            # Odhad byl úspěšný – hladce vyhladíme
+            alpha = 0.40  # 40% čerstvý odhad, 60% historie pro eliminaci třesu
+
+            self.robot_x = (1.0 - alpha) * self.robot_x + alpha * best_tx
+            self.robot_y = (1.0 - alpha) * self.robot_y + alpha * best_ty
+
+            # Hladké vyhlazení orientace přes sin/cos
+            cur_th = math.radians(self.robot_deg)
+            sin_blend = (1.0 - alpha) * math.sin(cur_th) + alpha * math.sin(best_theta)
+            cos_blend = (1.0 - alpha) * math.cos(cur_th) + alpha * math.cos(best_theta)
+            self.robot_deg = math.degrees(math.atan2(sin_blend, cos_blend))
+
+            self.pose_confidence = min(1.0, 0.65 * self.pose_confidence + 0.35 * (best_quality + 0.3))
+
+            # Ukládání bodů trajektorie (pokud se robot posunul aspoň o 25 mm)
+            last_pt = self.trajectory[-1]
+            if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 25.0:
+                self.trajectory.append((self.robot_x, self.robot_y))
+                if len(self.trajectory) > 250:
+                    self.trajectory.pop(0)
+
+            return True
+        else:
+            # Ztráta signálu / zakrytí – robot drží pozici, jistota jemně klesá
+            self.pose_confidence = max(0.0, self.pose_confidence - 0.04)
             return False
-
-        corr, match_err = result
-        src = [c[0] for c in corr]   # aktuální body (sensor frame)
-        dst = [c[1] for c in corr]   # referenční kotvy (world frame)
-
-        tx, ty, theta = self._rigid_transform_2d(src, dst)
-
-        # Confidence: klesá s chybou fingerprint matchingu
-        conf = max(0.0, min(1.0, 1.0 - match_err / 300.0))
-
-        # EMA buffer pro hladký pohyb ikony robota
-        self._history.append((tx, ty, theta, conf))
-        if len(self._history) > 8:
-            self._history.pop(0)
-
-        w_sum = 0.0; wx = 0.0; wy = 0.0; wt_s = 0.0; wt_c = 0.0; wc = 0.0
-        for (hx, hy, ht, hc) in self._history:
-            w = max(0.01, hc)
-            wx += hx * w; wy += hy * w; w_sum += w
-            wt_s += math.sin(ht) * w; wt_c += math.cos(ht) * w
-            wc += hc
-        if w_sum > 0:
-            self.robot_x   = wx / w_sum
-            self.robot_y   = wy / w_sum
-            self.robot_deg = math.degrees(math.atan2(wt_s / w_sum, wt_c / w_sum))
-            self.pose_confidence = min(1.0, wc / len(self._history))
-        return True
 
 
 # ============================================================
@@ -571,7 +648,8 @@ class DualLidarVisualizer:
     def on_parameter_changed(self):
         """Vždy při změně parametrů (FoV/dosah/intenzita) se vygeneruje čistá nová mapa."""
         self.model.reset()
-        print("[MAPA] Parametry upraveny -> stabilní mapa vyčištěna a generuje se nanovo.")
+        self.localizer.unlock_map()
+        print("[MAPA] Parametry upraveny -> stabilní mapa i lokalizace resetovány.")
 
     def to_screen(self, x_mm, y_mm, panel_offset_x):
         cx = panel_offset_x + PANEL_W / 2.0
@@ -594,11 +672,9 @@ class DualLidarVisualizer:
         if newest is not None and not self.frozen:
             self.last_frame = newest
             self.model.update(newest.get("candles", []), newest.get("walls", []))
-            # Lokalizace: odhad polohy robota na základě pevné referenční mapy
+            # Lokalizace: odhad polohy robota v reálném čase z čerstvých dat senzoru
             if self.localizer.locked:
-                cc = self.model.get_confirmed_candles()
-                cw = self.model.get_confirmed_walls()
-                self.localizer.estimate_pose(cc, cw)
+                self.localizer.estimate_pose(newest.get("candles", []), newest.get("walls", []))
 
     def handle_click(self, pos):
         if pos[0] >= PANEL_W:
@@ -637,7 +713,7 @@ class DualLidarVisualizer:
         else:
             self.selected_object = (click_x_mm, click_y_mm, math.hypot(click_x_mm, click_y_mm))
 
-    def draw_panel_decorations(self, offset_x):
+    def draw_panel_decorations(self, offset_x, is_right_panel=False):
         cx = offset_x + PANEL_W // 2
         cy = PANEL_H // 2
         scale = (PANEL_W / 2.0) / self.view_span_mm
@@ -662,9 +738,18 @@ class DualLidarVisualizer:
         p4 = self.to_screen(-hw, 3500, offset_x)
         pygame.draw.polygon(self.screen, (28, 44, 34), [p1, p2, p3, p4], 1)
 
-        # Robot ve středu (modrý kruh se směrovou šipkou dopředu)
-        pygame.draw.circle(self.screen, (0, 180, 255), (cx, cy), 8)
-        pygame.draw.line(self.screen, (0, 255, 180), (cx, cy), (cx, cy - 35), 3)
+        if not is_right_panel:
+            # LEVÝ RADAR: Robot pevně ve středu se směrovou šipkou dopředu
+            pygame.draw.circle(self.screen, (0, 180, 255), (cx, cy), 8)
+            pygame.draw.line(self.screen, (0, 255, 180), (cx, cy), (cx, cy - 35), 3)
+        else:
+            # PRAVÁ GLOBÁLNÍ MAPA: Bod START (0,0) – výchozí pozice robota
+            pygame.draw.circle(self.screen, (0, 180, 220), (cx, cy), 7, 1)
+            pygame.draw.line(self.screen, (0, 220, 255), (cx - 5, cy), (cx + 5, cy), 1)
+            pygame.draw.line(self.screen, (0, 220, 255), (cx, cy - 5), (cx, cy + 5), 1)
+            lbl_start = self.font_main.render("START (0,0)", True, (0, 220, 255))
+            self.screen.blit(lbl_start, (cx + 9, cy - 7))
+
 
     def draw_wall_corridor(self, x1, y1, x2, y2, wlen, offset_x):
         if wlen < 10.0: return
@@ -724,7 +809,7 @@ class DualLidarVisualizer:
         self.screen.blit(lbl, (lx, ly))
 
     def draw_left_live(self):
-        self.draw_panel_decorations(0)
+        self.draw_panel_decorations(0, is_right_panel=False)
         scale = (PANEL_W / 2.0) / self.view_span_mm
 
         # Modrý záměrný výsek 20° (+-10° dopředu)
@@ -853,14 +938,17 @@ class DualLidarVisualizer:
             self.screen.blit(s_info, (PANEL_W - 325, 45))
 
     def draw_right_stable(self):
-        self.draw_panel_decorations(PANEL_W)
+        self.draw_panel_decorations(PANEL_W, is_right_panel=True)
         scale = (PANEL_W / 2.0) / self.view_span_mm
 
-        # Modrý záměrný výsek 20° (+-10° dopředu)
-        self.draw_aiming_sector(PANEL_W)
-
-        conf_candles = self.model.get_confirmed_candles()
-        conf_walls = self.model.get_confirmed_walls()
+        # Získání objektů: po uzamčení bereme PEVNÝ referenční svět, před uzamčením živý model
+        loc = self.localizer
+        if loc.locked:
+            conf_candles = loc.ref_candles
+            conf_walls   = loc.ref_walls
+        else:
+            conf_candles = self.model.get_confirmed_candles()
+            conf_walls   = self.model.get_confirmed_walls()
 
         # Stabilní stěny a fialový koridor
         for w in conf_walls:
@@ -910,7 +998,6 @@ class DualLidarVisualizer:
             route = [(0.0, 0.0)]
             curr = (0.0, 0.0)
 
-            # Pokud je detekována svíčka v záměrném výseku, navštívíme ji VŽDY jako první
             if target_cand and target_cand in unvisited:
                 unvisited.remove(target_cand)
                 route.append((target_cand['x'], target_cand['y']))
@@ -937,121 +1024,123 @@ class DualLidarVisualizer:
                 self.screen.blit(self.font_bold.render(f"-> {i}", True, (255, 230, 80)), (mid_x + 4, mid_y - 6))
 
         # ============================================================
+        # POHYBLIVÝ RŮŽOVÝ ROBOT (ZOBRAZEN HNED OD ZAČÁTKU)
         # ============================================================
-        # LOKALIZACE: Kotvy A/B/C + růžová šipka robota
+        PINK_MAIN = (255, 70, 180)
+        PINK_BG   = (65, 15, 45)
+        PINK_LITE = (255, 150, 215)
+
+        # 1. Trajektorie pohybu (projetá trasa od startu)
+        if len(loc.trajectory) >= 2:
+            traj_px = [self.to_screen(tp[0], tp[1], PANEL_W) for tp in loc.trajectory]
+            pygame.draw.lines(self.screen, (220, 50, 140), False, traj_px, 2)
+            for tpt in traj_px[::4]:
+                pygame.draw.circle(self.screen, (255, 100, 180), tpt, 2)
+
+        # 2. Souřadnice a rotace robota
+        rx, ry = self.to_screen(loc.robot_x, loc.robot_y, PANEL_W)
+        heading_rad = math.radians(loc.robot_deg)
+        cos_h = math.cos(heading_rad)
+        sin_h = math.sin(heading_rad)
+
+        # 3. Zorný vějíř LiDARu dopředu (průhledný kužel ukazující kam se dívá senzor)
+        cone_r_mm = 650.0
+        cone_pts = [(rx, ry)]
+        for deg_off in range(-20, 21, 5):
+            a_rad = heading_rad + math.radians(deg_off)
+            kx = loc.robot_x + cone_r_mm * math.sin(a_rad)
+            ky = loc.robot_y + cone_r_mm * math.cos(a_rad)
+            cone_pts.append(self.to_screen(kx, ky, PANEL_W))
+        if len(cone_pts) > 2:
+            s_cone = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
+            cone_local = [(pt[0] - PANEL_W, pt[1]) for pt in cone_pts]
+            pygame.draw.polygon(s_cone, (255, 60, 170, 25), cone_local)
+            pygame.draw.lines(s_cone, (255, 80, 190, 80), False, cone_local, 1)
+            self.screen.blit(s_cone, (PANEL_W, 0))
+
+        # 4. Tělo robota: Růžový čtverec / šasi (240 x 240 mm v reálném měřítku hřiště)
+        hw_mm = 120.0
+        local_box = [(-hw_mm, -hw_mm), (hw_mm, -hw_mm), (hw_mm, hw_mm), (-hw_mm, hw_mm)]
+        box_px = []
+        for (bx, by) in local_box:
+            # Otočení v rovině
+            gx = loc.robot_x + bx * cos_h + by * sin_h
+            gy = loc.robot_y - bx * sin_h + by * cos_h
+            box_px.append(self.to_screen(gx, gy, PANEL_W))
+
+        pygame.draw.polygon(self.screen, PINK_BG, box_px, 0)
+        pygame.draw.polygon(self.screen, PINK_MAIN, box_px, 2)
+
+        # 5. Výrazná růžová šipka pohledu dopředu
+        arrow_len = 26
+        tip_x = int(rx + arrow_len * sin_h)
+        tip_y = int(ry - arrow_len * cos_h)
+        pygame.draw.line(self.screen, PINK_MAIN, (rx, ry), (tip_x, tip_y), 3)
+
+        # Křídla šipky
+        wing_len = 8
+        wing_rad = math.radians(145)
+        for sgn in [-1, 1]:
+            w_ang = heading_rad + sgn * wing_rad
+            wx2 = int(tip_x + wing_len * math.sin(w_ang))
+            wy2 = int(tip_y - wing_len * math.cos(w_ang))
+            pygame.draw.line(self.screen, PINK_MAIN, (tip_x, tip_y), (wx2, wy2), 2)
+
+        # 6. Malý LiDAR senzor uprostřed těla
+        pygame.draw.circle(self.screen, PINK_LITE, (rx, ry), 5)
+        pygame.draw.circle(self.screen, (255, 255, 255), (rx, ry), 2)
+
+        # 7. Textový popisek u robota
+        conf_pct = int(loc.pose_confidence * 100)
+        d_from_start = math.hypot(loc.robot_x, loc.robot_y)
+        lbl_rob = self.font_bold.render(
+            f"ROBOT ({loc.robot_x:+.0f}, {loc.robot_y:+.0f}mm) {loc.robot_deg:+.0f}° [{conf_pct}%]",
+            True, PINK_LITE if loc.locked else (190, 150, 180))
+        lbl_x = min(rx + 18, PANEL_W * 2 - lbl_rob.get_width() - 8)
+        self.screen.blit(lbl_rob, (lbl_x, ry - 10))
+
         # ============================================================
-        loc = self.localizer
-        if loc.locked:
-            conf = loc.pose_confidence
-            PINK   = (255, 80, 180)
-            CYAN   = (0, 220, 255)
-            YELLOW = (255, 215, 0)
-            ANCHOR_COLORS = [(255, 100, 60), (60, 200, 255), (120, 255, 100)]  # A=oranžová, B=modrá, C=zelená
-
-            # ---- Kotvy A, B, C: zvýrazněné čtverce + popisek + vzdálenosti ----
-            anchor_screen = []
-            for i, anc in enumerate(loc.anchors):
-                px, py = self.to_screen(anc['x'], anc['y'], PANEL_W)
-                anchor_screen.append((px, py))
-                ac = ANCHOR_COLORS[i % len(ANCHOR_COLORS)]
-                # Čtverec kotvy
-                pygame.draw.rect(self.screen, (10, 10, 20), (px-9, py-9, 18, 18))
-                pygame.draw.rect(self.screen, ac, (px-9, py-9, 18, 18), 2)
-                # Popisek A / B / C
-                lbl = self.font_bold.render(anc['label'], True, ac)
-                self.screen.blit(lbl, (px + 11, py - 8))
-
-            # Vzdálenostní čáry mezi kotvami (trojúhelník)
-            for (ai, aj, ref_d) in loc.anchor_dists:
-                if ai < len(anchor_screen) and aj < len(anchor_screen):
-                    pa = anchor_screen[ai]; pb = anchor_screen[aj]
-                    pygame.draw.line(self.screen, (80, 80, 50), pa, pb, 1)
-                    mid_x = (pa[0] + pb[0]) // 2
-                    mid_y = (pa[1] + pb[1]) // 2
-                    lbl_d = self.font_main.render(
-                        f"{loc.anchors[ai]['label']}-{loc.anchors[aj]['label']}: {ref_d:.0f}mm",
-                        True, (160, 155, 80))
-                    self.screen.blit(lbl_d, (mid_x + 4, mid_y - 6))
-
-            # ---- START: výchozí pozice robota = počátek světového souřadnicového systému ----
-            ox, oy = self.to_screen(0.0, 0.0, PANEL_W)
-            pygame.draw.circle(self.screen, (0, 60, 80), (ox, oy), 10)
-            pygame.draw.circle(self.screen, CYAN, (ox, oy), 10, 2)
-            pygame.draw.line(self.screen, CYAN, (ox-8, oy), (ox+8, oy), 1)
-            pygame.draw.line(self.screen, CYAN, (ox, oy-8), (ox, oy+8), 1)
-            lbl_start = self.font_main.render("START", True, CYAN)
-            self.screen.blit(lbl_start, (ox + 12, oy - 7))
-
-            # ---- Robot: růžová šipka na aktuální odhadované pozici ----
-            rx, ry = self.to_screen(loc.robot_x, loc.robot_y, PANEL_W)
-            heading_rad = math.radians(loc.robot_deg)
-
-            # Šipka = plný trojúhelník (hlava vpředu)
-            tip_len = 22    # délka od středu k hrotu
-            side_len = 11   # polovina šířky základny
-            back_len = 10   # vzdálenost od středu k základně
-
-            def rot(x, y):
-                c = math.cos(heading_rad); s = math.sin(heading_rad)
-                return int(rx + x*s - y*c), int(ry - x*c - y*s)
-
-            tip  = rot(0, tip_len)
-            bl   = rot(-side_len, -back_len)
-            br   = rot( side_len, -back_len)
-
-            # Vyplněný trojúhelník s tmavou výplní
-            pygame.draw.polygon(self.screen, (60, 10, 40), [tip, bl, br])
-            pygame.draw.polygon(self.screen, PINK, [tip, bl, br], 2)
-
-            # Malá tečka ve středu (středový bod robota)
-            pygame.draw.circle(self.screen, PINK, (rx, ry), 3)
-
-            # Tenká přímka od počátku k robotu (trajektorie pohybu)
-            if math.hypot(loc.robot_x, loc.robot_y) > 50.0:
-                pygame.draw.line(self.screen, (80, 30, 60), (ox, oy), (rx, ry), 1)
-
-            # Popisek robota
-            d_from_origin = math.hypot(loc.robot_x, loc.robot_y)
-            conf_pct = int(conf * 100)
-            lbl_rob = self.font_bold.render(
-                f"ROBOT  ({loc.robot_x:+.0f}, {loc.robot_y:+.0f}) mm  {loc.robot_deg:+.0f}°  [{conf_pct}%]",
-                True, PINK)
-            lbl_rx = min(rx + 16, PANEL_W * 2 - lbl_rob.get_width() - 5)
-            self.screen.blit(lbl_rob, (lbl_rx, ry - 10))
-
-            # ---- Pruh jistoty lokalizace ----
-            bar_x = PANEL_W + 15; bar_y = 68; bar_w = 490
-            pygame.draw.rect(self.screen, (30, 15, 25), (bar_x, bar_y, bar_w, 7))
-            fill_w = min(bar_w, max(0, int(bar_w * conf)))
-            bar_col = (min(255, int(255*(1-conf))), min(255, int(55 + 200*conf)), 100)
-            pygame.draw.rect(self.screen, bar_col, (bar_x, bar_y, fill_w, 7))
-            anc_lbl = f"{len(loc.anchors)} kotvy | vzdálenost od startu: {d_from_origin:.0f} mm | jistota: {conf_pct}%"
-            self.screen.blit(self.font_main.render(anc_lbl, True, (200, 200, 180)), (bar_x, bar_y + 9))
-
-        # Horní panel stavu pravého okna
-        stat_box = pygame.Surface((490, 52))
-        stat_box.set_alpha(215)
+        # HORNÍ STAVOVÝ PANEL
+        # ============================================================
+        stat_box = pygame.Surface((490, 56))
+        stat_box.set_alpha(220)
         stat_box.fill((10, 12, 16))
         self.screen.blit(stat_box, (PANEL_W + 15, 15))
-        pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, 15, 490, 52), 1)
+        border_col = (80, 255, 160) if loc.locked else (60, 50, 30)
+        pygame.draw.rect(self.screen, border_col, (PANEL_W + 15, 15, 490, 56), 1)
 
-        loc_status = "  🔒 LOKALIZACE AKTIVNÍ" if loc.locked else "  [L] Zamknout mapu"
-        t_stat = self.font_big.render(f"STABILNÍ REKONSTRUKCE HŘIŠTĚ{loc_status}", True,
+        loc_status = " 🔒 LOKALIZACE AKTIVNÍ" if loc.locked else " [L] ZAMKNOUT MAPU"
+        t_stat = self.font_big.render(f"MAPA HŘIŠTĚ{loc_status}", True,
                                       (80, 255, 160) if loc.locked else ACCENT_MAP)
-        self.screen.blit(t_stat, (PANEL_W + 25, 21))
-        stat_str = f"Potvrzeno: {len(conf_candles)}/4 svíček | {len(conf_walls)}/6 stěn | Skenů: {self.model.total_scans}"
-        self.screen.blit(self.font_main.render(stat_str, True, (210, 215, 225)), (PANEL_W + 25, 43))
+        self.screen.blit(t_stat, (PANEL_W + 25, 20))
 
-        # Nápověda vpravo dole
+        if loc.locked:
+            sub_str = f"Kotvy: {len(conf_candles)} svíček, {len(conf_walls)} stěn | Posun: {d_from_start:.0f} mm | Jistota: {conf_pct}%"
+            # Barevný pruh jistoty
+            bar_w = 460
+            fill_w = int(bar_w * loc.pose_confidence)
+            pygame.draw.rect(self.screen, (35, 20, 30), (PANEL_W + 25, 54, bar_w, 6))
+            bar_col = (min(255, int(255 * (1.0 - loc.pose_confidence))),
+                       min(255, int(80 + 175 * loc.pose_confidence)), 120)
+            pygame.draw.rect(self.screen, bar_col, (PANEL_W + 25, 54, fill_w, 6))
+        else:
+            sub_str = f"Svíčky: {len(conf_candles)}/4 | Stěny: {len(conf_walls)}/6 | Skenů: {self.model.total_scans}"
+
+        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (PANEL_W + 25, 38))
+
+        # ============================================================
+        # SPODNÍ NÁPOVĚDA
+        # ============================================================
         tip_box = pygame.Surface((440, 95))
         tip_box.set_alpha(210)
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (PANEL_W + 15, PANEL_H - 110))
         pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, PANEL_H - 110, 440, 95), 1)
-        self.screen.blit(self.font_bold.render("PRINCIP DLOUHODOBÉ MAPY:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 102))
-        self.screen.blit(self.font_main.render("• Fialový koridor: Zóna stěny (+15 cm za roh), svíčka zde nesmí být", True, (210, 130, 255)), (PANEL_W + 25, PANEL_H - 82))
-        self.screen.blit(self.font_main.render("• [L] Zamknout mapu → robot se lokalizuje vůči ní při pohybu", True, (80, 255, 160)), (PANEL_W + 25, PANEL_H - 64))
-        self.screen.blit(self.font_main.render("• Při změně parametrů se mapa vyčistí | [C] Manuální reset", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 46))
+        self.screen.blit(self.font_bold.render("ORIENTACE A LOKALIZACE ROBOTA:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 102))
+        self.screen.blit(self.font_main.render("• [L] Zamknout mapu: uloží svíčky jako pevné body hřiště", True, (80, 255, 160)), (PANEL_W + 25, PANEL_H - 82))
+        self.screen.blit(self.font_main.render("• Růžový robot ukazuje aktuální polohu [X, Y] a směr senzoru", True, PINK_LITE), (PANEL_W + 25, PANEL_H - 64))
+        self.screen.blit(self.font_main.render("• [C] Resetovat mapu | Bod START zůstává v počátku (0,0)", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 46))
+
 
 
     def run(self):
