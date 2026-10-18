@@ -36,6 +36,29 @@ struct Candle {
     int point_count;   // Počet bodů clusteru
 };
 
+// Detekovaný Bounding Box (Svíčka + Stěna i samostatná svíčka, max 4 ks)
+struct BoundingBox {
+    float min_x, max_x;
+    float min_y, max_y;
+    float cx, cy;
+    float width, height;
+    float span_mm;
+    float dist_mm;
+    float aspect_ratio;
+    int point_count;
+    bool is_solo_candle;
+};
+
+// Dlouhodobě sledovaný Bounding Box ve statické mapě
+struct TrackedBox {
+    BoundingBox box;
+    int hits;      // Počet detekcí v posledních skenech
+    int missed;    // Počet po sobě jdoucích skenů, kdy nebyl vidět
+};
+
+#define MAX_DETECTED_BOXES 4
+#define MAX_TRACKED_BOXES 8
+
 // Diagnostika a telemetrie
 struct LidarDiagnostics {
     float scan_fps;          // Skutečná frekvence otáček LiDARu (Hz)

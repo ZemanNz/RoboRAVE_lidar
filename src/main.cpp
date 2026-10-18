@@ -34,8 +34,9 @@ FilterConfig config = {
 
 // Buffery pro zpracování aktuální otáčky
 static LidarPoint scanPoints[MAX_LIDAR_POINTS];
-static WallSegment detectedWalls[MAX_DETECTED_WALLS];
-static Candle detectedCandles[MAX_DETECTED_CANDLES];
+static BoundingBox detectedBoxes[MAX_DETECTED_BOXES];
+static BoundingBox staticBoxes[MAX_DETECTED_BOXES];
+static StaticMapTracker staticMap;
 
 void setup() {
     // USB Serial pro přenos dat do Pythonu (vysoká rychlost 921600 baud)
@@ -53,7 +54,11 @@ void loop() {
     lidar.update(config);
 
     // 2. Kontrola příkazů z PC přes USB Serial
-    comm.checkCommands(config);
+    bool resetMapRequested = false;
+    bool configChanged = comm.checkCommands(config, &resetMapRequested);
+    if (configChanged || resetMapRequested) {
+        staticMap.reset();
+    }
 
     // 3. Jakmile je dokončena celá 360° otáčka, spustíme výpočet
     if (lidar.hasNewScan()) {
@@ -66,12 +71,14 @@ void loop() {
         int validCount = 0;
         FilterPipeline::apply(scanPoints, rawCount, config, validCount);
 
-        // Geometrická detekce na ESP32 (Hledání 30cm stěn a 50mm svíček)
-        int wallCount = 0;
-        int candleCount = 0;
-        GeometryDetector::process(scanPoints, rawCount,
-                                 detectedWalls, wallCount,
-                                 detectedCandles, candleCount);
+        // 1. Výpočet živých Bounding Boxů na ESP32 (Svíčky + Stěny, max 4 ks)
+        int boxCount = 0;
+        BoxDetector::process(scanPoints, rawCount, detectedBoxes, boxCount);
+
+        // 2. Dlouhodobá statická mapa: akumulace snímků a vyhodnocení nejstabilnějších cílů
+        staticMap.update(detectedBoxes, boxCount);
+        int staticCount = 0;
+        staticMap.getStaticBoxes(staticBoxes, staticCount, 4); // min 4 potvrzení
 
         uint32_t calcTimeUs = micros() - tStart;
 
@@ -84,10 +91,10 @@ void loop() {
         diag.free_heap = ESP.getFreeHeap();
         diag.crc_errors = lidar.getCrcErrors();
 
-        // Odeslání výsledků do Pythonu (podvzorkování mračna 1:2 pro úsporu UART bandwidth)
+        // Odeslání výsledků do Pythonu (živé boxy i dlouhodobá statická mapa)
         comm.sendFrame(scanPoints, rawCount,
-                       detectedWalls, wallCount,
-                       detectedCandles, candleCount,
+                       detectedBoxes, boxCount,
+                       staticBoxes, staticCount,
                        diag, 2);
     }
 }

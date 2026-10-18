@@ -640,6 +640,165 @@ class StableFieldModel:
 
 
 # ============================================================
+#  Detektor makro-shluků (Svíčka + Stěna i samostatná svíčka, max 4 boxy)
+# ============================================================
+class ClusterDetector:
+    """
+    Detekce makro-shluků překážek (Svíčka + Stěna i samostatná svíčka).
+    Princip:
+    1. 2D prostorové shlukování (Spatial Grid):
+       Body vzdálené do 250 mm (25 cm) se spojí do jednoho shluku.
+    2. Zachytí i samostatnou svíčku bez stěny:
+       Stačí alespoň 3-4 body a rozměr od 20 mm.
+    3. Poměr stran (Aspect Ratio) zhruba čtverec až obdélník 1:3:
+       max(W, H) / max(min(W, H), 18.0) <= 3.2.
+       Spolehlivě odfiltruje táhlé zdi místnosti/arény (poměry 5:1 až 20:1)!
+    4. Maximální rozměr: do 650 mm (vyřadí velké zdi).
+    5. Striktní limit: MAXIMÁLNĚ 4 Bounding Boxy.
+    """
+    def __init__(self, merge_dist_mm=250.0, min_pts=3, max_clusters=4, max_aspect_ratio=3.2):
+        self.merge_dist_mm = merge_dist_mm
+        self.min_pts = min_pts
+        self.max_clusters = max_clusters
+        self.max_aspect_ratio = max_aspect_ratio
+
+    def detect(self, raw_cloud):
+        if not raw_cloud or len(raw_cloud) < 3 * self.min_pts:
+            return []
+
+        # Extrakce bodů (x, y)
+        n = len(raw_cloud) // 3
+        pts = [(float(raw_cloud[i * 3]), float(raw_cloud[i * 3 + 1])) for i in range(n)]
+
+        # 1. Prostorová mřížka (Grid Hashing s buňkami o velikosti 250 mm)
+        cell_size = self.merge_dist_mm
+        grid = {}
+        for i, (x, y) in enumerate(pts):
+            gx = int(math.floor(x / cell_size))
+            gy = int(math.floor(y / cell_size))
+            cell = (gx, gy)
+            if cell not in grid:
+                grid[cell] = []
+            grid[cell].append(i)
+
+        # Disjoint-Set (Union-Find) pro propojení bodů v 2D do 250 mm
+        parent = list(range(n))
+        def find(i):
+            path = []
+            while parent[i] != i:
+                path.append(i)
+                i = parent[i]
+            for node in path:
+                parent[node] = i
+            return i
+
+        def union(i, j):
+            root_i = find(i)
+            root_j = find(j)
+            if root_i != root_j:
+                parent[root_i] = root_j
+
+        merge_sq = self.merge_dist_mm * self.merge_dist_mm
+
+        # Propojení uvnitř buněk a se sousedními buňkami
+        for (gx, gy), idxs in grid.items():
+            for a_idx in range(len(idxs)):
+                i = idxs[a_idx]
+                xi, yi = pts[i]
+                for b_idx in range(a_idx + 1, len(idxs)):
+                    j = idxs[b_idx]
+                    if (xi - pts[j][0])**2 + (yi - pts[j][1])**2 <= merge_sq:
+                        union(i, j)
+
+            for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+                nbr_cell = (gx + dx, gy + dy)
+                if nbr_cell in grid:
+                    nbr_idxs = grid[nbr_cell]
+                    for i in idxs:
+                        xi, yi = pts[i]
+                        for j in nbr_idxs:
+                            if (xi - pts[j][0])**2 + (yi - pts[j][1])**2 <= merge_sq:
+                                union(i, j)
+
+        clusters_dict = {}
+        for i in range(n):
+            root = find(i)
+            if root not in clusters_dict:
+                clusters_dict[root] = []
+            clusters_dict[root].append(pts[i])
+
+        candidates = []
+        for root, c in clusters_dict.items():
+            k = len(c)
+            if k < self.min_pts:
+                continue
+
+            # Rozměry pravoúhlého boxu
+            min_x = min(p[0] for p in c)
+            max_x = max(p[0] for p in c)
+            min_y = min(p[1] for p in c)
+            max_y = max(p[1] for p in c)
+            width = max_x - min_x
+            height = max_y - min_y
+
+            max_side = max(width, height)
+            min_side = min(width, height)
+
+            # Maximální rozpětí (průměr shluku)
+            max_d = 0.0
+            sample_c = c if k <= 40 else c[::max(1, k // 30)]
+            for i in range(len(sample_c)):
+                for j in range(i + 1, len(sample_c)):
+                    d_ij = math.hypot(sample_c[i][0] - sample_c[j][0], sample_c[i][1] - sample_c[j][1])
+                    if d_ij > max_d:
+                        max_d = d_ij
+
+            span_mm = max(max_d, max_side)
+
+            # 1. Zahození zdí (> 650 mm)
+            if span_mm > 650.0 or max_side > 620.0:
+                continue
+
+            # 2. Zahození mikroskopického šumu (< 20 mm)
+            if span_mm < 20.0:
+                continue
+
+            # 3. Kontrola poměru stran (Aspect Ratio):
+            # Pro malé shluky (do 7 bodů, např. osamocená svíčka) na poměru stran nezáleží.
+            # Pro větší objekty musí mít tvar zhruba čtverce až obdélníku cca 1:3 (odfiltruje zdi 1:10)
+            aspect_ratio = max_side / max(min_side, 18.0)
+            if k > 7 and aspect_ratio > self.max_aspect_ratio:
+                continue
+
+            # Středový bod (těžiště shluku)
+            cx = sum(p[0] for p in c) / k
+            cy = sum(p[1] for p in c) / k
+            dist_mm = math.hypot(cx, cy)
+
+            is_solo_candle = (span_mm < 140.0)
+            target_type = "SVÍČKA" if is_solo_candle else "SVÍČKA+STĚNA"
+
+            candidates.append({
+                'points': c,
+                'pts_count': k,
+                'cx': cx, 'cy': cy,
+                'min_x': min_x, 'max_x': max_x,
+                'min_y': min_y, 'max_y': max_y,
+                'width': width,
+                'height': height,
+                'span_mm': span_mm,
+                'dist_mm': dist_mm,
+                'aspect_ratio': aspect_ratio,
+                'type': target_type
+            })
+
+        # Výběr MAXIMÁLNĚ 4 kandidátů:
+        # Bližší bounding boxy mají přednost (řadíme podle vzdálenosti vzestupně)
+        candidates.sort(key=lambda item: item['dist_mm'])
+        return candidates[:self.max_clusters]
+
+
+# ============================================================
 #  Dvoupanelový vizualizér
 # ============================================================
 class DualLidarVisualizer:
@@ -666,6 +825,9 @@ class DualLidarVisualizer:
 
         self.model = StableFieldModel()
         self.localizer = RobotLocalizer()
+        self.cluster_detector = ClusterDetector(merge_dist_mm=250.0, min_pts=4, max_clusters=4)
+        self.show_boxes = True
+        self.show_legacy_detection = False
 
         pygame.init()
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -708,6 +870,7 @@ class DualLidarVisualizer:
         """Vždy při změně parametrů (FoV/dosah/intenzita) se vygeneruje čistá nová mapa."""
         self.model.reset()
         self.localizer.unlock_map()
+        self.send_cmd("RESET_MAP")
         print("[MAPA] Parametry upraveny -> stabilní mapa i lokalizace resetovány.")
 
     def to_screen(self, x_mm, y_mm, panel_offset_x):
@@ -871,10 +1034,10 @@ class DualLidarVisualizer:
         self.draw_panel_decorations(0, is_right_panel=False)
         scale = (PANEL_W / 2.0) / self.view_span_mm
 
-        # Modrý záměrný výsek 20° (+-10° dopředu)
-        self.draw_aiming_sector(0)
+        # (Záměrný sektor zakomentován - fokus pouze na bounding boxy)
+        # self.draw_aiming_sector(0)
 
-        # Body mračna
+        # Body mračna (čistý živý radar)
         cloud = self.last_frame.get("cloud", [])
         n = len(cloud) // 3
         for i in range(n):
@@ -883,50 +1046,69 @@ class DualLidarVisualizer:
             intensity = cloud[i * 3 + 2]
             sx, sy = self.to_screen(x, y, 0)
             if 0 <= sx < PANEL_W and 0 <= sy < PANEL_H:
-                v = min(255, max(30, intensity * 2 + 40))
+                v = min(255, max(40, intensity * 2 + 50))
                 self.screen.set_at((sx, sy), (v, v, v))
 
-        # Živé stěny a fialový koridor
-        for w in self.last_frame.get("walls", []):
-            self.draw_wall_corridor(w[0], w[1], w[2], w[3], w[4], 0)
-            p1 = self.to_screen(w[0], w[1], 0)
-            p2 = self.to_screen(w[2], w[3], 0)
-            pygame.draw.line(self.screen, (0, 255, 120), p1, p2, 4)
-            pygame.draw.circle(self.screen, (100, 255, 160), p1, 3)
-            pygame.draw.circle(self.screen, (100, 255, 160), p2, 3)
-            mx = (p1[0] + p2[0]) // 2
-            my = (p1[1] + p2[1]) // 2
-            lbl = self.font_main.render(f"STĚNA {int(w[4])}mm", True, (0, 255, 120))
-            self.screen.blit(lbl, (mx + 5, my - 6))
+        # Bounding Boxy přijaté přímo z ESP32 (výpočet probíhá na mikrokontroléru)
+        raw_boxes = self.last_frame.get("boxes", [])
+        targets = []
+        for b in raw_boxes:
+            if len(b) >= 12:
+                targets.append({
+                    'min_x': b[0], 'max_x': b[1],
+                    'min_y': b[2], 'max_y': b[3],
+                    'cx': b[4], 'cy': b[5],
+                    'width': b[6], 'height': b[7],
+                    'span_mm': b[8],
+                    'dist_mm': b[9],
+                    'pts_count': b[10],
+                    'is_solo': bool(b[11]),
+                    'type': "SVÍČKA" if b[11] else "SVÍČKA+STĚNA"
+                })
 
-        # Živé svíčky
-        for c in self.last_frame.get("candles", []):
-            scx, scy = self.to_screen(c[0], c[1], 0)
-            r_ring = int(200.0 * scale)
-            d = int(math.hypot(c[0], c[1]))
-            ang_deg = math.degrees(math.atan2(c[0], c[1])) if c[1] != 0 else 0.0
-            in_sector = (abs(ang_deg) <= 10.0 and c[1] > 0)
+        if self.show_boxes:
+            for idx, cl in enumerate(targets):
+                p_min = self.to_screen(cl['min_x'], cl['max_y'], 0)
+                p_max = self.to_screen(cl['max_x'], cl['min_y'], 0)
+                rx = min(p_min[0], p_max[0])
+                ry = min(p_min[1], p_max[1])
+                rw = max(8, abs(p_max[0] - p_min[0]))
+                rh = max(8, abs(p_max[1] - p_min[1]))
 
-            if in_sector:
-                # Zvýraznění prioritního 1. cíle v záměrném výseku
-                pygame.draw.circle(self.screen, (0, 220, 255), (scx, scy), max(4, r_ring), 2)
-                pygame.draw.circle(self.screen, (0, 255, 255), (scx, scy), 8)
-                pygame.draw.circle(self.screen, (255, 255, 255), (scx, scy), 3)
-                pygame.draw.line(self.screen, (0, 255, 255), (scx - 14, scy), (scx + 14, scy), 1)
-                pygame.draw.line(self.screen, (0, 255, 255), (scx, scy - 14), (scx, scy + 14), 1)
-                lbl = self.font_bold.render(f"★ 1. CÍL ({d}mm, {ang_deg:+.1f}°)", True, (0, 240, 255))
-                self.screen.blit(lbl, (scx + 14, scy - 12))
-            else:
-                pygame.draw.circle(self.screen, (255, 80, 80, 50), (scx, scy), max(4, r_ring), 1)
-                pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 6)
-                pygame.draw.circle(self.screen, (255, 220, 220), (scx, scy), 2)
-                lbl = self.font_bold.render(f"SVÍČKA ({d}mm)", True, (255, 80, 80))
-                self.screen.blit(lbl, (scx + 10, scy - 10))
+                # Rámeček Bounding Boxu
+                box_col = (0, 240, 160) if cl.get('type') == 'SVÍČKA+STĚNA' else (255, 180, 40)
+                pygame.draw.rect(self.screen, box_col, (rx, ry, rw, rh), 2)
+
+                # STŘEDOVÝ BOD (těžiště)
+                scx, scy = self.to_screen(cl['cx'], cl['cy'], 0)
+                pygame.draw.circle(self.screen, (255, 230, 20), (scx, scy), 5)
+                pygame.draw.circle(self.screen, (20, 20, 20), (scx, scy), 2)
+                pygame.draw.line(self.screen, (255, 255, 255), (scx - 7, scy), (scx + 7, scy), 2)
+                pygame.draw.line(self.screen, (255, 255, 255), (scx, scy - 7), (scx, scy + 7), 2)
+
+                # Popisky u boxu
+                target_type = cl.get('type', 'CÍL')
+                lbl1 = self.font_bold.render(f"BOX #{idx+1} [{target_type}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+                lbl2 = self.font_main.render(f"STŘED: [{int(cl['cx'])}, {int(cl['cy'])}] | R:{int(cl['dist_mm'])}mm ({cl['pts_count']}b)", True, (255, 240, 130))
+                self.screen.blit(lbl1, (rx + 4, max(4, ry - 18)))
+                self.screen.blit(lbl2, (scx + 9, scy - 8))
 
         # ============================================================
-        # 1. PŮVODNÍ TELEMETRICKÝ PANEL (V LEVÉM HORNÍM ROHU)
+        # STARÁ DETEKCE STĚN A SVÍČEK KOMPLETNĚ ZAKOMENTOVÁNA:
         # ============================================================
-        panel = pygame.Surface((340, 240))
+        # for w in self.last_frame.get("walls", []):
+        #     self.draw_wall_corridor(w[0], w[1], w[2], w[3], w[4], 0)
+        #     p1 = self.to_screen(w[0], w[1], 0)
+        #     p2 = self.to_screen(w[2], w[3], 0)
+        #     pygame.draw.line(self.screen, (0, 255, 120), p1, p2, 4)
+        #     ...
+        # for c in self.last_frame.get("candles", []):
+        #     ...
+
+        # ============================================================
+        # 1. TELEMETRICKÝ PANEL (V LEVÉM HORNÍM ROHU)
+        # ============================================================
+        panel = pygame.Surface((340, 220))
         panel.set_alpha(210)
         panel.fill((10, 12, 16))
         self.screen.blit(panel, (15, 15))
@@ -937,11 +1119,9 @@ class DualLidarVisualizer:
         calc_us  = f.get("calc_us", 0)
         heap     = f.get("heap", 0)
         crc_err  = f.get("crc_err", 0)
-        n_walls  = len(f.get("walls", []))
-        n_cands  = len(f.get("candles", []))
 
         y = 25
-        title = self.font_big.render("ESP32 D200 DETEKTOR", True, ACCENT_COLOR)
+        title = self.font_big.render("ESP32 D200 RADAR & BOXY", True, ACCENT_COLOR)
         self.screen.blit(title, (25, y)); y += 26
 
         def row(label, val, col=(200, 210, 225)):
@@ -957,11 +1137,10 @@ class DualLidarVisualizer:
         row("Výpočet na ESP32:", f"{calc_us} µs ({calc_us/1000.0:.2f} ms)", (0, 220, 255))
         row("Volná RAM ESP32:", f"{heap // 1024} kB")
         row("CRC8 Chyby:", f"{crc_err}", (255, 80, 80) if crc_err > 0 else (120, 200, 120))
-        row("Nalezené stěny:", f"{n_walls} (zeleně)", (0, 255, 100))
-        row("Nalezené svíčky:", f"{n_cands} (červeně)", (255, 80, 80))
+        row("Detekované cíle:", f"{len(targets)} / 4 (max 4)", (0, 240, 160) if len(targets) > 0 else (130, 140, 155))
 
         # ============================================================
-        # 2. PŮVODNÍ PANEL OVLÁDÁNÍ (V LEVÉM DOLNÍM ROHU) - PŘESNĚ DLE SCREENSHOTU
+        # 2. PANEL OVLÁDÁNÍ (V LEVÉM DOLNÍM ROHU)
         # ============================================================
         cmd_panel = pygame.Surface((440, 120))
         cmd_panel.set_alpha(200)
@@ -974,8 +1153,9 @@ class DualLidarVisualizer:
 
         fov_txt = "[F] Režim: 180° Kužel" if self.fov_limited else "[F] Režim: 360° Celé pole"
         freeze_txt = "[MEZERNÍK] ODMRAZIT" if self.frozen else "[MEZERNÍK] ZMRAZIT SKEN"
+        box_txt = "[B] BOXY: ZAP" if self.show_boxes else "[B] BOXY: VYP"
         
-        c1 = self.font_main.render(f"{fov_txt} | {freeze_txt}", True, (220, 220, 220))
+        c1 = self.font_main.render(f"{fov_txt} | {freeze_txt} | {box_txt}", True, (220, 220, 220))
         c2 = self.font_main.render(f"Rozsah: [R/E] Min: {self.min_range} mm | [T/G] Max: {self.max_range} mm", True, (170, 180, 195))
         c3 = self.font_main.render(f"Odrazivost: [I/K] Min Intenzita: {self.min_intensity}", True, (170, 180, 195))
         self.screen.blit(c1, (25, cy)); cy += 18
@@ -999,88 +1179,62 @@ class DualLidarVisualizer:
     def draw_right_stable(self):
         self.draw_panel_decorations(PANEL_W, is_right_panel=True)
         scale = (PANEL_W / 2.0) / self.view_span_mm
-
-        # Získání objektů: po uzamčení bereme PEVNÝ referenční svět, před uzamčením živý model
         loc = self.localizer
-        if loc.locked:
-            conf_candles = loc.ref_candles
-            conf_walls   = loc.ref_walls
-        else:
-            conf_candles = self.model.get_confirmed_candles()
-            conf_walls   = self.model.get_confirmed_walls()
 
-        # Stabilní stěny a fialový koridor
-        for w in conf_walls:
-            self.draw_wall_corridor(w['x1'], w['y1'], w['x2'], w['y2'], w['len'], PANEL_W)
-            p1 = self.to_screen(w['x1'], w['y1'], PANEL_W)
-            p2 = self.to_screen(w['x2'], w['y2'], PANEL_W)
-            pygame.draw.line(self.screen, (80, 255, 140), p1, p2, 6)
-            pygame.draw.circle(self.screen, (150, 255, 180), p1, 5)
-            pygame.draw.circle(self.screen, (150, 255, 180), p2, 5)
-            mx = (p1[0] + p2[0]) // 2
-            my = (p1[1] + p2[1]) // 2
-            lbl = self.font_bold.render(f"STĚNA {int(w['len'])}mm", True, (80, 255, 140))
-            self.screen.blit(lbl, (mx + 8, my - 8))
+        # Dlouhodobé statické Bounding Boxy přijaté z ESP32:
+        raw_static = self.last_frame.get("static_boxes", [])
+        static_boxes = []
+        for b in raw_static:
+            if len(b) >= 12:
+                static_boxes.append({
+                    'min_x': b[0], 'max_x': b[1],
+                    'min_y': b[2], 'max_y': b[3],
+                    'cx': b[4], 'cy': b[5],
+                    'width': b[6], 'height': b[7],
+                    'span_mm': b[8],
+                    'dist_mm': b[9],
+                    'pts_count': b[10],
+                    'is_solo': bool(b[11]),
+                    'type': "SVÍČKA" if b[11] else "SVÍČKA+STĚNA"
+                })
 
-        # Stabilní svíčky
-        target_cand = None
-        for idx, c in enumerate(conf_candles):
-            scx, scy = self.to_screen(c['x'], c['y'], PANEL_W)
-            r_ring = int(250.0 * scale) # Zóna dosahu 25 cm kolem svíčky
-            d = int(math.hypot(c['x'], c['y']))
-            ang_deg = math.degrees(math.atan2(c['x'], c['y'])) if c['y'] != 0 else 0.0
-            in_sector = (abs(ang_deg) <= 10.0 and c['y'] > 0)
-            walls_cnt = c.get('walls_count', 0)
-            wall_info = f"[{walls_cnt} stěn]" if walls_cnt > 0 else "[BEZ STĚNY]"
+        # Vykreslení potvrzených dlouhodobých Bounding Boxů
+        for idx, cl in enumerate(static_boxes):
+            p_min = self.to_screen(cl['min_x'], cl['max_y'], PANEL_W)
+            p_max = self.to_screen(cl['max_x'], cl['min_y'], PANEL_W)
+            rx = min(p_min[0], p_max[0])
+            ry = min(p_min[1], p_max[1])
+            rw = max(10, abs(p_max[0] - p_min[0]))
+            rh = max(10, abs(p_max[1] - p_min[1]))
 
-            if in_sector:
-                if target_cand is None: target_cand = c
-                pygame.draw.circle(self.screen, (0, 180, 220), (scx, scy), max(4, r_ring), 1)
-                pygame.draw.circle(self.screen, (0, 255, 255), (scx, scy), 8)
-                pygame.draw.circle(self.screen, (255, 255, 255), (scx, scy), 3)
-                pygame.draw.line(self.screen, (0, 255, 255), (scx - 14, scy), (scx + 14, scy), 1)
-                pygame.draw.line(self.screen, (0, 255, 255), (scx, scy - 14), (scx, scy + 14), 1)
-                lbl = self.font_bold.render(f"★ 1. CÍL ({d}mm, {ang_deg:+.1f}°) {wall_info}", True, (0, 240, 255))
-                self.screen.blit(lbl, (scx + 14, scy - 12))
-            else:
-                ring_color = (255, 140, 80) if walls_cnt > 0 else (255, 60, 60)
-                pygame.draw.circle(self.screen, ring_color, (scx, scy), max(4, r_ring), 1)
-                pygame.draw.circle(self.screen, (255, 40, 40), (scx, scy), 8)
-                pygame.draw.circle(self.screen, (255, 240, 180), (scx, scy), 3)
-                lbl_color = (255, 130, 130) if walls_cnt > 0 else (255, 80, 80)
-                lbl = self.font_bold.render(f"SVÍČKA #{idx+1} ({d}mm) {wall_info}", True, lbl_color)
-                self.screen.blit(lbl, (scx + 12, scy - 12))
+            # Barva podle typu (oranžová svíčka, tyrkysová svíčka+stěna)
+            box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
+            
+            # Poloprůhledná výplň boxu pro lepší viditelnost
+            s_fill = pygame.Surface((rw, rh), pygame.SRCALPHA)
+            fill_col = (0, 200, 140, 35) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 160, 30, 35)
+            s_fill.fill(fill_col)
+            self.screen.blit(s_fill, (rx, ry))
 
-        # Trasa mezi potvrzenými svíčkami (1. cíl je svíčka v záměrném výseku)
-        if len(conf_candles) >= 2:
-            unvisited = list(conf_candles)
-            route = [(0.0, 0.0)]
-            curr = (0.0, 0.0)
+            # Rámeček
+            pygame.draw.rect(self.screen, box_col, (rx, ry, rw, rh), 2)
 
-            if target_cand and target_cand in unvisited:
-                unvisited.remove(target_cand)
-                route.append((target_cand['x'], target_cand['y']))
-                curr = (target_cand['x'], target_cand['y'])
+            # Spojnice od výchozího bodu LiDARu (0,0) ke středu boxu
+            scx, scy = self.to_screen(cl['cx'], cl['cy'], PANEL_W)
+            origin_x, origin_y = self.to_screen(0, 0, PANEL_W)
+            pygame.draw.line(self.screen, (70, 90, 115), (origin_x, origin_y), (scx, scy), 1)
 
-            while unvisited:
-                best_i = 0
-                best_d = 999999.0
-                for i, c in enumerate(unvisited):
-                    d = math.hypot(c['x'] - curr[0], c['y'] - curr[1])
-                    if d < best_d:
-                        best_d = d
-                        best_i = i
-                next_c = unvisited.pop(best_i)
-                route.append((next_c['x'], next_c['y']))
-                curr = (next_c['x'], next_c['y'])
+            # STŘEDOVÝ BOD [X, Y]
+            pygame.draw.circle(self.screen, (255, 230, 20), (scx, scy), 6)
+            pygame.draw.circle(self.screen, (20, 20, 20), (scx, scy), 2)
+            pygame.draw.line(self.screen, (255, 255, 255), (scx - 8, scy), (scx + 8, scy), 2)
+            pygame.draw.line(self.screen, (255, 255, 255), (scx, scy - 8), (scx, scy + 8), 2)
 
-            for i in range(1, len(route)):
-                p_from = self.to_screen(route[i-1][0], route[i-1][1], PANEL_W)
-                p_to   = self.to_screen(route[i][0], route[i][1], PANEL_W)
-                pygame.draw.line(self.screen, (255, 215, 0), p_from, p_to, 2)
-                mid_x = (p_from[0] + p_to[0]) // 2
-                mid_y = (p_from[1] + p_to[1]) // 2
-                self.screen.blit(self.font_bold.render(f"-> {i}", True, (255, 230, 80)), (mid_x + 4, mid_y - 6))
+            # Zvýrazněné popisy s přesnými souřadnicemi [X, Y] a vzdáleností od startu
+            lbl_type = self.font_bold.render(f"BOX #{idx+1} [{cl['type']}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+            lbl_pos = self.font_bold.render(f"POZICE: X={int(cl['cx']):+d} mm, Y={int(cl['cy']):+d} mm | R={int(cl['dist_mm'])} mm", True, (255, 245, 140))
+            self.screen.blit(lbl_type, (rx + 4, max(4, ry - 20)))
+            self.screen.blit(lbl_pos, (scx + 10, scy - 8))
 
         # Živé detekce přetransformované do souřadnic hřiště (fialovo-růžové body potvrzující shodu)
         if loc.locked and self.last_frame:
@@ -1179,29 +1333,11 @@ class DualLidarVisualizer:
         stat_box.set_alpha(220)
         stat_box.fill((10, 12, 16))
         self.screen.blit(stat_box, (PANEL_W + 15, 15))
-        border_col = (80, 255, 160) if loc.locked else (60, 50, 30)
-        pygame.draw.rect(self.screen, border_col, (PANEL_W + 15, 15, 490, 56), 1)
+        pygame.draw.rect(self.screen, (80, 255, 160), (PANEL_W + 15, 15, 490, 56), 1)
 
-        if loc.locked:
-            mode_txt = " 🔒 STATICKÁ POLOHA (KLID)" if loc.is_stationary else " 🔒 POHYB ROBOTA"
-        else:
-            mode_txt = " [L] ZAMKNOUT MAPU"
-        t_stat = self.font_big.render(f"MAPA HŘIŠTĚ{mode_txt}", True,
-                                      (80, 255, 160) if loc.locked else ACCENT_MAP)
+        t_stat = self.font_big.render("DLOUHODOBÁ STATICKÁ MAPA (ESP32)", True, (80, 255, 160))
         self.screen.blit(t_stat, (PANEL_W + 25, 20))
-
-        if loc.locked:
-            sub_str = f"Kotvy: {len(conf_candles)} svíček, {len(conf_walls)} stěn | Posun: {d_from_start:.0f} mm | Jistota: {conf_pct}%"
-            # Barevný pruh jistoty
-            bar_w = 460
-            fill_w = int(bar_w * loc.pose_confidence)
-            pygame.draw.rect(self.screen, (35, 20, 30), (PANEL_W + 25, 54, bar_w, 6))
-            bar_col = (min(255, int(255 * (1.0 - loc.pose_confidence))),
-                       min(255, int(80 + 175 * loc.pose_confidence)), 120)
-            pygame.draw.rect(self.screen, bar_col, (PANEL_W + 25, 54, fill_w, 6))
-        else:
-            sub_str = f"Svíčky: {len(conf_candles)}/4 | Stěny: {len(conf_walls)}/6 | Skenů: {self.model.total_scans}"
-
+        sub_str = f"Potvrzené cíle: {len(static_boxes)} / 4 | Výpočet: ESP32 EMA akumulace"
         self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (PANEL_W + 25, 38))
 
         # ============================================================
@@ -1212,10 +1348,10 @@ class DualLidarVisualizer:
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (PANEL_W + 15, PANEL_H - 110))
         pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, PANEL_H - 110, 440, 95), 1)
-        self.screen.blit(self.font_bold.render("ORIENTACE A LOKALIZACE ROBOTA:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 102))
-        self.screen.blit(self.font_main.render("• [L] Zamknout mapu: uloží svíčky jako pevné body hřiště", True, (80, 255, 160)), (PANEL_W + 25, PANEL_H - 82))
-        self.screen.blit(self.font_main.render("• Růžový robot ukazuje aktuální polohu [X, Y] a směr senzoru", True, PINK_LITE), (PANEL_W + 25, PANEL_H - 64))
-        self.screen.blit(self.font_main.render("• [C] Resetovat mapu | Bod START zůstává v počátku (0,0)", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 46))
+        self.screen.blit(self.font_bold.render("STATICKÁ MAPA & SOUŘADNÝ SYSTÉM:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 102))
+        self.screen.blit(self.font_main.render("• Výchozí bod START (0,0) = pozice robota a senzoru", True, (0, 220, 255)), (PANEL_W + 25, PANEL_H - 82))
+        self.screen.blit(self.font_main.render("• Osy X (vpravo/vlevo) a Y (dopředu) v reálných mm", True, (240, 230, 130)), (PANEL_W + 25, PANEL_H - 64))
+        self.screen.blit(self.font_main.render("• [C] / [M] Vymazat a znovu akumulovat mapu na ESP32", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 46))
 
 
 
@@ -1271,6 +1407,12 @@ class DualLidarVisualizer:
                         self.view_span_mm = max(1200.0, self.view_span_mm - 300.0)
                     elif event.key in [pygame.K_MINUS]:
                         self.view_span_mm = min(6000.0, self.view_span_mm + 300.0)
+                    elif event.key == pygame.K_b:
+                        self.show_boxes = not self.show_boxes
+                        print(f"[BOX] Zobrazení Bounding Boxů: {'ZAPNUTO' if self.show_boxes else 'VYPNUTO'}")
+                    elif event.key == pygame.K_v:
+                        self.show_legacy_detection = not self.show_legacy_detection
+                        print(f"[DET] Stará detekce stěn a svíček: {'ZAPNUTA' if self.show_legacy_detection else 'VYPNUTA'}")
                     elif event.key == pygame.K_l:
                         # ZAMKNUTÍ MAPY → spuštění lokalizace
                         cc = self.model.get_confirmed_candles()

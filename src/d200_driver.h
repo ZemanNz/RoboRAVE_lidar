@@ -60,8 +60,10 @@ private:
         float endAngle   = endAngleX100 / 100.0f;
 
         // Detekce dokončení jedné otáčky (pokles úhlu přes 360° nebo nasbírání dostatku bodů)
-        bool angleRollover = (_prevStartAngle > 240.0f && startAngle < 120.0f);
-        if ((angleRollover && _accumCount > 180) || _accumCount >= 600) {
+        // Vyžadujeme minimálně 320 bodů a úhel přechodu přes 360° (z >280° na <80°),
+        // aby nedocházelo k předčasnému uzavření neúplného výseku/fragmentu!
+        bool angleRollover = (_prevStartAngle > 280.0f && startAngle < 80.0f);
+        if ((angleRollover && _accumCount >= 320) || _accumCount >= 620) {
             for (int i = 0; i < _accumCount; i++) {
                 _completedScan[i] = _accumPoints[i];
             }

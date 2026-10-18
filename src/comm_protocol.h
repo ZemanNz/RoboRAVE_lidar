@@ -25,8 +25,8 @@ public:
 
     // Odeslání kompletního rámce v kompaktním JSONu
     void sendFrame(const LidarPoint* points, int pointCount,
-                   const WallSegment* walls, int wallCount,
-                   const Candle* candles, int candleCount,
+                   const BoundingBox* boxes, int boxCount,
+                   const BoundingBox* staticBoxes, int staticBoxCount,
                    const LidarDiagnostics& diag,
                    int subsampleStep = 2) // Odesíláme každý 2. bod pro plynulost
     {
@@ -41,34 +41,44 @@ public:
         _port.print(F(",\"crc_err\":"));
         _port.print(diag.crc_errors);
 
-        // Seznam stěn: [[x1, y1, x2, y2, len], ...]
-        _port.print(F(",\"walls\":["));
-        for (int i = 0; i < wallCount; i++) {
+        // 1. Živé Bounding Boxy (levý panel): [[minX, maxX, minY, maxY, cx, cy, w, h, span, dist, pts, is_solo], ...]
+        _port.print(F(",\"boxes\":["));
+        for (int i = 0; i < boxCount; i++) {
             if (i > 0) _port.print(',');
             _port.print('[');
-            _port.print((int)roundf(walls[i].x1));
-            _port.print(',');
-            _port.print((int)roundf(walls[i].y1));
-            _port.print(',');
-            _port.print((int)roundf(walls[i].x2));
-            _port.print(',');
-            _port.print((int)roundf(walls[i].y2));
-            _port.print(',');
-            _port.print((int)roundf(walls[i].length_mm));
+            _port.print((int)roundf(boxes[i].min_x)); _port.print(',');
+            _port.print((int)roundf(boxes[i].max_x)); _port.print(',');
+            _port.print((int)roundf(boxes[i].min_y)); _port.print(',');
+            _port.print((int)roundf(boxes[i].max_y)); _port.print(',');
+            _port.print((int)roundf(boxes[i].cx)); _port.print(',');
+            _port.print((int)roundf(boxes[i].cy)); _port.print(',');
+            _port.print((int)roundf(boxes[i].width)); _port.print(',');
+            _port.print((int)roundf(boxes[i].height)); _port.print(',');
+            _port.print((int)roundf(boxes[i].span_mm)); _port.print(',');
+            _port.print((int)roundf(boxes[i].dist_mm)); _port.print(',');
+            _port.print(boxes[i].point_count); _port.print(',');
+            _port.print(boxes[i].is_solo_candle ? 1 : 0);
             _port.print(']');
         }
         _port.print(']');
 
-        // Seznam svíček: [[x, y, diam], ...]
-        _port.print(F(",\"candles\":["));
-        for (int i = 0; i < candleCount; i++) {
+        // 2. Dlouhodobá statická mapa (pravý panel): [[minX, maxX, minY, maxY, cx, cy, w, h, span, dist, pts, is_solo], ...]
+        _port.print(F(",\"static_boxes\":["));
+        for (int i = 0; i < staticBoxCount; i++) {
             if (i > 0) _port.print(',');
             _port.print('[');
-            _port.print((int)roundf(candles[i].x));
-            _port.print(',');
-            _port.print((int)roundf(candles[i].y));
-            _port.print(',');
-            _port.print((int)roundf(candles[i].diameter_mm));
+            _port.print((int)roundf(staticBoxes[i].min_x)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].max_x)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].min_y)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].max_y)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].cx)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].cy)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].width)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].height)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].span_mm)); _port.print(',');
+            _port.print((int)roundf(staticBoxes[i].dist_mm)); _port.print(',');
+            _port.print(staticBoxes[i].point_count); _port.print(',');
+            _port.print(staticBoxes[i].is_solo_candle ? 1 : 0);
             _port.print(']');
         }
         _port.print(']');
@@ -92,7 +102,7 @@ public:
     }
 
     // Zpracování příchozích příkazů z Pythonu
-    bool checkCommands(FilterConfig& cfg) {
+    bool checkCommands(FilterConfig& cfg, bool* outResetMap = nullptr) {
         bool changed = false;
         while (_port.available()) {
             char c = _port.read();
@@ -100,7 +110,13 @@ public:
             if (c == '\n') {
                 _rxLineBuf[_rxLineIdx] = '\0';
                 if (_rxLineIdx > 0) {
-                    changed = parseCommand(_rxLineBuf, cfg);
+                    if (strncmp(_rxLineBuf, "RESET_MAP", 9) == 0) {
+                        if (outResetMap) *outResetMap = true;
+                        _port.println(F("# ACK: RESET_MAP"));
+                        changed = true;
+                    } else {
+                        changed = parseCommand(_rxLineBuf, cfg);
+                    }
                 }
                 _rxLineIdx = 0;
             } else if (_rxLineIdx < 120) {

@@ -1122,3 +1122,276 @@ private:
         }
     }
 };
+
+// ============================================================
+//  BoxDetector - 2D prostorové shlukování na ESP32 (Svíčky + Stěny)
+// ============================================================
+class BoxDetector {
+public:
+    static void process(const LidarPoint* points, int count,
+                        BoundingBox* outBoxes, int& boxCount,
+                        float mergeDistMm = 250.0f,
+                        int minPts = 3,
+                        float maxAspect = 3.2f)
+    {
+        boxCount = 0;
+        if (count < minPts) return;
+
+        // Disjoint-set (Union-Find) pro propojení platných bodů
+        static int parent[MAX_LIDAR_POINTS];
+        for (int i = 0; i < count; i++) {
+            parent[i] = i;
+        }
+
+        auto getRoot = [](int i, int* p) -> int {
+            int root = i;
+            while (p[root] != root) {
+                root = p[root];
+            }
+            int curr = i;
+            while (curr != root) {
+                int nxt = p[curr];
+                p[curr] = root;
+                curr = nxt;
+            }
+            return root;
+        };
+
+        float mergeSq = mergeDistMm * mergeDistMm;
+
+        // Spatial Grid pro rychlé 2D propojení O(N)
+        // Vzhledem k rozsahu do 4 m stačí jednoduchý hashing
+        for (int i = 0; i < count; i++) {
+            if (!points[i].valid) continue;
+            float xi = points[i].x;
+            float yi = points[i].y;
+
+            // Porovnáme s body vpřed (v úhlové posloupnosti)
+            for (int j = i + 1; j < count; j++) {
+                if (!points[j].valid) continue;
+                float dx = points[j].x - xi;
+                float dy = points[j].y - yi;
+                if (dx * dx + dy * dy <= mergeSq) {
+                    int ri = getRoot(i, parent);
+                    int rj = getRoot(j, parent);
+                    if (ri != rj) {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+
+        // Extrakce shluků
+        static BoundingBox candidates[16];
+        int candCount = 0;
+
+        static bool rootProcessed[MAX_LIDAR_POINTS];
+        for (int i = 0; i < count; i++) rootProcessed[i] = false;
+
+        for (int i = 0; i < count; i++) {
+            if (!points[i].valid) continue;
+            int r = getRoot(i, parent);
+            if (rootProcessed[r]) continue;
+            rootProcessed[r] = true;
+
+            // Spočteme vlastnosti shluku s kořenem r
+            float minX = 99999.0f, maxX = -99999.0f;
+            float minY = 99999.0f, maxY = -99999.0f;
+            float sumX = 0.0f, sumY = 0.0f;
+            int k = 0;
+
+            for (int j = 0; j < count; j++) {
+                if (!points[j].valid) continue;
+                if (getRoot(j, parent) == r) {
+                    float px = points[j].x;
+                    float py = points[j].y;
+                    if (px < minX) minX = px;
+                    if (px > maxX) maxX = px;
+                    if (py < minY) minY = py;
+                    if (py > maxY) maxY = py;
+                    sumX += px;
+                    sumY += py;
+                    k++;
+                }
+            }
+
+            if (k < minPts) continue;
+
+            float w = maxX - minX;
+            float h = maxY - minY;
+            float maxSide = (w > h) ? w : h;
+            float minSide = (w < h) ? w : h;
+            float span = sqrtf(w * w + h * h);
+
+            // Filtrace:
+            // 1. Zdi arény / místnosti (> 650 mm) ZAHODIT
+            if (span > 650.0f || maxSide > 620.0f) continue;
+            // 2. Mikroskopický šum (< 20 mm) ZAHODIT
+            if (span < 20.0f) continue;
+            // 3. Poměr stran (pro k > 7 nesmí být zeď 1:10)
+            float denom = (minSide > 18.0f) ? minSide : 18.0f;
+            float aspect = maxSide / denom;
+            if (k > 7 && aspect > maxAspect) continue;
+
+            if (candCount < 16) {
+                BoundingBox b;
+                b.min_x = minX; b.max_x = maxX;
+                b.min_y = minY; b.max_y = maxY;
+                b.cx = sumX / (float)k;
+                b.cy = sumY / (float)k;
+                b.width = w;
+                b.height = h;
+                b.span_mm = span;
+                b.dist_mm = sqrtf(b.cx * b.cx + b.cy * b.cy);
+                b.aspect_ratio = aspect;
+                b.point_count = k;
+                b.is_solo_candle = (span < 140.0f);
+                candidates[candCount++] = b;
+            }
+        }
+
+        // Seřadit podle vzdálenosti (bližší mají přednost)
+        for (int a = 0; a < candCount - 1; a++) {
+            for (int b = a + 1; b < candCount; b++) {
+                if (candidates[b].dist_mm < candidates[a].dist_mm) {
+                    BoundingBox tmp = candidates[a];
+                    candidates[a] = candidates[b];
+                    candidates[b] = tmp;
+                }
+            }
+        }
+
+        // Vybrat max 4
+        int limit = (candCount < MAX_DETECTED_BOXES) ? candCount : MAX_DETECTED_BOXES;
+        for (int i = 0; i < limit; i++) {
+            outBoxes[boxCount++] = candidates[i];
+        }
+    }
+};
+
+// ============================================================
+//  StaticMapTracker - Dlouhodobá statická mapa na ESP32
+//  Agreguje snímky v čase a udržuje nejstabilnější/nejčastější boxy.
+// ============================================================
+class StaticMapTracker {
+private:
+    TrackedBox _tracked[MAX_TRACKED_BOXES];
+    int _trackedCount = 0;
+    uint32_t _totalScans = 0;
+
+public:
+    void reset() {
+        _trackedCount = 0;
+        _totalScans = 0;
+    }
+
+    void update(const BoundingBox* liveBoxes, int liveCount, float matchDistMm = 160.0f) {
+        _totalScans++;
+        float matchDistSq = matchDistMm * matchDistMm;
+        bool matchedTracked[MAX_TRACKED_BOXES];
+        for (int i = 0; i < _trackedCount; i++) matchedTracked[i] = false;
+
+        // Pro každý živý box hledáme odpovídající sledovaný box
+        for (int i = 0; i < liveCount; i++) {
+            const BoundingBox& lb = liveBoxes[i];
+            int bestIdx = -1;
+            float bestDistSq = matchDistSq;
+
+            for (int j = 0; j < _trackedCount; j++) {
+                if (matchedTracked[j]) continue;
+                float dx = _tracked[j].box.cx - lb.cx;
+                float dy = _tracked[j].box.cy - lb.cy;
+                float dsq = dx * dx + dy * dy;
+                if (dsq < bestDistSq) {
+                    bestDistSq = dsq;
+                    bestIdx = j;
+                }
+            }
+
+            if (bestIdx >= 0) {
+                // Nalezen odpovídající záznam -> EMA vyhlazení polohy a rozměrů
+                TrackedBox& tb = _tracked[bestIdx];
+                const float alpha = 0.20f;
+                tb.box.cx = (1.0f - alpha) * tb.box.cx + alpha * lb.cx;
+                tb.box.cy = (1.0f - alpha) * tb.box.cy + alpha * lb.cy;
+                tb.box.width = (1.0f - alpha) * tb.box.width + alpha * lb.width;
+                tb.box.height = (1.0f - alpha) * tb.box.height + alpha * lb.height;
+                tb.box.min_x = tb.box.cx - tb.box.width * 0.5f;
+                tb.box.max_x = tb.box.cx + tb.box.width * 0.5f;
+                tb.box.min_y = tb.box.cy - tb.box.height * 0.5f;
+                tb.box.max_y = tb.box.cy + tb.box.height * 0.5f;
+                tb.box.span_mm = sqrtf(tb.box.width * tb.box.width + tb.box.height * tb.box.height);
+                tb.box.dist_mm = sqrtf(tb.box.cx * tb.box.cx + tb.box.cy * tb.box.cy);
+                tb.box.point_count = (tb.box.point_count + lb.point_count) / 2;
+                tb.box.is_solo_candle = lb.is_solo_candle;
+
+                tb.hits++;
+                tb.missed = 0;
+                matchedTracked[bestIdx] = true;
+            } else {
+                // Nový kandidát
+                if (_trackedCount < MAX_TRACKED_BOXES) {
+                    TrackedBox& tb = _tracked[_trackedCount++];
+                    tb.box = lb;
+                    tb.hits = 1;
+                    tb.missed = 0;
+                }
+            }
+        }
+
+        // Inkremetace missed pro ty, které nebyly viděny v tomto snímku
+        for (int j = 0; j < _trackedCount; j++) {
+            if (!matchedTracked[j]) {
+                _tracked[j].missed++;
+            }
+        }
+
+        // Čištění: pokud chybí příliš dlouho, zahodit (šum rychle zanikne)
+        int writeIdx = 0;
+        for (int r = 0; r < _trackedCount; r++) {
+            bool keep = (_tracked[r].hits >= 10) ? (_tracked[r].missed < 18) : (_tracked[r].missed < 8);
+            if (keep) {
+                if (writeIdx != r) {
+                    _tracked[writeIdx] = _tracked[r];
+                }
+                writeIdx++;
+            }
+        }
+        _trackedCount = writeIdx;
+    }
+
+    // Získá potvrzené boxy (které se zobrazují nejčastěji v čase)
+    void getStaticBoxes(BoundingBox* outBoxes, int& outCount, int minHits = 4) const {
+        outCount = 0;
+        TrackedBox pool[MAX_TRACKED_BOXES];
+        int poolCount = 0;
+
+        for (int i = 0; i < _trackedCount; i++) {
+            if (_tracked[i].hits >= minHits) {
+                pool[poolCount++] = _tracked[i];
+            }
+        }
+
+        // Seřadit podle stability / počtu zásahů (nejčastější mají přednost)
+        for (int a = 0; a < poolCount - 1; a++) {
+            for (int b = a + 1; b < poolCount; b++) {
+                if (pool[b].hits > pool[a].hits) {
+                    TrackedBox tmp = pool[a];
+                    pool[a] = pool[b];
+                    pool[b] = tmp;
+                }
+            }
+        }
+
+        // Omezení na max 4 potvrzené boxy pro statickou mapu
+        int limit = (poolCount < MAX_DETECTED_BOXES) ? poolCount : MAX_DETECTED_BOXES;
+        for (int i = 0; i < limit; i++) {
+            outBoxes[outCount++] = pool[i].box;
+        }
+    }
+
+    uint32_t getTotalScans() const { return _totalScans; }
+    int getTrackedCount() const { return _trackedCount; }
+};
+
+
