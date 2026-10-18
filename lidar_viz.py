@@ -645,10 +645,11 @@ class StableFieldModel:
                 c_copy = dict(c)
                 c_copy['walls_count'] = walls_within_25cm
                 c_copy['closest_wall_dist'] = closest_dist
-                # Skóre: přednost mají svíčky se stěnou (2 stěny > 1 stěna > 0 stěn)
-                score = walls_within_25cm * 2000.0 + c['hits'] * 10.0
-                if walls_within_25cm > 0:
-                    score += max(0.0, 250.0 - closest_dist)
+                # Skóre: svíčky s více stěnami (2-3) mají nejvyšší jistotu, volná svíčka má garantovanou hodnotu
+                if walls_within_25cm == 0:
+                    score = 2200.0 + c['hits'] * 10.0  # Volná svíčka v poli (vždy musí být právě 1!)
+                else:
+                    score = walls_within_25cm * 2000.0 + c['hits'] * 10.0 + max(0.0, 250.0 - closest_dist)
                 c_copy['score'] = score
                 candidates.append(c_copy)
 
@@ -690,32 +691,46 @@ class StableFieldModel:
         # Seřadíme sestupně podle skóre
         candidates.sort(key=lambda x: x['score'], reverse=True)
 
-        # Výběr s pravidly:
-        # 1. Rozestup svíček alespoň 80 cm (800 mm)
-        # 2. Maximálně JEDNA svíčka bez stěny (dvě svíčky bez stěny nemohou být)
+        # Výběr s pravidly soutěže Kybernoid:
+        # 1. Rozestup svíček alespoň 80 cm (780 mm)
+        # 2. PŘESNĚ JEDNA svíčka bez stěny (max 1 volná, max 3 se stěnou!)
         filtered = []
         isolated_count = 0
+        walled_count = 0
+        rejected_excess_walled = []
 
         for cand in candidates:
             if len(filtered) >= 4:
                 break
 
             is_isolated = (cand['walls_count'] == 0)
-            if is_isolated and isolated_count >= 1:
-                # Už máme jednu samostatnou svíčku bez stěny, další bez stěny je vyloučena!
-                continue
+
+            # Pravidlo 1: Maximálně 1 svíčka bez stěny v poli
+            if is_isolated:
+                if isolated_count >= 1:
+                    continue
+            else:
+                # Pravidlo 2: Maximálně 3 svíčky se stěnou (4. se stěnou nesmí vytlačit volnou svíčku!)
+                if walled_count >= 3:
+                    rejected_excess_walled.append(cand)
+                    continue
 
             # Kontrola vzdálenosti 80 cm od už vybraných
-            too_close = False
-            for f in filtered:
-                if math.hypot(cand['x'] - f['x'], cand['y'] - f['y']) < 800.0:
-                    too_close = True
-                    break
-
+            too_close = any(math.hypot(cand['x'] - f['x'], cand['y'] - f['y']) < 780.0 for f in filtered)
             if not too_close:
                 if is_isolated:
                     isolated_count += 1
+                else:
+                    walled_count += 1
                 filtered.append(cand)
+            elif not is_isolated:
+                rejected_excess_walled.append(cand)
+
+        # Penalizace / útlum pravděpodobnosti pro nadbytečné svíčky se stěnou v dlouhodobé mapě
+        for rej in rejected_excess_walled:
+            for sc in self.candles:
+                if math.hypot(sc['x'] - rej['x'], sc['y'] - rej['y']) < 70.0:
+                    sc['hits'] = max(1, int(sc['hits'] * 0.85))
 
         return filtered
 
@@ -1034,30 +1049,57 @@ class GlobalFieldMap:
                     walls_near += 1
 
             if not in_wall:
+                walls_cnt = max(c.get('walls_count', 0), walls_near)
+                # Volná svíčka (walls_cnt == 0) musí mít férové skóre (2200 + hits*10),
+                # aby ji nepřebily falešné odrazy se stěnou (walls_near == 1)!
+                if walls_cnt == 0:
+                    score = 2200.0 + c['hits'] * 10.0
+                else:
+                    score = walls_cnt * 2000.0 + c['hits'] * 10.0
+
                 candidates.append({
                     'x': c['x'], 'y': c['y'],
                     'hits': c['hits'],
-                    'walls_count': max(c.get('walls_count', 0), walls_near),
-                    'score': c['hits'] * 10.0 + walls_near * 2000.0
+                    'walls_count': walls_cnt,
+                    'score': score
                 })
 
         self.rejected_outside_count = rejected_outside
         candidates.sort(key=lambda x: x['score'], reverse=True)
 
-        # 3. VÝBĚR S PRAVIDLY: rozestup min 800 mm, max 1 volná svíčka bez stěny
+        # 3. VÝBĚR S PRAVIDLY: rozestup min 800 mm, PŘESNĚ JEDNA volná svíčka bez stěny a max 3 se stěnou
         selected = []
         isolated_count = 0
+        walled_count = 0
+        rejected_excess_walled = []
+
         for cand in candidates:
             if len(selected) >= max_count:
                 break
             is_iso = (cand['walls_count'] == 0)
-            if is_iso and isolated_count >= 1:
-                continue
+            if is_iso:
+                if isolated_count >= 1:
+                    continue
+            else:
+                if walled_count >= 3:
+                    rejected_excess_walled.append(cand)
+                    continue
+
             too_close = any(math.hypot(cand['x'] - s['x'], cand['y'] - s['y']) < 800.0 for s in selected)
             if not too_close:
                 if is_iso:
                     isolated_count += 1
+                else:
+                    walled_count += 1
                 selected.append(cand)
+            elif not is_iso:
+                rejected_excess_walled.append(cand)
+
+        # Penalizace / útlum pravděpodobnosti pro nadbytečné svíčky se stěnou v dlouhodobé globální mapě
+        for rej in rejected_excess_walled:
+            for gc in self.candles:
+                if math.hypot(gc['x'] - rej['x'], gc['y'] - rej['y']) < 70.0:
+                    gc['hits'] = max(1, int(gc['hits'] * 0.85))
 
         return selected
 
@@ -2209,12 +2251,20 @@ class DualLidarVisualizer:
         self.screen.blit(self.font_bold.render(f"{sym2} MIN. ROZESTUP 800 mm: {'SPLNĚNO' if dist_ok else 'PORUŠENO'} {d_str}", True, col2), (mid_x, t_y))
         t_y += 17
 
-        # Pravidlo 4: Max 1 volná svíčka bez stěny
+        # Pravidlo 4: Skladba svíček (přesně 1 volná v prostoru, max 3 u stěny)
         iso_cnt = sum(1 for c in field_candles if c.get('walls_count', 0) == 0)
-        iso_ok = (iso_cnt <= 1)
-        sym3 = "✓" if iso_ok else "✗"
-        col3 = (100, 255, 120) if iso_ok else (255, 70, 70)
-        self.screen.blit(self.font_bold.render(f"{sym3} MAX 1 VOLNÁ SVÍČKA: {'SPLNĚNO' if iso_ok else 'PŘEKROČENO'} ({iso_cnt} volná)", True, col3), (mid_x, t_y))
+        walled_cnt = sum(1 for c in field_candles if c.get('walls_count', 0) > 0)
+        if n_c == 4:
+            comp_ok = (iso_cnt == 1 and walled_cnt == 3)
+            sym3 = "✓" if comp_ok else "✗"
+            col3 = (100, 255, 120) if comp_ok else (255, 70, 70)
+            msg3 = "SPLNĚNO (1 volná + 3 u stěny)" if comp_ok else f"CHYBA ({iso_cnt} volná, {walled_cnt} u stěny)"
+        else:
+            comp_ok = (iso_cnt <= 1 and walled_cnt <= 3)
+            sym3 = "✓" if comp_ok else "✗"
+            col3 = (100, 255, 120) if comp_ok else (255, 70, 70)
+            msg3 = f"v normě ({iso_cnt}/1 volná, {walled_cnt}/3 u stěny)" if comp_ok else f"PŘEKROČENO ({iso_cnt} volných, {walled_cnt} u stěny)"
+        self.screen.blit(self.font_bold.render(f"{sym3} SKLADBA SVÍČEK: {msg3}", True, col3), (mid_x, t_y))
         t_y += 17
 
         # Pravidlo 5: Stěny (max 6 bez překryvů)
@@ -2233,8 +2283,12 @@ class DualLidarVisualizer:
         else:
             for i, c in enumerate(field_candles):
                 wc = c.get('walls_count', 0)
-                wt = f"[U STĚNY: {wc}]" if wc > 0 else "[VOLNÁ SVÍČKA]"
-                w_col = (255, 170, 70) if wc > 0 else (255, 100, 100)
+                if wc > 0:
+                    wt = f"[U STĚNY: {wc}]"
+                    w_col = (255, 170, 70)
+                else:
+                    wt = "[VOLNÁ V PROSTORU (0 stěn)]"
+                    w_col = (0, 220, 255)
                 txt = f"S{i+1}: X={c['x']:+.0f} mm, Y={c['y']:+.0f} mm  {wt}  (hitů: {c['hits']})"
                 self.screen.blit(self.font_main.render(txt, True, w_col), (mid_x, t_y))
                 t_y += 15
