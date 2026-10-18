@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-LIDAR_SVICKY_27 - Dvoupanelový vizualizační terminál (Kybernoid 27)
-Autor: Antigravity & Nik
+LIDAR_SVICKY_27 - Vícepanelový lokalizační a detekční systém (Kybernoid 27)
+Filozofie: Shluky bodů (Bounding Boxy), invariantní map-matching a kumulativní mapa hřiště.
 
-Dva panely vedle sebe:
-  1. LEVÝ PANEL: Živý radar (Live LIDAR scan) v reálném čase + přesný HUD.
-  2. PRAVÝ PANEL: Stabilní herní mapa (World Model) + LOKALIZACE ROBOTA.
+4 panely:
+  1. LEVÝ PANEL (Nahoře): Živý radar (Live LIDAR scan) v reálném čase + surové Bounding Boxy.
+  2. STŘEDNÍ PANEL (Nahoře): Referenční etalon (zamčený na STARTu) s odstupňovanými kotvami a trojúhelníkem.
+  3. PRAVÝ PANEL (Nahoře): Porovnání map & LOKALIZACE ROBOTA (paprsky shod, růžový robot se směrem).
+  4. SPODNÍ PANEL: Celková obdélníková mapa hřiště (2.4 m x 3.5 m) s kumulativním dosazováním cílů,
+     zachováním zastíněných svíček při pohybu, kontrolou pravidel a optimální trasou hašení.
 
-Klávesové zkratky a ovládání:
-  [F]         - Přepnout režim: 180° Kužel / 360° Celé pole (výchozí 180°)
+Ovládání:
+  [L]         - Zamknout / Odemknout referenční etalon (aktivuje lokalizaci a kumulativní mapu)
+  [2 / ě]     - Startovní stěna 2.4 m (Kratší stěna) -> auto-fit pole 2.4 x 3.5 m
+  [3 / š]     - Startovní stěna 3.5 m (Delší stěna)  -> auto-fit pole 3.5 x 2.4 m
+  [P]         - Přepnout startovní stěnu (2.4 m <-> 3.5 m)
+  [F]         - Přepnout FoV: 180° Kužel (start) / 360° Plný rozhled (v poli)
   [MEZERNÍK]  - Zmrazit / Odmrazit obraz (Freeze)
+  [C / M]     - Resetovat mapy a začít znovu sbírat etalon na startu
+  [N]         - Resetovat novou stabilní mapu na aktuální pozici
   [R / E]     - Min vzdálenost (+50 / -50 mm)
   [T / G]     - Max vzdálenost (+200 / -200 mm)
   [I / K]     - Min intenzita (+5 / -5)
-  [C]         - Vymazat a přepočítat stabilní mapu hřiště
-  [L]         - ZAMKNOUT mapu jako referenční svět (spustí lokalizaci)
-  [+ / -]     - Zoom in / Zoom out (funguje také kolečko myši)
-  Klik myší   - Detailní inspekce souřadnic vybraného bodu / objektu
+  [+ / -]     - Zoom in / Zoom out (lze použít i kolečko myši)
+  Klik myší   - Detailní inspekce souřadnic vybraného bodu / cíle
 """
 
 import sys, os, time, json, math
@@ -24,19 +31,46 @@ import pygame
 import serial
 from serial.tools import list_ports
 
-# Rozměry
-PANEL_W     = 840
-PANEL_H     = 850
-WIN_W       = PANEL_W * 2
-WIN_H       = PANEL_H
+# ============================================================
+#  Rozměry oken a panelů (Optimalizováno pro obrazovky 1920x1080)
+# ============================================================
+PANEL_W     = 600
+PANEL_H     = 560      # Výška horních 3 panelů
+FIELD_H     = 300      # Výška spodní mapy hřiště
+WIN_W       = PANEL_W * 3
+WIN_H       = PANEL_H + FIELD_H
 
-# Barvy
+# Rozměry soutěžního hřiště Kybernoid / RoboRAVE (mm)
+FIELD_W_MM  = 3500.0   # Delší strana hřiště
+FIELD_H_MM  = 2400.0   # Kratší strana hřiště
+
+# Konfigurace startovních stěn (přepínatelné klávesami [2/ě], [3/š] nebo [P])
+WALL_CONFIGS = {
+    2: {
+        "name": "2.4 m (Kratší stěna)",
+        "w": 2400.0, "l": 3500.0,
+        "key_hint": "[2 / ě]",
+        "desc": "Robot u stěny 2.4 m, pole sahá 3.5 m dopředu"
+    },
+    3: {
+        "name": "3.5 m (Delší stěna)",
+        "w": 3500.0, "l": 2400.0,
+        "key_hint": "[3 / š]",
+        "desc": "Robot u stěny 3.5 m, pole sahá 2.4 m dopředu"
+    }
+}
+
+# Barevná paleta
 BG_COLOR     = (18, 20, 24)
 GRID_COLOR   = (40, 45, 52)
 CIRCLE_COLOR = (55, 62, 75)
 TEXT_COLOR   = (220, 225, 230)
 ACCENT_COLOR = (0, 210, 255)
 ACCENT_MAP   = (255, 200, 60)
+
+PINK_MAIN    = (255, 70, 180)
+PINK_BG      = (65, 15, 45)
+PINK_LITE    = (255, 150, 215)
 
 def get_serial_port():
     if len(sys.argv) > 1: return sys.argv[1]
@@ -49,32 +83,50 @@ def get_baudrate():
     if len(sys.argv) > 2: return int(sys.argv[2])
     return 921600
 
+def parse_box_list(raw_boxes):
+    """Převede surové pole z ESP32 JSON na strukturované slovníky Bounding Boxů."""
+    boxes = []
+    for b in raw_boxes:
+        if len(b) >= 12:
+            is_solo = bool(b[11])
+            boxes.append({
+                'min_x': float(b[0]), 'max_x': float(b[1]),
+                'min_y': float(b[2]), 'max_y': float(b[3]),
+                'cx': float(b[4]), 'cy': float(b[5]),
+                'width': float(b[6]), 'height': float(b[7]),
+                'span_mm': float(b[8]),
+                'dist_mm': float(b[9]),
+                'pts_count': int(b[10]),
+                'is_solo': is_solo,
+                'type': "SVÍČKA" if is_solo else "SVÍČKA+STĚNA"
+            })
+    return boxes
+
 
 # ============================================================
-#  Map-to-Map Lokalizátor robota (Porovnání stabilních map hřiště)
+#  Map-to-Map Lokalizátor robota (Porovnání Bounding Boxů)
 # ============================================================
 class RobotLocalizer:
     """
-    Čistý a spolehlivý Map-to-Map Matching:
-    1. Při zamknutí [L] se uloží REFERENČNÍ MAPA (vyfiltrované svíčky a stěny z počátku).
-       Změří se všechny vzájemné vzdálenosti mezi body (tyto vzdálenosti jsou absolutně
-       neměnné bez ohledu na to, kam robot popojede a jak se otočí).
-    2. Při pohybu robota se vezme AKTUÁLNÍ STABILNÍ MAPA (vyfiltrovaná z cca 15-20 měření)
-       a porovná se s referenční mapou:
-       - Změří se vzdálenosti mezi aktuálními body.
-       - Najde se shoda se vzdálenostmi v referenční mapě -> jednoznačná identita bodů.
-       - Z rozdílu směrů se spočítá přesný úhel natočení theta.
-       - Z posunu bodů se spočítá přesná poloha (X, Y) robota od startu.
-    3. Žádné umělé blokování podle vzdálenosti skoku – robot se může posunout o kolik chce!
-    4. Výsledek je díky porovnávání dvou stabilních map naprosto klidný, přesný a bez šumu.
+    Spolehlivý invariantní Map-to-Map matching na Bounding Boxech:
+    1. Při zamknutí [L] se uloží REFERENČNÍ MAPA (Bounding Boxy ze startovní pozice).
+       Vypočtou se všechny vzájemné vzdálenosti mezi středy boxů (vzdálenosti jsou absolutně
+       invariantní vůči jakékoliv translaci či rotaci robota).
+    2. Vytvoří se hierarchické geometrické kotvy:
+       - Stupeň 1: Trojúhelníkový vzorec (Kotva 1 + Kotva 2 přes společný pivot).
+       - Stupeň 2: Kotva 1 (Primární přímka s největším rozvorem pro maximální úhlovou přesnost).
+       - Stupeň 3: Kotva 2 (Sekundární přímka pro případ zastínění jednoho cíle).
+       - Stupeň 4: Záložní kotvy (jakákoliv dvojice cílů).
+    3. Analytická 2D rigidní transformace (Procrustes / Kabsch) okamžitě spočítá přesnou
+       polohu (X, Y) a orientaci (theta) robota vůči výchozímu bodu START = [0,0].
     """
 
     def __init__(self):
         self.locked           = False
-        self.ref_candles      = []   # Referenční svíčky ve světových souřadnicích
-        self.ref_walls        = []   # Referenční stěny ve světových souřadnicích
-        self.ref_candle_dists = []   # [(i, j, dist_mm)] mezi referenčními svíčkami
-        self.ref_cw_dists     = []   # [(c_idx, w_idx, dist_mm)] mezi svíčkami a středy stěn
+        self.ref_boxes        = []   # Referenční Bounding Boxy v souřadnicích startu
+        self.ref_dists        = []   # [(i, j, dist_mm)] mezi referenčními středy boxů
+        self.anchors          = []   # Seřazené kotvy podle rozvoru a kvality
+        self.triangle_pattern = None # Trojúhelníkový vzorec
 
         self.robot_x          = 0.0  # mm ve světě (START = [0,0])
         self.robot_y          = 0.0
@@ -82,47 +134,113 @@ class RobotLocalizer:
         self.pose_confidence  = 0.0  # 0.0 – 1.0
         self.trajectory       = [(0.0, 0.0)]
         self.is_stationary    = True
-        self.candle_tracker   = []   # Krátkodobý tracker svíček (vyhlazení chvění, rozpad za 4 snímky)
+        self.last_match_info  = None # Detailní informace o shodě pro vykreslení paprsků
 
-    def lock_map(self, conf_candles, conf_walls):
-        """Uloží aktuální potvrzené svíčky a stěny jako fixní referenční mapu světa."""
-        self.ref_candles = [dict(c) for c in conf_candles]
-        self.ref_walls   = [dict(w) for w in conf_walls]
-        self.ref_candle_dists = []
-        self.ref_cw_dists     = []
-        self.candle_tracker   = []
+    def lock_map(self, boxes):
+        """Uloží aktuální potvrzené Bounding Boxy jako referenční etalon světa a sestaví kotvy."""
+        self.ref_boxes = [dict(b) for b in boxes]
+        self.ref_dists = []
+        self.last_match_info = None
 
-        # Invariantní vzdálenosti mezi všemi svíčkami
-        for i in range(len(self.ref_candles)):
-            for j in range(i + 1, len(self.ref_candles)):
-                d = math.hypot(self.ref_candles[i]['x'] - self.ref_candles[j]['x'],
-                               self.ref_candles[i]['y'] - self.ref_candles[j]['y'])
-                self.ref_candle_dists.append((i, j, d))
+        n = len(self.ref_boxes)
+        if n < 2:
+            self.locked = False
+            return False
 
-        # Invariantní vzdálenosti mezi svíčkami a středy stěn
-        for ci, c in enumerate(self.ref_candles):
-            for wi, w in enumerate(self.ref_walls):
-                d = math.hypot(c['x'] - w['mx'], c['y'] - w['my'])
-                self.ref_cw_dists.append((ci, wi, d))
+        # 1. Invariantní párové vzdálenosti mezi všemi středy boxů
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = math.hypot(self.ref_boxes[i]['cx'] - self.ref_boxes[j]['cx'],
+                               self.ref_boxes[i]['cy'] - self.ref_boxes[j]['cy'])
+                self.ref_dists.append((i, j, d))
 
+        # 2. Sestavení a seřazení geometrických kotev
+        raw_anchors = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                b1 = self.ref_boxes[i]
+                b2 = self.ref_boxes[j]
+                dx = b2['cx'] - b1['cx']
+                dy = b2['cy'] - b1['cy']
+                dist = math.hypot(dx, dy)
+                if dist < 250.0:
+                    continue
+                # Skóre: větší rozvor = podstatně vyšší přesnost úhlu + bonus za body
+                score = dist + (b1.get('pts_count', 0) + b2.get('pts_count', 0)) * 5.0
+                raw_anchors.append({
+                    'idx1': i, 'idx2': j,
+                    'p1': (b1['cx'], b1['cy']),
+                    'p2': (b2['cx'], b2['cy']),
+                    'dist': dist,
+                    'score': score
+                })
+
+        raw_anchors.sort(key=lambda a: a['score'], reverse=True)
+        self.anchors = []
+        for rank, a in enumerate(raw_anchors):
+            a['rank'] = rank + 1
+            if rank == 0:
+                a['name'] = "KOTVA 1 (PRIMÁRNÍ)"
+                a['color'] = (255, 215, 0)   # Zlatá
+            elif rank == 1:
+                a['name'] = "KOTVA 2 (SEKUNDÁRNÍ)"
+                a['color'] = (255, 150, 40)  # Oranžová
+            else:
+                a['name'] = f"KOTVA {rank+1} (ZÁLOŽNÍ)"
+                a['color'] = (200, 140, 255) # Fialová
+            self.anchors.append(a)
+
+        # 3. Sestavení trojúhelníkového vzorce (pokud máme alespoň 3 boxy)
+        self.triangle_pattern = None
+        if len(self.anchors) >= 2 and n >= 3:
+            a1 = self.anchors[0]
+            a2 = self.anchors[1]
+            shared = set([a1['idx1'], a1['idx2']]).intersection([a2['idx1'], a2['idx2']])
+            if shared:
+                pivot_idx = list(shared)[0]
+                other1_idx = a1['idx2'] if a1['idx1'] == pivot_idx else a1['idx1']
+                other2_idx = a2['idx2'] if a2['idx1'] == pivot_idx else a2['idx1']
+                pivot_pt = (self.ref_boxes[pivot_idx]['cx'], self.ref_boxes[pivot_idx]['cy'])
+                p1_pt    = (self.ref_boxes[other1_idx]['cx'], self.ref_boxes[other1_idx]['cy'])
+                p2_pt    = (self.ref_boxes[other2_idx]['cx'], self.ref_boxes[other2_idx]['cy'])
+
+                v1_x = p1_pt[0] - pivot_pt[0]; v1_y = p1_pt[1] - pivot_pt[1]
+                v2_x = p2_pt[0] - pivot_pt[0]; v2_y = p2_pt[1] - pivot_pt[1]
+                az1 = math.atan2(v1_x, v1_y)
+                az2 = math.atan2(v2_x, v2_y)
+                ang_diff = abs(math.atan2(math.sin(az1 - az2), math.cos(az1 - az2)))
+                d3 = math.hypot(p1_pt[0] - p2_pt[0], p1_pt[1] - p2_pt[1])
+
+                self.triangle_pattern = {
+                    'pivot_idx': pivot_idx,
+                    'other1_idx': other1_idx,
+                    'other2_idx': other2_idx,
+                    'pivot_pt': pivot_pt,
+                    'p1_pt': p1_pt,
+                    'p2_pt': p2_pt,
+                    'dist1': a1['dist'],
+                    'dist2': a2['dist'],
+                    'dist3': d3,
+                    'angle_deg': math.degrees(ang_diff)
+                }
+
+        self.locked = True
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_deg = 0.0
         self.pose_confidence = 1.0
         self.trajectory = [(0.0, 0.0)]
         self.is_stationary = True
-
-        self.locked = (len(self.ref_candles) + len(self.ref_walls)) >= 2
-        return self.locked
+        return True
 
     def unlock_map(self):
-        """Odemkne mapu a vrátí robota na start."""
+        """Odemkne mapu a vrátí robota do výchozího stavu."""
         self.locked = False
-        self.ref_candles = []
-        self.ref_walls = []
-        self.ref_candle_dists = []
-        self.ref_cw_dists = []
-        self.candle_tracker = []
+        self.ref_boxes = []
+        self.ref_dists = []
+        self.anchors = []
+        self.triangle_pattern = None
+        self.last_match_info = None
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_deg = 0.0
@@ -132,7 +250,10 @@ class RobotLocalizer:
 
     @staticmethod
     def _rigid_transform_2d(src, dst):
-        """Metoda nejmenších čtverců (Procrustes) pro analytický výpočet (tx, ty, theta)."""
+        """
+        Metoda nejmenších čtverců (Procrustes / Kabsch) v navigačním systému:
+        +Y dopředu, +X doprava, úhel theta orientován doprava (ve směru hodinových ručiček).
+        """
         n = len(src)
         if n == 0: return 0.0, 0.0, 0.0
         if n == 1:
@@ -143,663 +264,408 @@ class RobotLocalizer:
         cx_d = sum(p[0] for p in dst) / n
         cy_d = sum(p[1] for p in dst) / n
 
-        h00 = h01 = h10 = h11 = 0.0
+        A = 0.0
+        B = 0.0
         for (sx, sy), (dx, dy) in zip(src, dst):
             scx = sx - cx_s; scy = sy - cy_s
             dcx = dx - cx_d; dcy = dy - cy_d
-            h00 += scx * dcx; h01 += scx * dcy
-            h10 += scy * dcx; h11 += scy * dcy
+            A += (dcx * scx + dcy * scy)
+            B += (dcx * scy - dcy * scx)
 
-        theta = math.atan2(h10 - h01, h00 + h11)
+        theta = math.atan2(B, A)
         cos_t = math.cos(theta); sin_t = math.sin(theta)
 
-        tx = cx_d - (cx_s * cos_t - cy_s * sin_t)
-        ty = cy_d - (cx_s * sin_t + cy_s * cos_t)
+        tx = cx_d - (cx_s * cos_t + cy_s * sin_t)
+        ty = cy_d - (-cx_s * sin_t + cy_s * cos_t)
         return tx, ty, theta
 
-    def estimate_pose(self, live_candles, live_walls):
+    def estimate_pose(self, current_boxes):
         """
-        Určí pozici a orientaci robota (x, y, theta) vůči referenční mapě
-        pomocí invariantních vzdáleností mezi svíčkami a stěnami.
-        Funguje při jakémkoliv pohybu i přemístění robota.
+        Určí pozici a orientaci robota (x, y, theta) porovnáním aktuálních Bounding Boxů
+        s referenčním etalonem ze startu pomocí odstupňovaných kotev.
         """
-        if not self.locked or (len(self.ref_candles) + len(self.ref_walls)) < 2:
+        if not self.locked or len(self.ref_boxes) < 2 or len(current_boxes) < 2:
             return False
 
-        # Převod na standardní formát (x, y) pro svíčky a (mx, my) pro stěny
-        raw_cands = []
-        for c in live_candles:
-            if isinstance(c, (list, tuple)):
-                raw_cands.append((float(c[0]), float(c[1])))
-            elif isinstance(c, dict):
-                raw_cands.append((float(c['x']), float(c['y'])))
+        cands = [(float(b['cx']), float(b['cy'])) for b in current_boxes]
 
-        raw_walls = []
-        for w in live_walls:
-            if isinstance(w, (list, tuple)):
-                mx = (float(w[0]) + float(w[2])) * 0.5
-                my = (float(w[1]) + float(w[3])) * 0.5
-                raw_walls.append((mx, my))
-            elif isinstance(w, dict):
-                raw_walls.append((float(w['mx']), float(w['my'])))
+        def evaluate_transformation(tx, ty, th, active_anchors, pattern_name, base_score=0.0):
+            cos_t = math.cos(th); sin_t = math.sin(th)
+            inliers = 0
+            err_sum = 0.0
+            inlier_src = []
+            inlier_dst = []
+            inlier_pairs = []
 
-        # Krátkodobý tracker svíček (vyhlazuje chvění měření a překlenuje krátké výpadky na 1-2 snímky)
-        matched_tracker = set()
-        for cx, cy in raw_cands:
-            best_idx = -1
-            best_d = 100.0
-            for idx, tc in enumerate(self.candle_tracker):
-                if idx in matched_tracker: continue
-                d = math.hypot(tc['x'] - cx, tc['y'] - cy)
-                if d < best_d:
-                    best_d = d
-                    best_idx = idx
-            if best_idx >= 0:
-                self.candle_tracker[best_idx]['x'] = 0.7 * self.candle_tracker[best_idx]['x'] + 0.3 * cx
-                self.candle_tracker[best_idx]['y'] = 0.7 * self.candle_tracker[best_idx]['y'] + 0.3 * cy
-                self.candle_tracker[best_idx]['hits'] += 1
-                self.candle_tracker[best_idx]['missed'] = 0
-                matched_tracker.add(best_idx)
+            for cp in cands:
+                # Navigační transformace: X doprava, Y dopředu, th doprava
+                wx = tx + cp[0] * cos_t + cp[1] * sin_t
+                wy = ty - cp[0] * sin_t + cp[1] * cos_t
+                min_d = 9999.0
+                best_rb = None
+                for rb in self.ref_boxes:
+                    d = math.hypot(wx - rb['cx'], wy - rb['cy'])
+                    if d < min_d:
+                        min_d = d
+                        best_rb = rb
+
+                if min_d < 160.0 and best_rb:
+                    inliers += 1
+                    err_sum += min_d
+                    inlier_src.append(cp)
+                    inlier_dst.append((best_rb['cx'], best_rb['cy']))
+                    inlier_pairs.append(((best_rb['cx'], best_rb['cy']), (wx, wy), min_d))
+
+            avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
+
+            # Zpřesnění metodou Procrustes přes inliers
+            if len(inlier_src) >= 2:
+                rtx, rty, rth = self._rigid_transform_2d(inlier_src, inlier_dst)
             else:
-                self.candle_tracker.append({'x': cx, 'y': cy, 'hits': 1, 'missed': 0})
-                matched_tracker.add(len(self.candle_tracker) - 1)
+                rtx, rty, rth = tx, ty, th
 
-        for idx, tc in enumerate(self.candle_tracker):
-            if idx not in matched_tracker:
-                tc['missed'] += 1
+            total_score = base_score + inliers * 500.0 - avg_err * 2.0
+            return {
+                'inliers': inliers,
+                'avg_error': avg_err,
+                'tx': rtx, 'ty': rty, 'theta': rth,
+                'inlier_pairs': inlier_pairs,
+                'active_anchors': active_anchors,
+                'pattern_name': pattern_name,
+                'score': total_score
+            }
 
-        # Rychlý rozpad (max 4 missed snímky = 0.6 s) -> při posunu robota nezůstávají duchové!
-        self.candle_tracker = [c for c in self.candle_tracker if c['missed'] <= 4]
-
-        # Výběr kandidátů na svíčky:
-        # Preferujeme stabilizované body z trackeru, případně přímo živé ze snímku
-        tracked_cands = [(c['x'], c['y']) for c in self.candle_tracker if c['hits'] >= 2]
-        cands = tracked_cands if len(tracked_cands) >= 2 else raw_cands
-        walls = raw_walls
-
-        best_tx = None
-        best_ty = None
-        best_theta = None
-        best_inliers = 0
-        best_error = 9999.0
+        best_match_info = None
+        best_score = -999999.0
 
         # ========================================================
-        # 1. PÁROVÁNÍ PODLE INVARIANTNÍCH VZDÁLENOSTÍ MEZI SVÍČKAMI
+        # STUPEŇ 1: SHODA TROJÚHELNÍKOVÉHO VZORCE (Kotva 1 + Kotva 2)
         # ========================================================
-        if len(cands) >= 2 and len(self.ref_candles) >= 2:
-            for a in range(len(cands)):
-                for b in range(a + 1, len(cands)):
-                    d_cur = math.hypot(cands[a][0] - cands[b][0], cands[a][1] - cands[b][1])
+        if self.triangle_pattern and len(cands) >= 3:
+            tp = self.triangle_pattern
+            for p in range(len(cands)):
+                for a in range(len(cands)):
+                    if a == p: continue
+                    d1_cur = math.hypot(cands[a][0] - cands[p][0], cands[a][1] - cands[p][1])
+                    if abs(d1_cur - tp['dist1']) > 130.0: continue
 
-                    # Hledáme odpovídající dvojici svíček v referenční mapě
-                    for (ri, rj, d_ref) in self.ref_candle_dists:
-                        if abs(d_cur - d_ref) < 130.0:  # tolerance 13 cm na rozestup
-                            rI = (self.ref_candles[ri]['x'], self.ref_candles[ri]['y'])
-                            rJ = (self.ref_candles[rj]['x'], self.ref_candles[rj]['y'])
+                    for b in range(len(cands)):
+                        if b == p or b == a: continue
+                        d2_cur = math.hypot(cands[b][0] - cands[p][0], cands[b][1] - cands[p][1])
+                        if abs(d2_cur - tp['dist2']) > 130.0: continue
 
-                            # Dvě možné orientace přiřazení: (a->ri, b->rj) a (a->rj, b->ri)
-                            for (p1, p2, ref1, ref2) in [(cands[a], cands[b], rI, rJ), (cands[a], cands[b], rJ, rI)]:
-                                v_ref_x = ref2[0] - ref1[0]; v_ref_y = ref2[1] - ref1[1]
-                                v_cur_x = p2[0] - p1[0];     v_cur_y = p2[1] - p1[1]
-                                th = math.atan2(v_ref_y, v_ref_x) - math.atan2(v_cur_y, v_cur_x)
-                                cos_t = math.cos(th); sin_t = math.sin(th)
+                        # Kontrola 3. strany trojúhelníku
+                        d3_cur = math.hypot(cands[a][0] - cands[b][0], cands[a][1] - cands[b][1])
+                        if abs(d3_cur - tp['dist3']) > 140.0: continue
 
-                                tx = ref1[0] - (p1[0]*cos_t - p1[1]*sin_t)
-                                ty = ref1[1] - (p1[0]*sin_t + p1[1]*cos_t)
+                        # Azimut Kotvy 1 v referenčním světě
+                        del_X = tp['p1_pt'][0] - tp['pivot_pt'][0]
+                        del_Y = tp['p1_pt'][1] - tp['pivot_pt'][1]
+                        az_ref = math.atan2(del_X, del_Y)
 
-                                # Ověříme shodu se všemi svíčkami a stěnami v mapě
-                                inliers = 0
-                                err_sum = 0.0
-                                inlier_src = []
-                                inlier_dst = []
+                        # Azimut v aktuálním měření senzoru
+                        d_x = cands[a][0] - cands[p][0]
+                        d_y = cands[a][1] - cands[p][1]
+                        az_cur = math.atan2(d_x, d_y)
 
-                                for cp in cands:
-                                    wx = cp[0]*cos_t - cp[1]*sin_t + tx
-                                    wy = cp[0]*sin_t + cp[1]*cos_t + ty
-                                    min_d = 9999.0
-                                    best_rc = None
-                                    for rc in self.ref_candles:
-                                        d = math.hypot(wx - rc['x'], wy - rc['y'])
-                                        if d < min_d: min_d = d; best_rc = rc
-                                    if min_d < 180.0 and best_rc:
-                                        inliers += 2 # Svíčka má váhu 2
-                                        err_sum += min_d
-                                        inlier_src.append(cp)
-                                        inlier_dst.append((best_rc['x'], best_rc['y']))
+                        th = (az_ref - az_cur + math.pi) % (2 * math.pi) - math.pi
+                        cos_t = math.cos(th); sin_t = math.sin(th)
+                        tx = tp['pivot_pt'][0] - (cands[p][0] * cos_t + cands[p][1] * sin_t)
+                        ty = tp['pivot_pt'][1] - (-cands[p][0] * sin_t + cands[p][1] * cos_t)
 
-                                for wp in walls:
-                                    wx = wp[0]*cos_t - wp[1]*sin_t + tx
-                                    wy = wp[0]*sin_t + wp[1]*cos_t + ty
-                                    min_d = min((math.hypot(wx - rw['mx'], wy - rw['my']) for rw in self.ref_walls), default=9999.0)
-                                    if min_d < 220.0:
-                                        inliers += 1
-                                        err_sum += min_d
+                        res = evaluate_transformation(
+                            tx, ty, th,
+                            active_anchors=self.anchors[:2],
+                            pattern_name="TROJÚHELNÍK (KOTVA 1 + 2)",
+                            base_score=5000.0
+                        )
 
-                                avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
-
-                                if inliers > best_inliers or (inliers == best_inliers and avg_err < best_error):
-                                    best_inliers = inliers
-                                    best_error = avg_err
-                                    if len(inlier_src) >= 2:
-                                        rtx, rty, rth = self._rigid_transform_2d(inlier_src, inlier_dst)
-                                        best_tx = rtx; best_ty = rty; best_theta = rth
-                                    else:
-                                        best_tx = tx; best_ty = ty; best_theta = th
+                        if res['inliers'] >= 3 and res['score'] > best_score:
+                            best_score = res['score']
+                            best_match_info = res
 
         # ========================================================
-        # 2. ZÁLOŽNÍ METODA: PÁROVÁNÍ SVÍČKA-STĚNA / STĚNA-STĚNA
+        # STUPEŇ 2: SHODA JEDNOTLIVÝCH KOTEVA (Kotva 1 -> Kotva 2 -> Záložní)
         # ========================================================
-        if best_inliers < 2:
-            all_cur = [(c[0], c[1], 'c') for c in cands] + [(w[0], w[1], 'w') for w in walls]
-            all_ref = [(c['x'], c['y'], 'c') for c in self.ref_candles] + [(w['mx'], w['my'], 'w') for w in self.ref_walls]
+        if best_match_info is None or best_match_info['inliers'] < 3:
+            for anchor in self.anchors:
+                d_ref = anchor['dist']
+                ref1 = anchor['p1']
+                ref2 = anchor['p2']
+                del_X = ref2[0] - ref1[0]
+                del_Y = ref2[1] - ref1[1]
+                az_ref = math.atan2(del_X, del_Y)
 
-            for i in range(len(all_cur)):
-                for j in range(i + 1, len(all_cur)):
-                    d_cur = math.hypot(all_cur[i][0] - all_cur[j][0], all_cur[i][1] - all_cur[j][1])
-                    if d_cur < 150.0: continue
+                for a in range(len(cands)):
+                    for b in range(a + 1, len(cands)):
+                        d_cur = math.hypot(cands[a][0] - cands[b][0], cands[a][1] - cands[b][1])
+                        if abs(d_cur - d_ref) > 130.0: continue
 
-                    for ri in range(len(all_ref)):
-                        if all_cur[i][2] != all_ref[ri][2]: continue
-                        for rj in range(len(all_ref)):
-                            if rj == ri or all_cur[j][2] != all_ref[rj][2]: continue
+                        for (p1, p2) in [(cands[a], cands[b]), (cands[b], cands[a])]:
+                            d_x = p2[0] - p1[0]
+                            d_y = p2[1] - p1[1]
+                            az_cur = math.atan2(d_x, d_y)
 
-                            d_ref = math.hypot(all_ref[ri][0] - all_ref[rj][0], all_ref[ri][1] - all_ref[rj][1])
-                            if abs(d_cur - d_ref) < 130.0:
-                                p1 = (all_cur[i][0], all_cur[i][1])
-                                p2 = (all_cur[j][0], all_cur[j][1])
-                                r1 = (all_ref[ri][0], all_ref[ri][1])
-                                r2 = (all_ref[rj][0], all_ref[rj][1])
+                            th = (az_ref - az_cur + math.pi) % (2 * math.pi) - math.pi
+                            cos_t = math.cos(th); sin_t = math.sin(th)
+                            tx = ref1[0] - (p1[0] * cos_t + p1[1] * sin_t)
+                            ty = ref1[1] - (-p1[0] * sin_t + p1[1] * cos_t)
 
-                                tx, ty, th = self._rigid_transform_2d([p1, p2], [r1, r2])
-                                cos_t = math.cos(th); sin_t = math.sin(th)
+                            rank_bonus = max(0.0, 1500.0 - (anchor['rank'] - 1) * 350.0)
+                            res = evaluate_transformation(
+                                tx, ty, th,
+                                active_anchors=[anchor],
+                                pattern_name=anchor['name'],
+                                base_score=rank_bonus
+                            )
 
-                                inliers = 0
-                                err_sum = 0.0
-                                for p in all_cur:
-                                    wx = p[0]*cos_t - p[1]*sin_t + tx
-                                    wy = p[0]*sin_t + p[1]*cos_t + ty
-                                    min_d = min((math.hypot(wx - rp[0], wy - rp[1]) for rp in all_ref if rp[2] == p[2]), default=9999.0)
-                                    if min_d < 200.0:
-                                        inliers += 1
-                                        err_sum += min_d
-
-                                avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
-                                if inliers > best_inliers or (inliers == best_inliers and avg_err < best_error):
-                                    best_inliers = inliers
-                                    best_error = avg_err
-                                    best_tx = tx; best_ty = ty; best_theta = th
+                            if res['inliers'] >= 2 and res['score'] > best_score:
+                                best_score = res['score']
+                                best_match_info = res
 
         # ========================================================
-        # 3. APLIKACE VÝSLEDKU: STATICKÁ POLOHA, SETRVAČNOST A TRAJEKTORIE
+        # APLIKACE VÝSLEDKU LOKALIZACE
         # ========================================================
-        if best_inliers >= 2 and best_tx is not None:
-            cur_rad = math.radians(self.robot_deg)
-            dist_diff = math.hypot(best_tx - self.robot_x, best_ty - self.robot_y)
-            ang_diff = abs(math.atan2(math.sin(best_theta - cur_rad), math.cos(best_theta - cur_rad)))
+        if best_match_info is not None and best_match_info['inliers'] >= 2:
+            self.last_match_info = best_match_info
+            self.robot_x = best_match_info['tx']
+            self.robot_y = best_match_info['ty']
+            self.robot_deg = math.degrees(best_match_info['theta'])
+            self.is_stationary = True
+            quality = min(1.0, best_match_info['inliers'] / max(2, len(self.ref_boxes)))
+            self.pose_confidence = quality
 
-            # Klidový zámek: pokud se poloha liší o méně než 20 mm a 1.5°, robot stojí na místě
-            # (Absolutně statická poloha lidaru bez sebemenšího třesu!)
-            if dist_diff < 20.0 and ang_diff < math.radians(1.5):
-                self.is_stationary = True
-                self.pose_confidence = min(1.0, self.pose_confidence + 0.05)
-            else:
-                self.is_stationary = False
-
-                # Pokud došlo k velkému přemístění (např. uživatel zvedl a posunul LiDAR o > 300 mm),
-                # reagujeme rychleji (alpha = 0.50), při normálním pohybu plynule setrvačně (alpha = 0.22)
-                alpha = 0.50 if dist_diff > 300.0 else 0.22
-
-                self.robot_x = (1.0 - alpha) * self.robot_x + alpha * best_tx
-                self.robot_y = (1.0 - alpha) * self.robot_y + alpha * best_ty
-
-                # Hladké vyhlazení úhlu na jednotkové kružnici
-                sin_b = (1.0 - alpha) * math.sin(cur_rad) + alpha * math.sin(best_theta)
-                cos_b = (1.0 - alpha) * math.cos(cur_rad) + alpha * math.cos(best_theta)
-                self.robot_deg = math.degrees(math.atan2(sin_b, cos_b))
-
-                quality = min(1.0, best_inliers / max(2, len(self.ref_candles) + len(self.ref_walls)))
-                self.pose_confidence = min(1.0, 0.7 * self.pose_confidence + 0.3 * quality)
-
-                # Záznam do projeté trajektorie (každých 25 mm)
-                last_pt = self.trajectory[-1]
-                if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 25.0:
-                    self.trajectory.append((self.robot_x, self.robot_y))
-                    if len(self.trajectory) > 300:
-                        self.trajectory.pop(0)
+            # Záznam trajektorie robota (při posunu alespoň o 20 mm)
+            last_pt = self.trajectory[-1]
+            if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 20.0:
+                self.trajectory.append((self.robot_x, self.robot_y))
+                if len(self.trajectory) > 500:
+                    self.trajectory.pop(0)
 
             return True
         else:
-            # Krátkodobý výpadek měření – držíme pozici, jistota jemně klesá
-            self.pose_confidence = max(0.0, self.pose_confidence - 0.02)
+            self.pose_confidence = max(0.0, self.pose_confidence - 0.05)
             return False
 
-    update_pose = estimate_pose
-
 
 # ============================================================
-#  Třída pro stabilní herní mapu (World Model)
+#  Kumulativní mapa celého hřiště (GlobalFieldMap)
+#  S podporou doplňování cílů a zachováním zastíněných překážek
 # ============================================================
+class GlobalFieldMap:
+    """
+    Globální model celého hřiště (2.4 m x 3.5 m):
+    - Kumulativně shromažďuje Bounding Boxy (až 4 cíle).
+    - Zachovává známé cíle, i když je robot v daném úhlu zrovna nevidí (jsou zastíněné).
+    - Jakmile se při pohybu objeví dosud neviděný cíl (např. 4. svíčka skrytá za stěnou),
+      automaticky ho doplní do mapy.
+    - Filtruje falešné odrazy za mantinelem hřiště.
+    - Počítá optimální pořadí trasy pro hašení svíček (1 -> 2 -> 3 -> 4).
+    """
 
-class StableFieldModel:
     def __init__(self):
-        self.candles = []
-        self.walls = []
-        self.total_scans = 0
+        self.targets = []               # Seznam globálních cílů v souřadnicích hřiště
+        self.robot_start = (0.0, 0.0)   # Výchozí pozice START
+        self.robot_pos = (0.0, 0.0)     # Aktuální pozice robota [X, Y]
+        self.robot_deg = 0.0            # Aktuální natočení
+        self.trajectory = [(0.0, 0.0)]  # Trajektorie robota
+        self.total_updates = 0
+        self.start_wall_mode = 2        # 2 = 2.4 m (Kratší stěna), 3 = 3.5 m (Delší stěna)
+        self.smooth_bounds = None       # [xmin, xmax, ymin, ymax]
+        self.rejected_outside_count = 0 # Počet bodů mimo mantinel
 
     def reset(self):
-        self.candles.clear()
-        self.walls.clear()
-        self.total_scans = 0
+        self.targets.clear()
+        self.robot_pos = (0.0, 0.0)
+        self.robot_deg = 0.0
+        self.trajectory = [(0.0, 0.0)]
+        self.total_updates = 0
+        self.smooth_bounds = None
+        self.rejected_outside_count = 0
 
-    def update(self, live_candles, live_walls):
-        self.total_scans += 1
+    def set_start_wall(self, mode):
+        if mode in (2, 3) and self.start_wall_mode != mode:
+            self.start_wall_mode = mode
+            self.smooth_bounds = None
 
-        # 1. SVÍČKY (párování do 150 mm)
-        matched_c = set()
-        for lc in live_candles:
-            cx, cy = lc[0], lc[1]
+    def toggle_start_wall(self):
+        new_mode = 3 if self.start_wall_mode == 2 else 2
+        self.set_start_wall(new_mode)
+        return self.start_wall_mode
+
+    def get_field_dims(self):
+        cfg = WALL_CONFIGS.get(self.start_wall_mode, WALL_CONFIGS[2])
+        return cfg["w"], cfg["l"]
+
+    def get_auto_field_bounds(self):
+        """Vrátí hranice hřiště [xmin, xmax, ymin, ymax] přizpůsobené startu a cílům."""
+        W, L = self.get_field_dims()
+
+        x_pts = [0.0, self.robot_pos[0]]
+        y_pts = [0.0, self.robot_pos[1]]
+        for tp in self.trajectory:
+            x_pts.append(tp[0]); y_pts.append(tp[1])
+        for t in self.targets:
+            if abs(t['x']) <= 4500.0 and -800.0 <= t['y'] <= 5000.0:
+                x_pts.append(t['x']); y_pts.append(t['y'])
+
+        # Zadní startovní stěna (robot začíná cca 200 mm od mantinelu)
+        min_y = min(y_pts)
+        target_ymin = min(-200.0, min_y - 80.0)
+        target_ymax = target_ymin + L
+
+        # Vycentrování na šířku W
+        min_x = min(x_pts)
+        max_x = max(x_pts)
+        mid_x = (min_x + max_x) * 0.5
+        target_xmin = mid_x - W * 0.5
+        target_xmax = target_xmin + W
+
+        if self.smooth_bounds is None:
+            self.smooth_bounds = [target_xmin, target_xmax, target_ymin, target_ymax]
+        else:
+            alpha = 0.10
+            self.smooth_bounds[0] = (1.0 - alpha) * self.smooth_bounds[0] + alpha * target_xmin
+            self.smooth_bounds[1] = self.smooth_bounds[0] + W
+            self.smooth_bounds[2] = (1.0 - alpha) * self.smooth_bounds[2] + alpha * target_ymin
+            self.smooth_bounds[3] = self.smooth_bounds[2] + L
+
+        return tuple(self.smooth_bounds)
+
+    def update_robot_pose(self, rx, ry, rdeg):
+        self.robot_pos = (rx, ry)
+        self.robot_deg = rdeg
+        if len(self.trajectory) == 0 or math.hypot(rx - self.trajectory[-1][0], ry - self.trajectory[-1][1]) > 15.0:
+            self.trajectory.append((rx, ry))
+            if len(self.trajectory) > 600:
+                self.trajectory.pop(0)
+
+    def ingest_boxes(self, boxes, rx, ry, rdeg):
+        """
+        Převezme Bounding Boxy z aktuálního skenu a transformuje je do souřadnic hřiště.
+        - Spáruje známé cíle (aktualizuje EMA polohu).
+        - Přidá nově objevené cíle (doplňování při pohybu robota).
+        - Zastíněné cíle nezahazuje, ale ponechává je s označením [ZASTÍNĚNÝ].
+        """
+        self.total_updates += 1
+        xmin, xmax, ymin, ymax = self.get_auto_field_bounds()
+        margin = 40.0 # Ochranný okraj od mantinelu
+
+        heading_rad = math.radians(rdeg)
+        cos_h = math.cos(heading_rad)
+        sin_h = math.sin(heading_rad)
+
+        # 1. Transformace aktuálních boxů do souřadnic hřiště
+        curr_transformed = []
+        rejected = 0
+        for b in boxes:
+            cx, cy = b['cx'], b['cy']
+            wx = rx + cx * cos_h + cy * sin_h
+            wy = ry - cx * sin_h + cy * cos_h
+
+            # Kontrola hranic pole: co leží vně mantinelu, je falešný odraz
+            if (xmin + margin <= wx <= xmax - margin) and (ymin + margin <= wy <= ymax - margin):
+                curr_transformed.append({
+                    'wx': wx, 'wy': wy,
+                    'width': b['width'], 'height': b['height'],
+                    'span_mm': b['span_mm'],
+                    'is_solo': b['is_solo'],
+                    'pts_count': b['pts_count']
+                })
+            else:
+                rejected += 1
+
+        self.rejected_outside_count = rejected
+
+        # 2. Označení všech dosavadních cílů jako prozatím neviděných v tomto snímku
+        for t in self.targets:
+            t['is_visible'] = False
+
+        # 3. Párování a doplňování cílů
+        matched_target_idxs = set()
+        for cb in curr_transformed:
             best_idx = -1
-            best_dist = 150.0
-            for idx, sc in enumerate(self.candles):
-                if idx in matched_c: continue
-                d = math.hypot(sc['x'] - cx, sc['y'] - cy)
-                if d < best_dist:
-                    best_dist = d
+            best_d = 280.0 # Tolerance párování v mm
+
+            for idx, t in enumerate(self.targets):
+                if idx in matched_target_idxs: continue
+                d = math.hypot(t['x'] - cb['wx'], t['y'] - cb['wy'])
+                if d < best_d:
+                    best_d = d
                     best_idx = idx
 
             if best_idx >= 0:
-                sc = self.candles[best_idx]
-                sc['x'] = 0.85 * sc['x'] + 0.15 * cx
-                sc['y'] = 0.85 * sc['y'] + 0.15 * cy
-                sc['hits'] += 1
-                sc['missed'] = 0
-                matched_c.add(best_idx)
+                # Nalezena shoda -> vyhlazení polohy a rozměrů
+                t = self.targets[best_idx]
+                alpha = 0.15
+                t['x'] = (1.0 - alpha) * t['x'] + alpha * cb['wx']
+                t['y'] = (1.0 - alpha) * t['y'] + alpha * cb['wy']
+                t['width'] = (1.0 - alpha) * t['width'] + alpha * cb['width']
+                t['height'] = (1.0 - alpha) * t['height'] + alpha * cb['height']
+                t['span_mm'] = math.hypot(t['width'], t['height'])
+                t['hits'] += 1
+                t['is_visible'] = True
+                t['is_solo'] = cb['is_solo']
+                t['status'] = "VIDITELNÝ"
+                matched_target_idxs.add(best_idx)
             else:
-                if len(self.candles) < 8:
-                    new_idx = len(self.candles)
-                    self.candles.append({'x': cx, 'y': cy, 'hits': 1, 'missed': 0})
-                    matched_c.add(new_idx)
+                # Nový cíl -> kontrola minimálního rozestupu od stávajících cílů (min 600 mm)
+                too_close = any(math.hypot(cb['wx'] - t['x'], cb['wy'] - t['y']) < 600.0 for t in self.targets)
+                if not too_close and len(self.targets) < 4:
+                    new_target = {
+                        'x': cb['wx'], 'y': cb['wy'],
+                        'width': cb['width'], 'height': cb['height'],
+                        'span_mm': cb['span_mm'],
+                        'hits': 1,
+                        'is_visible': True,
+                        'is_solo': cb['is_solo'],
+                        'status': "VIDITELNÝ"
+                    }
+                    self.targets.append(new_target)
+                    matched_target_idxs.add(len(self.targets) - 1)
 
-        for idx, sc in enumerate(self.candles):
-            if idx not in matched_c:
-                sc['missed'] += 1
+        # 4. Pro cíle, které nebyly v tomto skenu spatřeny (zastíněné):
+        for idx, t in enumerate(self.targets):
+            if not t['is_visible']:
+                t['status'] = "ZASTÍNĚNÝ / ZNÁMÝ"
 
-        self.candles = [c for c in self.candles if c['missed'] < 16 or (c['hits'] > 10 and c['missed'] < 25)]
+            # Vzdálenost od aktuální pozice robota
+            t['dist_from_robot'] = math.hypot(t['x'] - rx, t['y'] - ry)
+            t['dist_from_start'] = math.hypot(t['x'], t['y'])
 
-        # 2. STĚNY (párování do 140 mm)
-        matched_w = set()
-        for lw in live_walls:
-            x1, y1, x2, y2 = lw[0], lw[1], lw[2], lw[3]
-            mx = (x1 + x2) * 0.5
-            my = (y1 + y2) * 0.5
-            wlen = lw[4]
+    def get_field_targets(self):
+        """Vrátí potvrzené cíle hřiště (seřazené podle vzdálenosti od startu)."""
+        valid = [t for t in self.targets if t.get('hits', 0) >= 1]
+        valid.sort(key=lambda t: t['dist_from_start'])
+        return valid[:4]
 
-            best_idx = -1
-            best_dist = 140.0
-            for idx, sw in enumerate(self.walls):
-                if idx in matched_w: continue
-                d = math.hypot(sw['mx'] - mx, sw['my'] - my)
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = idx
+    def compute_extinguish_route(self):
+        """Vypočítá optimální trasu hašení svíček od aktuální polohy robota."""
+        targets = self.get_field_targets()
+        if len(targets) < 2:
+            return targets
 
-            if best_idx >= 0:
-                sw = self.walls[best_idx]
-                sw['x1'] = 0.8 * sw['x1'] + 0.2 * x1
-                sw['y1'] = 0.8 * sw['y1'] + 0.2 * y1
-                sw['x2'] = 0.8 * sw['x2'] + 0.2 * x2
-                sw['y2'] = 0.8 * sw['y2'] + 0.2 * y2
-                sw['mx'] = (sw['x1'] + sw['x2']) * 0.5
-                sw['my'] = (sw['y1'] + sw['y2']) * 0.5
-                sw['len'] = math.hypot(sw['x2'] - sw['x1'], sw['y2'] - sw['y1'])
-                sw['hits'] += 1
-                sw['missed'] = 0
-                matched_w.add(best_idx)
-            else:
-                if len(self.walls) < 12:
-                    new_w_idx = len(self.walls)
-                    self.walls.append({
-                        'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                        'mx': mx, 'my': my, 'len': wlen,
-                        'hits': 1, 'missed': 0
-                    })
-                    matched_w.add(new_w_idx)
+        unvisited = list(targets)
+        route = []
+        curr_x, curr_y = self.robot_pos
 
-        for idx, sw in enumerate(self.walls):
-            if idx not in matched_w:
-                sw['missed'] += 1
+        while unvisited:
+            best_idx = 0
+            best_d = 999999.0
+            for i, t in enumerate(unvisited):
+                d = math.hypot(t['x'] - curr_x, t['y'] - curr_y)
+                if d < best_d:
+                    best_d = d
+                    best_idx = i
+            nxt = unvisited.pop(best_idx)
+            route.append(nxt)
+            curr_x, curr_y = nxt['x'], nxt['y']
 
-        self.walls = [w for w in self.walls if w['missed'] < 14 or (w['hits'] > 8 and w['missed'] < 22)]
-
-    def get_confirmed_candles(self):
-        valid = [c for c in self.candles if c['hits'] >= 4]
-        conf_walls = self.get_confirmed_walls()
-
-        candidates = []
-        for c in valid:
-            in_wall = False
-            walls_within_25cm = 0
-            closest_dist = 9999.0
-
-            for w in conf_walls:
-                dx = w['x2'] - w['x1']
-                dy = w['y2'] - w['y1']
-                L = math.hypot(dx, dy)
-                if L < 10.0: continue
-                ux = dx / L
-                uy = dy / L
-                nx = -uy
-                ny = ux
-
-                vx = c['x'] - w['x1']
-                vy = c['y'] - w['y1']
-                proj_t = vx * ux + vy * uy
-                d_perp = abs(vx * nx + vy * ny)
-
-                # Fialový koridor: svíčka nesmí ležet v dráze stěny ani v prodloužení o 15 cm před/za
-                if d_perp <= 55.0 and -150.0 <= proj_t <= L + 150.0:
-                    in_wall = True
-                    break
-
-                # Nejbližší bod na úsečce stěny
-                t_clamped = max(0.0, min(L, proj_t))
-                cx_wall = w['x1'] + t_clamped * ux
-                cy_wall = w['y1'] + t_clamped * uy
-                dist_to_seg = math.hypot(c['x'] - cx_wall, c['y'] - cy_wall)
-
-                if dist_to_seg < closest_dist:
-                    closest_dist = dist_to_seg
-
-                # Poloměr 25 cm (250 mm): počítáme stěny u svíčky
-                if dist_to_seg <= 250.0:
-                    walls_within_25cm += 1
-
-            if not in_wall:
-                c_copy = dict(c)
-                c_copy['walls_count'] = walls_within_25cm
-                c_copy['closest_wall_dist'] = closest_dist
-                # Skóre: přednost mají svíčky se stěnou (2 stěny > 1 stěna > 0 stěn)
-                score = walls_within_25cm * 2000.0 + c['hits'] * 10.0
-                if walls_within_25cm > 0:
-                    score += max(0.0, 250.0 - closest_dist)
-                c_copy['score'] = score
-                candidates.append(c_copy)
-
-        # Doplnění svíčky pro každou samostatnou 30cm stěnu, která zatím nemá svíčku v dosahu 25 cm:
-        for w in conf_walls:
-            if w['len'] >= 250.0 and w['len'] <= 350.0:
-                has_candle = False
-                for cand in candidates:
-                    d = math.hypot(cand['x'] - w['mx'], cand['y'] - w['my'])
-                    if d <= 260.0:
-                        has_candle = True
-                        break
-
-                if not has_candle:
-                    # Normála směřující k robotu (do středu pole)
-                    dx = w['x2'] - w['x1']
-                    dy = w['y2'] - w['y1']
-                    L = math.hypot(dx, dy)
-                    if L >= 10.0:
-                        ux = dx / L
-                        uy = dy / L
-                        nx = -uy
-                        ny = ux
-                        if (w['mx'] * nx + w['my'] * ny) > 0:
-                            nx = -nx
-                            ny = -ny
-
-                        synth_x = w['mx'] + 130.0 * nx
-                        synth_y = w['my'] + 130.0 * ny
-                        candidates.append({
-                            'x': synth_x,
-                            'y': synth_y,
-                            'hits': w['hits'],
-                            'walls_count': 1,
-                            'closest_wall_dist': 130.0,
-                            'score': 2500.0 + w['hits'] * 10.0
-                        })
-
-        # Seřadíme sestupně podle skóre
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-
-        # Výběr s pravidly:
-        # 1. Rozestup svíček alespoň 80 cm (800 mm)
-        # 2. Maximálně JEDNA svíčka bez stěny (dvě svíčky bez stěny nemohou být)
-        filtered = []
-        isolated_count = 0
-
-        for cand in candidates:
-            if len(filtered) >= 4:
-                break
-
-            is_isolated = (cand['walls_count'] == 0)
-            if is_isolated and isolated_count >= 1:
-                # Už máme jednu samostatnou svíčku bez stěny, další bez stěny je vyloučena!
-                continue
-
-            # Kontrola vzdálenosti 80 cm od už vybraných
-            too_close = False
-            for f in filtered:
-                if math.hypot(cand['x'] - f['x'], cand['y'] - f['y']) < 800.0:
-                    too_close = True
-                    break
-
-            if not too_close:
-                if is_isolated:
-                    isolated_count += 1
-                filtered.append(cand)
-
-        return filtered
-
-    def get_confirmed_walls(self):
-        valid = [w for w in self.walls if w['hits'] >= 4]
-        valid.sort(key=lambda w: w['hits'], reverse=True)
-
-        selected = []
-        for w in valid:
-            if len(selected) >= 6:
-                break
-
-            conflict = False
-            w_dx = (w['x2'] - w['x1']) / w['len'] if w['len'] > 0 else 0
-            w_dy = (w['y2'] - w['y1']) / w['len'] if w['len'] > 0 else 0
-
-            for s in selected:
-                s_dx = (s['x2'] - s['x1']) / s['len'] if s['len'] > 0 else 0
-                s_dy = (s['y2'] - s['y1']) / s['len'] if s['len'] > 0 else 0
-
-                center_dist = math.hypot(w['mx'] - s['mx'], w['my'] - s['my'])
-                dot = abs(w_dx * s_dx + w_dy * s_dy)
-
-                # Kolmé stěny (cca 70° až 110° -> |dot| <= 0.35)
-                is_perp = (dot <= 0.35)
-
-                if is_perp:
-                    # Kolmé stěny tvoří rohy L nebo U-boxy, dotýkají se v rozích.
-                    if center_dist < 70.0:
-                        conflict = True
-                        break
-                else:
-                    # Nekolmé stěny (rovnoběžné nebo šikmé např. pod 45°) se nesmí překrývat
-                    if center_dist < 200.0:
-                        conflict = True
-                        break
-
-                    # Kolmá vzdálenost nosné přímky a podélný překryv
-                    perp_dist = abs((w['mx'] - s['x1']) * (-s_dy) + (w['my'] - s['y1']) * s_dx)
-                    proj_long = (w['mx'] - s['x1']) * s_dx + (w['my'] - s['y1']) * s_dy
-                    if perp_dist < 150.0 and -60.0 <= proj_long <= (s['len'] + 60.0):
-                        conflict = True
-                        break
-
-            if not conflict:
-                selected.append(w)
-
-        return selected
+        return route
 
 
 # ============================================================
-#  Detektor makro-shluků (Svíčka + Stěna i samostatná svíčka, max 4 boxy)
-# ============================================================
-class ClusterDetector:
-    """
-    Detekce makro-shluků překážek (Svíčka + Stěna i samostatná svíčka).
-    Princip:
-    1. 2D prostorové shlukování (Spatial Grid):
-       Body vzdálené do 250 mm (25 cm) se spojí do jednoho shluku.
-    2. Zachytí i samostatnou svíčku bez stěny:
-       Stačí alespoň 3-4 body a rozměr od 20 mm.
-    3. Poměr stran (Aspect Ratio) zhruba čtverec až obdélník 1:3:
-       max(W, H) / max(min(W, H), 18.0) <= 3.2.
-       Spolehlivě odfiltruje táhlé zdi místnosti/arény (poměry 5:1 až 20:1)!
-    4. Maximální rozměr: do 650 mm (vyřadí velké zdi).
-    5. Striktní limit: MAXIMÁLNĚ 4 Bounding Boxy.
-    """
-    def __init__(self, merge_dist_mm=250.0, min_pts=3, max_clusters=4, max_aspect_ratio=3.2):
-        self.merge_dist_mm = merge_dist_mm
-        self.min_pts = min_pts
-        self.max_clusters = max_clusters
-        self.max_aspect_ratio = max_aspect_ratio
-
-    def detect(self, raw_cloud):
-        if not raw_cloud or len(raw_cloud) < 3 * self.min_pts:
-            return []
-
-        # Extrakce bodů (x, y)
-        n = len(raw_cloud) // 3
-        pts = [(float(raw_cloud[i * 3]), float(raw_cloud[i * 3 + 1])) for i in range(n)]
-
-        # 1. Prostorová mřížka (Grid Hashing s buňkami o velikosti 250 mm)
-        cell_size = self.merge_dist_mm
-        grid = {}
-        for i, (x, y) in enumerate(pts):
-            gx = int(math.floor(x / cell_size))
-            gy = int(math.floor(y / cell_size))
-            cell = (gx, gy)
-            if cell not in grid:
-                grid[cell] = []
-            grid[cell].append(i)
-
-        # Disjoint-Set (Union-Find) pro propojení bodů v 2D do 250 mm
-        parent = list(range(n))
-        def find(i):
-            path = []
-            while parent[i] != i:
-                path.append(i)
-                i = parent[i]
-            for node in path:
-                parent[node] = i
-            return i
-
-        def union(i, j):
-            root_i = find(i)
-            root_j = find(j)
-            if root_i != root_j:
-                parent[root_i] = root_j
-
-        merge_sq = self.merge_dist_mm * self.merge_dist_mm
-
-        # Propojení uvnitř buněk a se sousedními buňkami
-        for (gx, gy), idxs in grid.items():
-            for a_idx in range(len(idxs)):
-                i = idxs[a_idx]
-                xi, yi = pts[i]
-                for b_idx in range(a_idx + 1, len(idxs)):
-                    j = idxs[b_idx]
-                    if (xi - pts[j][0])**2 + (yi - pts[j][1])**2 <= merge_sq:
-                        union(i, j)
-
-            for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-                nbr_cell = (gx + dx, gy + dy)
-                if nbr_cell in grid:
-                    nbr_idxs = grid[nbr_cell]
-                    for i in idxs:
-                        xi, yi = pts[i]
-                        for j in nbr_idxs:
-                            if (xi - pts[j][0])**2 + (yi - pts[j][1])**2 <= merge_sq:
-                                union(i, j)
-
-        clusters_dict = {}
-        for i in range(n):
-            root = find(i)
-            if root not in clusters_dict:
-                clusters_dict[root] = []
-            clusters_dict[root].append(pts[i])
-
-        candidates = []
-        for root, c in clusters_dict.items():
-            k = len(c)
-            if k < self.min_pts:
-                continue
-
-            # Rozměry pravoúhlého boxu
-            min_x = min(p[0] for p in c)
-            max_x = max(p[0] for p in c)
-            min_y = min(p[1] for p in c)
-            max_y = max(p[1] for p in c)
-            width = max_x - min_x
-            height = max_y - min_y
-
-            max_side = max(width, height)
-            min_side = min(width, height)
-
-            # Maximální rozpětí (průměr shluku)
-            max_d = 0.0
-            sample_c = c if k <= 40 else c[::max(1, k // 30)]
-            for i in range(len(sample_c)):
-                for j in range(i + 1, len(sample_c)):
-                    d_ij = math.hypot(sample_c[i][0] - sample_c[j][0], sample_c[i][1] - sample_c[j][1])
-                    if d_ij > max_d:
-                        max_d = d_ij
-
-            span_mm = max(max_d, max_side)
-
-            # 1. Zahození zdí (> 650 mm)
-            if span_mm > 650.0 or max_side > 620.0:
-                continue
-
-            # 2. Zahození mikroskopického šumu (< 20 mm)
-            if span_mm < 20.0:
-                continue
-
-            # 3. Kontrola poměru stran (Aspect Ratio):
-            # Pro malé shluky (do 7 bodů, např. osamocená svíčka) na poměru stran nezáleží.
-            # Pro větší objekty musí mít tvar zhruba čtverce až obdélníku cca 1:3 (odfiltruje zdi 1:10)
-            aspect_ratio = max_side / max(min_side, 18.0)
-            if k > 7 and aspect_ratio > self.max_aspect_ratio:
-                continue
-
-            # Středový bod (těžiště shluku)
-            cx = sum(p[0] for p in c) / k
-            cy = sum(p[1] for p in c) / k
-            dist_mm = math.hypot(cx, cy)
-
-            is_solo_candle = (span_mm < 140.0)
-            target_type = "SVÍČKA" if is_solo_candle else "SVÍČKA+STĚNA"
-
-            candidates.append({
-                'points': c,
-                'pts_count': k,
-                'cx': cx, 'cy': cy,
-                'min_x': min_x, 'max_x': max_x,
-                'min_y': min_y, 'max_y': max_y,
-                'width': width,
-                'height': height,
-                'span_mm': span_mm,
-                'dist_mm': dist_mm,
-                'aspect_ratio': aspect_ratio,
-                'type': target_type
-            })
-
-        # Výběr MAXIMÁLNĚ 4 kandidátů:
-        # Bližší bounding boxy mají přednost (řadíme podle vzdálenosti vzestupně)
-        candidates.sort(key=lambda item: item['dist_mm'])
-        return candidates[:self.max_clusters]
-
-
-# ============================================================
-#  Dvoupanelový vizualizér
+#  Hlavní vícepanelový vizualizér
 # ============================================================
 class DualLidarVisualizer:
     def __init__(self, port, baud):
@@ -809,10 +675,11 @@ class DualLidarVisualizer:
         self.running = True
         self.frozen = False
 
-        # Výchozí nastavení přesně dle specifikace a screenshotu
+        # Výchozí parametry
         self.fov_limited = True
+        self.auto_fov_enabled = True  # 180° start kužel -> 360° plný rozhled po [L] v poli
         self.min_range = 130
-        self.max_range = 1800
+        self.max_range = 2400
         self.min_intensity = 15
         self.view_span_mm = 3500.0
 
@@ -820,32 +687,29 @@ class DualLidarVisualizer:
 
         self.last_frame = {
             "fps": 0.0, "pts": 0, "calc_us": 0, "heap": 0, "crc_err": 0,
-            "walls": [], "candles": [], "cloud": []
+            "boxes": [], "static_boxes": [], "cloud": []
         }
 
-        self.model = StableFieldModel()
         self.localizer = RobotLocalizer()
-        self.cluster_detector = ClusterDetector(merge_dist_mm=250.0, min_pts=4, max_clusters=4)
-        self.show_boxes = True
-        self.show_legacy_detection = False
+        self.field_map = GlobalFieldMap()
 
         pygame.init()
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
-        pygame.display.set_caption(f"Kybernoid 27 - LiDAR D200 Detector [{port}]")
+        pygame.display.set_caption(f"Kybernoid 27 - LiDAR D200 Bounding Box Localizer [{port}]")
         self.clock = pygame.time.Clock()
 
         try:
-            self.font_main = pygame.font.SysFont("DejaVu Sans Mono", 12)
-            self.font_bold = pygame.font.SysFont("DejaVu Sans Mono", 13, bold=True)
-            self.font_big  = pygame.font.SysFont("DejaVu Sans Mono", 16, bold=True)
+            self.font_main = pygame.font.SysFont("DejaVu Sans Mono", 11)
+            self.font_bold = pygame.font.SysFont("DejaVu Sans Mono", 12, bold=True)
+            self.font_big  = pygame.font.SysFont("DejaVu Sans Mono", 15, bold=True)
         except:
-            self.font_main = pygame.font.SysFont(None, 15)
-            self.font_bold = pygame.font.SysFont(None, 17)
-            self.font_big  = pygame.font.SysFont(None, 21)
+            self.font_main = pygame.font.SysFont(None, 14)
+            self.font_bold = pygame.font.SysFont(None, 16)
+            self.font_big  = pygame.font.SysFont(None, 20)
 
         self.connect_serial()
-        # Nastavení výchozího 180° režimu do ESP32
-        self.send_cmd(f"FOV 1")
+        # Výchozí konfigurace do ESP32
+        self.send_cmd("FOV 1")
         self.send_cmd(f"RANGE {self.min_range} {self.max_range}")
         self.send_cmd(f"INTENSITY {self.min_intensity}")
 
@@ -867,11 +731,11 @@ class DualLidarVisualizer:
             except: pass
 
     def on_parameter_changed(self):
-        """Vždy při změně parametrů (FoV/dosah/intenzita) se vygeneruje čistá nová mapa."""
-        self.model.reset()
+        """Vyresetuje stav map a odešle RESET_MAP do ESP32."""
         self.localizer.unlock_map()
+        self.field_map.reset()
         self.send_cmd("RESET_MAP")
-        print("[MAPA] Parametry upraveny -> stabilní mapa i lokalizace resetovány.")
+        print("[MAPA] Mapy vyresetovány -> sběr čistého etalonu.")
 
     def to_screen(self, x_mm, y_mm, panel_offset_x):
         cx = panel_offset_x + PANEL_W / 2.0
@@ -893,49 +757,57 @@ class DualLidarVisualizer:
 
         if newest is not None and not self.frozen:
             self.last_frame = newest
-            self.model.update(newest.get("candles", []), newest.get("walls", []))
-            # Lokalizace: odhad polohy robota v reálném čase z čerstvých dat senzoru
-            if self.localizer.locked:
-                self.localizer.estimate_pose(newest.get("candles", []), newest.get("walls", []))
+            live_boxes = parse_box_list(newest.get("boxes", []))
+            static_boxes = parse_box_list(newest.get("static_boxes", []))
+
+            # Pokud ještě není zamčeno [L], průběžně aktualizujeme globální model z pozice START=[0,0]
+            if not self.localizer.locked:
+                active_b = static_boxes if static_boxes else live_boxes
+                if active_b:
+                    self.field_map.ingest_boxes(active_b, 0.0, 0.0, 0.0)
+            else:
+                # Po zamknutí provádíme lokalizaci robota podle aktuálních boxů
+                active_b = static_boxes if len(static_boxes) >= 2 else live_boxes
+                if len(active_b) >= 2:
+                    self.localizer.estimate_pose(active_b)
+
+                loc = self.localizer
+                if loc.pose_confidence > 0.3 and len(active_b) >= 1:
+                    # Kumulativní plnění hřiště a zachování/doplnění cílů
+                    self.field_map.ingest_boxes(active_b, loc.robot_x, loc.robot_y, loc.robot_deg)
+                    self.field_map.update_robot_pose(loc.robot_x, loc.robot_y, loc.robot_deg)
 
     def handle_click(self, pos):
-        if pos[0] >= PANEL_W:
-            return  # Klik v pravém panelu neprovádí inspekci bodů radaru
-        cx = PANEL_W / 2.0
+        if pos[1] >= PANEL_H:
+            return # Klik ve spodním panelu
+
+        panel_idx = pos[0] // PANEL_W
+        offset_x = panel_idx * PANEL_W
+        cx = offset_x + PANEL_W / 2.0
         cy = PANEL_H / 2.0
         scale = (PANEL_W / 2.0) / self.view_span_mm
-        click_x_mm = (pos[0] - cx) / scale
-        click_y_mm = -(pos[1] - cy) / scale
+        click_x = (pos[0] - cx) / scale
+        click_y = -(pos[1] - cy) / scale
 
         best_dist = 999999.0
         best_obj = None
 
-        # Svíčky
-        for c in self.last_frame.get("candles", []):
-            dx = c[0] - click_x_mm
-            dy = c[1] - click_y_mm
-            d = math.hypot(dx, dy)
+        boxes_to_check = parse_box_list(self.last_frame.get("static_boxes", []))
+        if not boxes_to_check:
+            boxes_to_check = parse_box_list(self.last_frame.get("boxes", []))
+
+        for b in boxes_to_check:
+            d = math.hypot(b['cx'] - click_x, b['cy'] - click_y)
             if d < best_dist:
                 best_dist = d
-                best_obj = (c[0], c[1], math.hypot(c[0], c[1]))
+                best_obj = (b['cx'], b['cy'], b['dist_mm'])
 
-        # Stěny
-        for w in self.last_frame.get("walls", []):
-            mx = (w[0] + w[2]) / 2.0
-            my = (w[1] + w[3]) / 2.0
-            dx = mx - click_x_mm
-            dy = my - click_y_mm
-            d = math.hypot(dx, dy)
-            if d < best_dist:
-                best_dist = d
-                best_obj = (mx, my, math.hypot(mx, my))
-
-        if best_dist < 400: # V dosahu kliku
+        if best_dist < 400:
             self.selected_object = best_obj
         else:
-            self.selected_object = (click_x_mm, click_y_mm, math.hypot(click_x_mm, click_y_mm))
+            self.selected_object = (click_x, click_y, math.hypot(click_x, click_y))
 
-    def draw_panel_decorations(self, offset_x, is_right_panel=False):
+    def draw_panel_decorations(self, offset_x, panel_idx=0):
         cx = offset_x + PANEL_W // 2
         cy = PANEL_H // 2
         scale = (PANEL_W / 2.0) / self.view_span_mm
@@ -952,409 +824,537 @@ class DualLidarVisualizer:
             lbl = self.font_main.render(f"{d_m:.1f} m", True, (90, 100, 115))
             self.screen.blit(lbl, (cx + 5, cy - r_px - 8))
 
-        # Obrys hřiště 2400 x 3500 mm
-        hw = 2400 / 2.0
-        p1 = self.to_screen(-hw, 0, offset_x)
-        p2 = self.to_screen( hw, 0, offset_x)
-        p3 = self.to_screen( hw, 3500, offset_x)
-        p4 = self.to_screen(-hw, 3500, offset_x)
-        pygame.draw.polygon(self.screen, (28, 44, 34), [p1, p2, p3, p4], 1)
-
-        if not is_right_panel:
-            # LEVÝ RADAR: Robot pevně ve středu se směrovou šipkou dopředu
+        if panel_idx == 0:
+            # Panel 1: Robot pevně ve středu
             pygame.draw.circle(self.screen, (0, 180, 255), (cx, cy), 8)
             pygame.draw.line(self.screen, (0, 255, 180), (cx, cy), (cx, cy - 35), 3)
-        else:
-            # PRAVÁ GLOBÁLNÍ MAPA: Bod START (0,0) – výchozí pozice robota
+        elif panel_idx == 1:
+            # Panel 2: Bod START (0,0)
             pygame.draw.circle(self.screen, (0, 180, 220), (cx, cy), 7, 1)
             pygame.draw.line(self.screen, (0, 220, 255), (cx - 5, cy), (cx + 5, cy), 1)
             pygame.draw.line(self.screen, (0, 220, 255), (cx, cy - 5), (cx, cy + 5), 1)
-            lbl_start = self.font_main.render("START (0,0)", True, (0, 220, 255))
-            self.screen.blit(lbl_start, (cx + 9, cy - 7))
+            self.screen.blit(self.font_main.render("START (0,0)", True, (0, 220, 255)), (cx + 9, cy - 7))
+        elif panel_idx == 2:
+            # Panel 3: Bod START jako výchozí bod referenčního světa
+            pygame.draw.circle(self.screen, (0, 220, 255), (cx, cy), 5)
+            self.screen.blit(self.font_main.render("START", True, (0, 200, 240)), (cx + 8, cy - 6))
 
-
-    def draw_wall_corridor(self, x1, y1, x2, y2, wlen, offset_x):
-        if wlen < 10.0: return
-        dx = (x2 - x1) / wlen
-        dy = (y2 - y1) / wlen
-        nx = -dy
-        ny = dx
-
-        ext = 150.0  # 15 cm prodloužení přes stěnu
-        hw = 55.0    # Tloušťka koridoru (+-55 mm od přímky)
-
-        ax1 = x1 - ext * dx
-        ay1 = y1 - ext * dy
-        ax2 = x2 + ext * dx
-        ay2 = y2 + ext * dy
-
-        c1 = self.to_screen(ax1 + hw * nx, ay1 + hw * ny, offset_x)
-        c2 = self.to_screen(ax2 + hw * nx, ay2 + hw * ny, offset_x)
-        c3 = self.to_screen(ax2 - hw * nx, ay2 - hw * ny, offset_x)
-        c4 = self.to_screen(ax1 - hw * nx, ay1 - hw * ny, offset_x)
-
-        # Fialový koridor (zakázaná zóna pro svíčky)
-        pygame.draw.polygon(self.screen, (45, 12, 55), [c1, c2, c3, c4], 0)
-        pygame.draw.polygon(self.screen, (160, 45, 200), [c1, c2, c3, c4], 1)
-
-        # Prodloužení osy fialovou čarou
-        ep1 = self.to_screen(ax1, ay1, offset_x)
-        ep2 = self.to_screen(ax2, ay2, offset_x)
-        p1 = self.to_screen(x1, y1, offset_x)
-        p2 = self.to_screen(x2, y2, offset_x)
-        pygame.draw.line(self.screen, (200, 60, 240), ep1, p1, 1)
-        pygame.draw.line(self.screen, (200, 60, 240), p2, ep2, 1)
-
-    def draw_aiming_sector(self, offset_x):
-        r_mm = min(self.max_range, self.view_span_mm)
-        p_center = self.to_screen(0, 0, offset_x)
-
-        arc_pts = []
-        for deg in range(-10, 11, 2):
-            rad = math.radians(deg)
-            px, py = self.to_screen(r_mm * math.sin(rad), r_mm * math.cos(rad), offset_x)
-            arc_pts.append((px, py))
-
-        poly_pts = [p_center] + arc_pts + [p_center]
-
-        s = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
-        pygame.draw.polygon(s, (0, 150, 255, 30), [(pt[0] - offset_x, pt[1]) for pt in poly_pts])
-        pygame.draw.lines(s, (0, 210, 255, 150), False, [(pt[0] - offset_x, pt[1]) for pt in poly_pts], 1)
-
-        top_center = self.to_screen(0, r_mm, offset_x)
-        pygame.draw.line(s, (0, 230, 255, 90), (p_center[0] - offset_x, p_center[1]), (top_center[0] - offset_x, top_center[1]), 1)
-        self.screen.blit(s, (offset_x, 0))
-
-        lbl = self.font_main.render("ZÁMĚR ±10° (1. CÍL)", True, (0, 220, 255))
-        lx = top_center[0] - lbl.get_width() // 2
-        ly = max(180, top_center[1] - 18)
-        self.screen.blit(lbl, (lx, ly))
-
+    # ========================================================
+    #  PANEL 1: ŽIVÝ RADAR (LIVE SCAN & BOXY)
+    # ========================================================
     def draw_left_live(self):
-        self.draw_panel_decorations(0, is_right_panel=False)
-        scale = (PANEL_W / 2.0) / self.view_span_mm
+        offset_x = 0
+        self.draw_panel_decorations(offset_x, panel_idx=0)
 
-        # (Záměrný sektor zakomentován - fokus pouze na bounding boxy)
-        # self.draw_aiming_sector(0)
-
-        # Body mračna (čistý živý radar)
+        # Body mračna
         cloud = self.last_frame.get("cloud", [])
         n = len(cloud) // 3
         for i in range(n):
             x = cloud[i * 3]
             y = cloud[i * 3 + 1]
             intensity = cloud[i * 3 + 2]
-            sx, sy = self.to_screen(x, y, 0)
+            sx, sy = self.to_screen(x, y, offset_x)
             if 0 <= sx < PANEL_W and 0 <= sy < PANEL_H:
-                v = min(255, max(40, intensity * 2 + 50))
+                v = min(255, max(30, intensity * 2 + 40))
                 self.screen.set_at((sx, sy), (v, v, v))
 
-        # Bounding Boxy přijaté přímo z ESP32 (výpočet probíhá na mikrokontroléru)
-        raw_boxes = self.last_frame.get("boxes", [])
-        targets = []
-        for b in raw_boxes:
-            if len(b) >= 12:
-                targets.append({
-                    'min_x': b[0], 'max_x': b[1],
-                    'min_y': b[2], 'max_y': b[3],
-                    'cx': b[4], 'cy': b[5],
-                    'width': b[6], 'height': b[7],
-                    'span_mm': b[8],
-                    'dist_mm': b[9],
-                    'pts_count': b[10],
-                    'is_solo': bool(b[11]),
-                    'type': "SVÍČKA" if b[11] else "SVÍČKA+STĚNA"
-                })
+        # Surové Bounding Boxy z ESP32
+        live_boxes = parse_box_list(self.last_frame.get("boxes", []))
+        for idx, cl in enumerate(live_boxes):
+            p_min = self.to_screen(cl['min_x'], cl['max_y'], offset_x)
+            p_max = self.to_screen(cl['max_x'], cl['min_y'], offset_x)
+            rx = min(p_min[0], p_max[0])
+            ry = min(p_min[1], p_max[1])
+            rw = max(8, abs(p_max[0] - p_min[0]))
+            rh = max(8, abs(p_max[1] - p_min[1]))
 
-        if self.show_boxes:
-            for idx, cl in enumerate(targets):
-                p_min = self.to_screen(cl['min_x'], cl['max_y'], 0)
-                p_max = self.to_screen(cl['max_x'], cl['min_y'], 0)
-                rx = min(p_min[0], p_max[0])
-                ry = min(p_min[1], p_max[1])
-                rw = max(8, abs(p_max[0] - p_min[0]))
-                rh = max(8, abs(p_max[1] - p_min[1]))
+            box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
+            pygame.draw.rect(self.screen, box_col, (rx, ry, rw, rh), 2)
 
-                # Rámeček Bounding Boxu
-                box_col = (0, 240, 160) if cl.get('type') == 'SVÍČKA+STĚNA' else (255, 180, 40)
-                pygame.draw.rect(self.screen, box_col, (rx, ry, rw, rh), 2)
+            scx, scy = self.to_screen(cl['cx'], cl['cy'], offset_x)
+            pygame.draw.circle(self.screen, (255, 230, 20), (scx, scy), 5)
+            pygame.draw.circle(self.screen, (20, 20, 20), (scx, scy), 2)
 
-                # STŘEDOVÝ BOD (těžiště)
-                scx, scy = self.to_screen(cl['cx'], cl['cy'], 0)
-                pygame.draw.circle(self.screen, (255, 230, 20), (scx, scy), 5)
-                pygame.draw.circle(self.screen, (20, 20, 20), (scx, scy), 2)
-                pygame.draw.line(self.screen, (255, 255, 255), (scx - 7, scy), (scx + 7, scy), 2)
-                pygame.draw.line(self.screen, (255, 255, 255), (scx, scy - 7), (scx, scy + 7), 2)
+            lbl1 = self.font_bold.render(f"BOX #{idx+1} [{cl['type']}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+            lbl2 = self.font_main.render(f"STŘED: [{int(cl['cx'])}, {int(cl['cy'])}] | R:{int(cl['dist_mm'])}mm ({cl['pts_count']}b)", True, (255, 240, 130))
+            self.screen.blit(lbl1, (rx + 4, max(4, ry - 18)))
+            self.screen.blit(lbl2, (scx + 8, scy - 7))
 
-                # Popisky u boxu
-                target_type = cl.get('type', 'CÍL')
-                lbl1 = self.font_bold.render(f"BOX #{idx+1} [{target_type}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
-                lbl2 = self.font_main.render(f"STŘED: [{int(cl['cx'])}, {int(cl['cy'])}] | R:{int(cl['dist_mm'])}mm ({cl['pts_count']}b)", True, (255, 240, 130))
-                self.screen.blit(lbl1, (rx + 4, max(4, ry - 18)))
-                self.screen.blit(lbl2, (scx + 9, scy - 8))
-
-        # ============================================================
-        # STARÁ DETEKCE STĚN A SVÍČEK KOMPLETNĚ ZAKOMENTOVÁNA:
-        # ============================================================
-        # for w in self.last_frame.get("walls", []):
-        #     self.draw_wall_corridor(w[0], w[1], w[2], w[3], w[4], 0)
-        #     p1 = self.to_screen(w[0], w[1], 0)
-        #     p2 = self.to_screen(w[2], w[3], 0)
-        #     pygame.draw.line(self.screen, (0, 255, 120), p1, p2, 4)
-        #     ...
-        # for c in self.last_frame.get("candles", []):
-        #     ...
-
-        # ============================================================
-        # 1. TELEMETRICKÝ PANEL (V LEVÉM HORNÍM ROHU)
-        # ============================================================
-        panel = pygame.Surface((340, 220))
-        panel.set_alpha(210)
+        # Telemetrický panel vlevo nahoře
+        panel = pygame.Surface((290, 140))
+        panel.set_alpha(220)
         panel.fill((10, 12, 16))
-        self.screen.blit(panel, (15, 15))
+        self.screen.blit(panel, (12, 12))
+        pygame.draw.rect(self.screen, (40, 50, 60), (12, 12, 290, 140), 1)
 
         f = self.last_frame
-        fps      = f.get("fps", 0.0)
-        pts      = f.get("pts", 0)
-        calc_us  = f.get("calc_us", 0)
-        heap     = f.get("heap", 0)
-        crc_err  = f.get("crc_err", 0)
-
-        y = 25
-        title = self.font_big.render("ESP32 D200 RADAR & BOXY", True, ACCENT_COLOR)
-        self.screen.blit(title, (25, y)); y += 26
-
+        y = 18
+        self.screen.blit(self.font_big.render("1. ŽIVÝ RADAR (D200)", True, ACCENT_COLOR), (20, y)); y += 22
         def row(label, val, col=(200, 210, 225)):
             nonlocal y
-            t1 = self.font_main.render(label, True, (130, 140, 155))
-            t2 = self.font_bold.render(str(val), True, col)
-            self.screen.blit(t1, (25, y))
-            self.screen.blit(t2, (180, y))
-            y += 20
+            self.screen.blit(self.font_main.render(label, True, (130, 140, 155)), (20, y))
+            self.screen.blit(self.font_bold.render(str(val), True, col), (150, y))
+            y += 18
 
-        row("Frekvence skenu:", f"{fps:.1f} Hz", (100, 255, 120) if fps > 4.5 else (255, 150, 0))
-        row("Filtrované body:", f"{pts} bodů")
-        row("Výpočet na ESP32:", f"{calc_us} µs ({calc_us/1000.0:.2f} ms)", (0, 220, 255))
-        row("Volná RAM ESP32:", f"{heap // 1024} kB")
-        row("CRC8 Chyby:", f"{crc_err}", (255, 80, 80) if crc_err > 0 else (120, 200, 120))
-        row("Detekované cíle:", f"{len(targets)} / 4 (max 4)", (0, 240, 160) if len(targets) > 0 else (130, 140, 155))
+        row("Frekvence:", f"{f.get('fps', 0.0):.1f} Hz", (100, 255, 120))
+        row("Filtrováno bodů:", f"{f.get('pts', 0)} bodů")
+        row("Výpočet na ESP32:", f"{f.get('calc_us', 0)} µs", (0, 220, 255))
+        row("Volná RAM ESP32:", f"{f.get('heap', 0) // 1024} kB")
+        row("Živé boxy (max 4):", f"{len(live_boxes)} cílů", (0, 240, 160))
 
-        # ============================================================
-        # 2. PANEL OVLÁDÁNÍ (V LEVÉM DOLNÍM ROHU)
-        # ============================================================
-        cmd_panel = pygame.Surface((440, 120))
-        cmd_panel.set_alpha(200)
+        # Ovládací HUD vlevo dole
+        cmd_panel = pygame.Surface((576, 95))
+        cmd_panel.set_alpha(220)
         cmd_panel.fill((10, 12, 16))
-        self.screen.blit(cmd_panel, (15, PANEL_H - 135))
+        self.screen.blit(cmd_panel, (12, PANEL_H - 105))
+        pygame.draw.rect(self.screen, (55, 45, 30), (12, PANEL_H - 105, 576, 95), 1)
 
-        cy = PANEL_H - 128
-        h_title = self.font_bold.render("LADĚNÍ ZA BĚHU (PŘÍKAZY DO ESP32):", True, (240, 200, 80))
-        self.screen.blit(h_title, (25, cy)); cy += 22
-
-        fov_txt = "[F] Režim: 180° Kužel" if self.fov_limited else "[F] Režim: 360° Celé pole"
-        freeze_txt = "[MEZERNÍK] ODMRAZIT" if self.frozen else "[MEZERNÍK] ZMRAZIT SKEN"
-        box_txt = "[B] BOXY: ZAP" if self.show_boxes else "[B] BOXY: VYP"
-        
-        c1 = self.font_main.render(f"{fov_txt} | {freeze_txt} | {box_txt}", True, (220, 220, 220))
+        cy = PANEL_H - 99
+        self.screen.blit(self.font_bold.render("LADĚNÍ ZA BĚHU (PŘÍKAZY DO ESP32):", True, (240, 200, 80)), (22, cy)); cy += 20
+        fov_txt = "[F] FoV: 180° Kužel (Start)" if self.fov_limited else "[F] FoV: 360° Celé pole (V poli)"
+        auto_badge = "[AUTO]" if self.auto_fov_enabled else ""
+        freeze_txt = "[MEZERNÍK] ODMRAZIT" if self.frozen else "[MEZERNÍK] ZMRAZIT"
+        c1 = self.font_main.render(f"{fov_txt} {auto_badge} | {freeze_txt}", True, (220, 220, 220))
         c2 = self.font_main.render(f"Rozsah: [R/E] Min: {self.min_range} mm | [T/G] Max: {self.max_range} mm", True, (170, 180, 195))
-        c3 = self.font_main.render(f"Odrazivost: [I/K] Min Intenzita: {self.min_intensity}", True, (170, 180, 195))
-        self.screen.blit(c1, (25, cy)); cy += 18
-        self.screen.blit(c2, (25, cy)); cy += 18
-        self.screen.blit(c3, (25, cy))
+        c3 = self.font_main.render(f"Odrazivost: [I/K] Min Intenzita: {self.min_intensity} | [C] Resetovat mapy", True, (170, 180, 195))
+        self.screen.blit(c1, (22, cy)); cy += 17
+        self.screen.blit(c2, (22, cy)); cy += 17
+        self.screen.blit(c3, (22, cy))
 
-        # Info o vybraném bodě po kliknutí
         if self.selected_object:
-            sel_panel = pygame.Surface((320, 70))
+            sel_panel = pygame.Surface((250, 60))
             sel_panel.set_alpha(220)
             sel_panel.fill((25, 20, 10))
-            self.screen.blit(sel_panel, (PANEL_W - 335, 15))
-            pygame.draw.rect(self.screen, (255, 180, 0), (PANEL_W - 335, 15, 320, 70), 1)
-
-            st = self.font_bold.render("INSPEKCE VYBRANÉHO BODU:", True, (255, 200, 50))
-            self.screen.blit(st, (PANEL_W - 325, 22))
+            self.screen.blit(sel_panel, (PANEL_W - 262, 12))
+            pygame.draw.rect(self.screen, (255, 180, 0), (PANEL_W - 262, 12, 250, 60), 1)
+            self.screen.blit(self.font_bold.render("INSPEKCE BODU:", True, (255, 200, 50)), (PANEL_W - 254, 18))
             sx_mm, sy_mm, s_dist = self.selected_object
-            s_info = self.font_main.render(f"X: {sx_mm:.0f} mm, Y: {sy_mm:.0f} mm | R: {s_dist:.0f} mm", True, (255, 255, 255))
-            self.screen.blit(s_info, (PANEL_W - 325, 45))
+            self.screen.blit(self.font_main.render(f"X:{sx_mm:.0f} Y:{sy_mm:.0f} | R:{s_dist:.0f}mm", True, (255, 255, 255)), (PANEL_W - 254, 40))
 
-    def draw_right_stable(self):
-        self.draw_panel_decorations(PANEL_W, is_right_panel=True)
-        scale = (PANEL_W / 2.0) / self.view_span_mm
+    # ========================================================
+    #  PANEL 2: REFERENČNÍ ETALON (START & ODSTUPŇOVANÉ KOTVY)
+    # ========================================================
+    def draw_mid_original(self):
+        offset_x = PANEL_W
+        self.draw_panel_decorations(offset_x, panel_idx=1)
+
         loc = self.localizer
+        ref_boxes = loc.ref_boxes if loc.locked else parse_box_list(self.last_frame.get("static_boxes", []))
 
-        # Dlouhodobé statické Bounding Boxy přijaté z ESP32:
-        raw_static = self.last_frame.get("static_boxes", [])
-        static_boxes = []
-        for b in raw_static:
-            if len(b) >= 12:
-                static_boxes.append({
-                    'min_x': b[0], 'max_x': b[1],
-                    'min_y': b[2], 'max_y': b[3],
-                    'cx': b[4], 'cy': b[5],
-                    'width': b[6], 'height': b[7],
-                    'span_mm': b[8],
-                    'dist_mm': b[9],
-                    'pts_count': b[10],
-                    'is_solo': bool(b[11]),
-                    'type': "SVÍČKA" if b[11] else "SVÍČKA+STĚNA"
-                })
+        # Kotvy a trojúhelník
+        if loc.locked and loc.anchors:
+            # KOTVA 1 (Zlatá)
+            if len(loc.anchors) >= 1:
+                a1 = loc.anchors[0]
+                p1 = self.to_screen(a1['p1'][0], a1['p1'][1], offset_x)
+                p2 = self.to_screen(a1['p2'][0], a1['p2'][1], offset_x)
+                pygame.draw.line(self.screen, a1['color'], p1, p2, 4)
+                mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
+                self.screen.blit(self.font_bold.render(f"KOTVA 1: {int(a1['dist'])} mm", True, a1['color']), (mx + 8, my - 8))
 
-        # Vykreslení potvrzených dlouhodobých Bounding Boxů
-        for idx, cl in enumerate(static_boxes):
-            p_min = self.to_screen(cl['min_x'], cl['max_y'], PANEL_W)
-            p_max = self.to_screen(cl['max_x'], cl['min_y'], PANEL_W)
+            # KOTVA 2 (Oranžová)
+            if len(loc.anchors) >= 2:
+                a2 = loc.anchors[1]
+                p1 = self.to_screen(a2['p1'][0], a2['p1'][1], offset_x)
+                p2 = self.to_screen(a2['p2'][0], a2['p2'][1], offset_x)
+                pygame.draw.line(self.screen, a2['color'], p1, p2, 3)
+                mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
+                self.screen.blit(self.font_bold.render(f"KOTVA 2: {int(a2['dist'])} mm", True, a2['color']), (mx + 8, my + 8))
+
+            # Trojúhelníkový vzorec (spojnice)
+            if loc.triangle_pattern:
+                tp = loc.triangle_pattern
+                p1 = self.to_screen(tp['p1_pt'][0], tp['p1_pt'][1], offset_x)
+                p2 = self.to_screen(tp['p2_pt'][0], tp['p2_pt'][1], offset_x)
+                pygame.draw.line(self.screen, (0, 220, 255), p1, p2, 2)
+                mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
+                self.screen.blit(self.font_main.render(f"{int(tp['dist3'])} mm ({tp['angle_deg']:.0f}°)", True, (0, 220, 255)), (mx - 20, my - 16))
+
+        # Vykreslení referenčních Bounding Boxů
+        for idx, cl in enumerate(ref_boxes):
+            p_min = self.to_screen(cl['min_x'], cl['max_y'], offset_x)
+            p_max = self.to_screen(cl['max_x'], cl['min_y'], offset_x)
             rx = min(p_min[0], p_max[0])
             ry = min(p_min[1], p_max[1])
             rw = max(10, abs(p_max[0] - p_min[0]))
             rh = max(10, abs(p_max[1] - p_min[1]))
 
-            # Barva podle typu (oranžová svíčka, tyrkysová svíčka+stěna)
             box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
-            
-            # Poloprůhledná výplň boxu pro lepší viditelnost
             s_fill = pygame.Surface((rw, rh), pygame.SRCALPHA)
-            fill_col = (0, 200, 140, 35) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 160, 30, 35)
+            fill_col = (0, 200, 140, 30) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 160, 30, 30)
             s_fill.fill(fill_col)
             self.screen.blit(s_fill, (rx, ry))
-
-            # Rámeček
             pygame.draw.rect(self.screen, box_col, (rx, ry, rw, rh), 2)
 
-            # Spojnice od výchozího bodu LiDARu (0,0) ke středu boxu
-            scx, scy = self.to_screen(cl['cx'], cl['cy'], PANEL_W)
-            origin_x, origin_y = self.to_screen(0, 0, PANEL_W)
-            pygame.draw.line(self.screen, (70, 90, 115), (origin_x, origin_y), (scx, scy), 1)
-
-            # STŘEDOVÝ BOD [X, Y]
+            scx, scy = self.to_screen(cl['cx'], cl['cy'], offset_x)
             pygame.draw.circle(self.screen, (255, 230, 20), (scx, scy), 6)
             pygame.draw.circle(self.screen, (20, 20, 20), (scx, scy), 2)
-            pygame.draw.line(self.screen, (255, 255, 255), (scx - 8, scy), (scx + 8, scy), 2)
-            pygame.draw.line(self.screen, (255, 255, 255), (scx, scy - 8), (scx, scy + 8), 2)
 
-            # Zvýrazněné popisy s přesnými souřadnicemi [X, Y] a vzdáleností od startu
-            lbl_type = self.font_bold.render(f"BOX #{idx+1} [{cl['type']}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
-            lbl_pos = self.font_bold.render(f"POZICE: X={int(cl['cx']):+d} mm, Y={int(cl['cy']):+d} mm | R={int(cl['dist_mm'])} mm", True, (255, 245, 140))
-            self.screen.blit(lbl_type, (rx + 4, max(4, ry - 20)))
-            self.screen.blit(lbl_pos, (scx + 10, scy - 8))
+            lbl_t = self.font_bold.render(f"ETALON #{idx+1} [{cl['type']}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+            lbl_c = self.font_main.render(f"X:{int(cl['cx']):+d} Y:{int(cl['cy']):+d} | R:{int(cl['dist_mm'])} mm", True, (255, 245, 140))
+            self.screen.blit(lbl_t, (rx + 4, max(4, ry - 18)))
+            self.screen.blit(lbl_c, (scx + 8, scy - 7))
 
-        # Živé detekce přetransformované do souřadnic hřiště (fialovo-růžové body potvrzující shodu)
-        if loc.locked and self.last_frame:
-            h_rad = math.radians(loc.robot_deg)
-            c_h = math.cos(h_rad)
-            s_h = math.sin(h_rad)
-            for lc in self.last_frame.get("candles", []):
-                cx, cy = float(lc[0]), float(lc[1])
-                wx = loc.robot_x + cx * c_h - cy * s_h
-                wy = loc.robot_y + cx * s_h + cy * c_h
-                lsx, lsy = self.to_screen(wx, wy, PANEL_W)
-                pygame.draw.circle(self.screen, (255, 120, 220), (lsx, lsy), 6, 1)
-                pygame.draw.circle(self.screen, (255, 240, 255), (lsx, lsy), 2)
+        # Horní status panel
+        stat_box = pygame.Surface((570, 56))
+        stat_box.set_alpha(220)
+        stat_box.fill((10, 12, 16))
+        self.screen.blit(stat_box, (offset_x + 15, 12))
+        border_col = (80, 255, 160) if loc.locked else (70, 60, 40)
+        pygame.draw.rect(self.screen, border_col, (offset_x + 15, 12, 570, 56), 1)
 
-        # ============================================================
-        # POHYBLIVÝ RŮŽOVÝ ROBOT (ZOBRAZEN HNED OD ZAČÁTKU)
-        # ============================================================
-        PINK_MAIN = (255, 70, 180)
-        PINK_BG   = (65, 15, 45)
-        PINK_LITE = (255, 150, 215)
+        lock_badge = " 🔒 ZAMČENO" if loc.locked else " [L] ZAMKNOUT MAPU"
+        self.screen.blit(self.font_big.render(f"2. REFERENČNÍ ETALON (START){lock_badge}", True, (80, 255, 160) if loc.locked else ACCENT_MAP), (offset_x + 25, 17))
+        tri_txt = " | Trojúhelník: AKTIVNÍ" if (loc.locked and loc.triangle_pattern) else ""
+        sub_str = f"Kotvy: {len(loc.anchors)} | Referenční boxy: {len(ref_boxes)}/4{tri_txt}" if loc.locked else f"Sběr etalonu na startu... Boxů: {len(ref_boxes)}/4 (stiskněte [L])"
+        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 39))
 
-        # 1. Trajektorie pohybu (projetá trasa od startu)
+        # Spodní tip panel
+        tip_box = pygame.Surface((570, 75))
+        tip_box.set_alpha(210)
+        tip_box.fill((10, 12, 16))
+        self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
+        pygame.draw.rect(self.screen, (50, 45, 30), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
+        self.screen.blit(self.font_bold.render("REFERENČNÍ ETALON (START 180°):", True, (240, 200, 80)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Čistý sken 180° dopředu ze startovní zdi eliminuje falešné odrazy za mantinelem.", True, (200, 210, 225)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• [L] Zamknout etalon -> automaticky aktivuje 360° plný rozhled v poli!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
+
+    # ========================================================
+    #  PANEL 3: POROVNÁNÍ & LOKALIZACE ROBOTA (VÝPOČET POLOHY)
+    # ========================================================
+    def draw_right_comparison(self):
+        offset_x = PANEL_W * 2
+        self.draw_panel_decorations(offset_x, panel_idx=2)
+        loc = self.localizer
+
+        if not loc.locked:
+            msg_box = pygame.Surface((540, 130))
+            msg_box.set_alpha(220)
+            msg_box.fill((12, 14, 18))
+            bx = offset_x + 30; by = PANEL_H // 2 - 65
+            self.screen.blit(msg_box, (bx, by))
+            pygame.draw.rect(self.screen, (70, 60, 40), (bx, by, 540, 130), 1)
+            self.screen.blit(self.font_big.render("3. LOKALIZACE ROBOTA", True, (200, 200, 200)), (bx + 20, by + 12))
+            self.screen.blit(self.font_bold.render("Čekám na zamknutí etalonu na startu...", True, (240, 180, 50)), (bx + 20, by + 36))
+            self.screen.blit(self.font_main.render("1. Nechte na startu ustálit boxy v panelu 2.", True, (160, 170, 185)), (bx + 20, by + 60))
+            self.screen.blit(self.font_main.render("2. Stiskněte [L] pro zamknutí etalonu a aktivaci lokalizace.", True, (80, 255, 160)), (bx + 20, by + 80))
+            self.screen.blit(self.font_main.render("3. Při posunu robota se zde zobrazí poloha a paprsky shod.", True, (255, 120, 220)), (bx + 20, by + 100))
+            return
+
+        # Rozhodovací paprsky shod mezi aktuálními inliery a referenčními body
+        match = loc.last_match_info
+        if match and match.get('inlier_pairs'):
+            for ref_pt, cur_trans_pt, err in match['inlier_pairs']:
+                rp = self.to_screen(ref_pt[0], ref_pt[1], offset_x)
+                cp = self.to_screen(cur_trans_pt[0], cur_trans_pt[1], offset_x)
+                pygame.draw.line(self.screen, (255, 60, 200), rp, cp, 2)
+                pygame.draw.circle(self.screen, (255, 200, 240), cp, 4)
+
+        # Aktuální Bounding Boxy přetransformované do souřadnic hřiště
+        curr_boxes = parse_box_list(self.last_frame.get("static_boxes", []))
+        if not curr_boxes:
+            curr_boxes = parse_box_list(self.last_frame.get("boxes", []))
+
+        cos_t = math.cos(math.radians(loc.robot_deg))
+        sin_t = math.sin(math.radians(loc.robot_deg))
+        for cl in curr_boxes:
+            wx = loc.robot_x + cl['cx'] * cos_t + cl['cy'] * sin_t
+            wy = loc.robot_y - cl['cx'] * sin_t + cl['cy'] * cos_t
+            scx, scy = self.to_screen(wx, wy, offset_x)
+            pygame.draw.circle(self.screen, (0, 240, 160), (scx, scy), 6)
+            pygame.draw.circle(self.screen, (255, 255, 255), (scx, scy), 2)
+
+        # Trajektorie robota
         if len(loc.trajectory) >= 2:
-            traj_px = [self.to_screen(tp[0], tp[1], PANEL_W) for tp in loc.trajectory]
+            traj_px = [self.to_screen(tp[0], tp[1], offset_x) for tp in loc.trajectory]
             pygame.draw.lines(self.screen, (220, 50, 140), False, traj_px, 2)
             for tpt in traj_px[::4]:
                 pygame.draw.circle(self.screen, (255, 100, 180), tpt, 2)
 
-        # 2. Souřadnice a rotace robota
-        rx, ry = self.to_screen(loc.robot_x, loc.robot_y, PANEL_W)
-        heading_rad = math.radians(loc.robot_deg)
-        cos_h = math.cos(heading_rad)
-        sin_h = math.sin(heading_rad)
+        # Růžový robot s natočením
+        rx, ry = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
+        h_rad = math.radians(loc.robot_deg)
+        cos_h = math.cos(h_rad); sin_h = math.sin(h_rad)
 
-        # 3. Zorný vějíř LiDARu dopředu (průhledný kužel ukazující kam se dívá senzor)
+        # Zorný kužel dopředu
         cone_r_mm = 650.0
         cone_pts = [(rx, ry)]
         for deg_off in range(-20, 21, 5):
-            a_rad = heading_rad + math.radians(deg_off)
+            a_rad = h_rad + math.radians(deg_off)
             kx = loc.robot_x + cone_r_mm * math.sin(a_rad)
             ky = loc.robot_y + cone_r_mm * math.cos(a_rad)
-            cone_pts.append(self.to_screen(kx, ky, PANEL_W))
+            cone_pts.append(self.to_screen(kx, ky, offset_x))
         if len(cone_pts) > 2:
             s_cone = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
-            cone_local = [(pt[0] - PANEL_W, pt[1]) for pt in cone_pts]
+            cone_local = [(pt[0] - offset_x, pt[1]) for pt in cone_pts]
             pygame.draw.polygon(s_cone, (255, 60, 170, 25), cone_local)
             pygame.draw.lines(s_cone, (255, 80, 190, 80), False, cone_local, 1)
-            self.screen.blit(s_cone, (PANEL_W, 0))
+            self.screen.blit(s_cone, (offset_x, 0))
 
-        # 4. Tělo robota: Růžový čtverec / šasi (240 x 240 mm v reálném měřítku hřiště)
+        # Šasi robota (čtverec 240 x 240 mm)
         hw_mm = 120.0
         local_box = [(-hw_mm, -hw_mm), (hw_mm, -hw_mm), (hw_mm, hw_mm), (-hw_mm, hw_mm)]
         box_px = []
         for (bx, by) in local_box:
-            # Otočení v rovině
             gx = loc.robot_x + bx * cos_h + by * sin_h
             gy = loc.robot_y - bx * sin_h + by * cos_h
-            box_px.append(self.to_screen(gx, gy, PANEL_W))
-
+            box_px.append(self.to_screen(gx, gy, offset_x))
         pygame.draw.polygon(self.screen, PINK_BG, box_px, 0)
         pygame.draw.polygon(self.screen, PINK_MAIN, box_px, 2)
 
-        # 5. Výrazná růžová šipka pohledu dopředu
-        arrow_len = 26
-        tip_x = int(rx + arrow_len * sin_h)
-        tip_y = int(ry - arrow_len * cos_h)
+        # Šipka pohledu dopředu
+        tip_x = int(rx + 26 * sin_h)
+        tip_y = int(ry - 26 * cos_h)
         pygame.draw.line(self.screen, PINK_MAIN, (rx, ry), (tip_x, tip_y), 3)
 
-        # Křídla šipky
-        wing_len = 8
-        wing_rad = math.radians(145)
-        for sgn in [-1, 1]:
-            w_ang = heading_rad + sgn * wing_rad
-            wx2 = int(tip_x + wing_len * math.sin(w_ang))
-            wy2 = int(tip_y - wing_len * math.cos(w_ang))
-            pygame.draw.line(self.screen, PINK_MAIN, (tip_x, tip_y), (wx2, wy2), 2)
-
-        # 6. Malý LiDAR senzor uprostřed těla
-        pygame.draw.circle(self.screen, PINK_LITE, (rx, ry), 5)
-        pygame.draw.circle(self.screen, (255, 255, 255), (rx, ry), 2)
-
-        # 7. Textový popisek u robota
+        # Popisek robota
         conf_pct = int(loc.pose_confidence * 100)
-        d_from_start = math.hypot(loc.robot_x, loc.robot_y)
-        stat_tag = " [KLID]" if loc.is_stationary else " [POHYB]"
-        lbl_rob = self.font_bold.render(
-            f"ROBOT ({loc.robot_x:+.0f}, {loc.robot_y:+.0f}mm) {loc.robot_deg:+.0f}°{stat_tag} [{conf_pct}%]",
-            True, PINK_LITE if loc.locked else (190, 150, 180))
-        lbl_x = min(rx + 18, PANEL_W * 2 - lbl_rob.get_width() - 8)
-        self.screen.blit(lbl_rob, (lbl_x, ry - 10))
+        lbl_rob = self.font_bold.render(f"ROBOT [{loc.robot_x:+.0f}, {loc.robot_y:+.0f}] {loc.robot_deg:+.0f}° ({conf_pct}%)", True, PINK_LITE)
+        self.screen.blit(lbl_rob, (rx + 16, ry - 10))
 
-        # ============================================================
-        # HORNÍ STAVOVÝ PANEL
-        # ============================================================
-        stat_box = pygame.Surface((490, 56))
+        # Horní status panel
+        stat_box = pygame.Surface((570, 56))
         stat_box.set_alpha(220)
         stat_box.fill((10, 12, 16))
-        self.screen.blit(stat_box, (PANEL_W + 15, 15))
-        pygame.draw.rect(self.screen, (80, 255, 160), (PANEL_W + 15, 15, 490, 56), 1)
+        self.screen.blit(stat_box, (offset_x + 15, 12))
+        pygame.draw.rect(self.screen, (80, 255, 160), (offset_x + 15, 12, 570, 56), 1)
 
-        t_stat = self.font_big.render("DLOUHODOBÁ STATICKÁ MAPA (ESP32)", True, (80, 255, 160))
-        self.screen.blit(t_stat, (PANEL_W + 25, 20))
-        sub_str = f"Potvrzené cíle: {len(static_boxes)} / 4 | Výpočet: ESP32 EMA akumulace"
-        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (PANEL_W + 25, 38))
+        pat_name = match.get('pattern_name', 'HLEDÁM SHODU...') if match else 'HLEDÁM SHODU...'
+        inliers = match.get('inliers', 0) if match else 0
+        err = match.get('avg_error', 0.0) if match else 0.0
+        dist_from_start = math.hypot(loc.robot_x, loc.robot_y)
+        fov_tag = "360° V POLI" if not self.fov_limited else "180° START"
 
-        # ============================================================
-        # SPODNÍ NÁPOVĚDA
-        # ============================================================
-        tip_box = pygame.Surface((440, 95))
+        self.screen.blit(self.font_big.render(f"3. SHODA [{fov_tag}]: {pat_name}", True, (80, 255, 160)), (offset_x + 25, 17))
+        sub_str = f"Inliery: {inliers} | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
+        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 38))
+
+        # Spodní tip panel
+        tip_box = pygame.Surface((570, 75))
         tip_box.set_alpha(210)
         tip_box.fill((10, 12, 16))
-        self.screen.blit(tip_box, (PANEL_W + 15, PANEL_H - 110))
-        pygame.draw.rect(self.screen, (60, 50, 30), (PANEL_W + 15, PANEL_H - 110, 440, 95), 1)
-        self.screen.blit(self.font_bold.render("STATICKÁ MAPA & SOUŘADNÝ SYSTÉM:", True, ACCENT_MAP), (PANEL_W + 25, PANEL_H - 102))
-        self.screen.blit(self.font_main.render("• Výchozí bod START (0,0) = pozice robota a senzoru", True, (0, 220, 255)), (PANEL_W + 25, PANEL_H - 82))
-        self.screen.blit(self.font_main.render("• Osy X (vpravo/vlevo) a Y (dopředu) v reálných mm", True, (240, 230, 130)), (PANEL_W + 25, PANEL_H - 64))
-        self.screen.blit(self.font_main.render("• [C] / [M] Vymazat a znovu akumulovat mapu na ESP32", True, (160, 170, 185)), (PANEL_W + 25, PANEL_H - 46))
+        self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
+        pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
+        self.screen.blit(self.font_bold.render("HIERARCHICKÉ KOTVY A 360° ROZHLED V POLI:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Zlatá: KOTVA 1 (nejdelší rozvor) | Oranžová: KOTVA 2 | Tyrkys: Trojúhelník", True, (240, 220, 80)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Zastíněná svíčka nevadí: lokalizace běží dál i při zakrytí jedné z kotev!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
 
+    # ========================================================
+    #  PANEL 4: OBDÉLNÍKOVÁ MAPA CELÉHO HŘIŠTĚ (KUMULATIVNÍ CÍLE)
+    # ========================================================
+    def draw_field_map(self):
+        fm = self.field_map
+        y_offset = PANEL_H
+        xmin, xmax, ymin, ymax = fm.get_auto_field_bounds()
 
+        # Pozadí
+        pygame.draw.rect(self.screen, (12, 14, 18), pygame.Rect(0, y_offset, WIN_W, FIELD_H))
 
+        # ========================================================
+        # 1. LEVÝ ODDÍL: GRAFICKÝ OBDÉLNÍK HŘIŠTĚ
+        # ========================================================
+        avail_w = 510.0
+        avail_h = float(FIELD_H - 58)
+
+        field_w_mm = xmax - xmin
+        field_h_mm = ymax - ymin
+        scale_x = avail_w / max(100.0, field_w_mm)
+        scale_y = avail_h / max(100.0, field_h_mm)
+        draw_scale = min(scale_x, scale_y)
+
+        draw_w = field_w_mm * draw_scale
+        draw_h = field_h_mm * draw_scale
+        field_x0 = 20 + int((avail_w - draw_w) * 0.5)
+        field_y0 = y_offset + 10 + int((avail_h - draw_h) * 0.5)
+
+        def f_to_screen(gx, gy):
+            sx = int(field_x0 + (gx - xmin) * draw_scale)
+            sy = int(field_y0 + draw_h - (gy - ymin) * draw_scale)
+            return sx, sy
+
+        # Rám hřiště
+        f_rect_pts = [
+            f_to_screen(xmin, ymin),
+            f_to_screen(xmax, ymin),
+            f_to_screen(xmax, ymax),
+            f_to_screen(xmin, ymax)
+        ]
+        pygame.draw.polygon(self.screen, (16, 32, 22), f_rect_pts, 0)
+        pygame.draw.polygon(self.screen, (60, 180, 100), f_rect_pts, 2)
+
+        # Síť po 500 mm
+        gx = math.ceil(xmin / 500.0) * 500.0
+        while gx < xmax:
+            p1 = f_to_screen(gx, ymin); p2 = f_to_screen(gx, ymax)
+            pygame.draw.line(self.screen, (28, 62, 40), p1, p2, 1)
+            gx += 500.0
+        gy = math.ceil(ymin / 500.0) * 500.0
+        while gy < ymax:
+            p1 = f_to_screen(xmin, gy); p2 = f_to_screen(xmax, gy)
+            pygame.draw.line(self.screen, (28, 62, 40), p1, p2, 1)
+            gy += 500.0
+
+        # Kóty hřiště
+        lbl_w = self.font_main.render(f"{field_w_mm:.0f} mm", True, (80, 160, 110))
+        self.screen.blit(lbl_w, ((f_rect_pts[0][0] + f_rect_pts[1][0]) // 2 - lbl_w.get_width() // 2, f_rect_pts[0][1] + 2))
+        lbl_h = self.font_main.render(f"{field_h_mm:.0f} mm", True, (80, 160, 110))
+        self.screen.blit(lbl_h, (f_rect_pts[0][0] - lbl_h.get_width() - 4, (f_rect_pts[0][1] + f_rect_pts[3][1]) // 2 - 6))
+
+        # START pozice [0, 0]
+        start_sx, start_sy = f_to_screen(0.0, 0.0)
+        pygame.draw.circle(self.screen, (0, 180, 255), (start_sx, start_sy), 6, 1)
+        pygame.draw.line(self.screen, (0, 220, 255), (start_sx - 6, start_sy), (start_sx + 6, start_sy), 1)
+        pygame.draw.line(self.screen, (0, 220, 255), (start_sx, start_sy - 6), (start_sx, start_sy + 6), 1)
+        self.screen.blit(self.font_main.render("START (0,0)", True, (0, 200, 255)), (start_sx + 8, start_sy - 6))
+
+        # Trajektorie robota na mapě hřiště
+        if len(fm.trajectory) >= 2:
+            traj_px = [f_to_screen(tp[0], tp[1]) for tp in fm.trajectory]
+            pygame.draw.lines(self.screen, (230, 60, 150), False, traj_px, 2)
+
+        # Aktuální pozice robota v poli
+        rx, ry = fm.robot_pos
+        if math.hypot(rx, ry) > 15.0 or abs(fm.robot_deg) > 2.0:
+            rob_sx, rob_sy = f_to_screen(rx, ry)
+            h_rad = math.radians(fm.robot_deg)
+            pygame.draw.circle(self.screen, (255, 80, 180), (rob_sx, rob_sy), 5)
+            tip_x = int(rob_sx + 14 * math.sin(h_rad))
+            tip_y = int(rob_sy - 14 * math.cos(h_rad))
+            pygame.draw.line(self.screen, (255, 120, 220), (rob_sx, rob_sy), (tip_x, tip_y), 2)
+
+        # Trasa hašení svíček (optimalizované pořadí)
+        route = fm.compute_extinguish_route()
+        if len(route) >= 2:
+            r_pts = [f_to_screen(rx, ry)] + [f_to_screen(t['x'], t['y']) for t in route]
+            pygame.draw.lines(self.screen, (255, 215, 0), False, r_pts, 2)
+
+        # Bounding Boxy uvnitř pole (kumulativní cíle)
+        field_targets = fm.get_field_targets()
+        for idx, t in enumerate(field_targets):
+            csx, csy = f_to_screen(t['x'], t['y'])
+            is_vis = t.get('is_visible', True)
+
+            # Rámeček boxu v měřítku hřiště
+            bw = max(8, int(t.get('width', 300) * draw_scale))
+            bh = max(8, int(t.get('height', 300) * draw_scale))
+            box_rect = pygame.Rect(csx - bw // 2, csy - bh // 2, bw, bh)
+
+            if is_vis:
+                box_color = (0, 240, 160) if not t['is_solo'] else (255, 180, 40)
+                pygame.draw.rect(self.screen, box_color, box_rect, 2)
+                pygame.draw.circle(self.screen, (255, 230, 20), (csx, csy), 5)
+            else:
+                # ZASTÍNĚNÝ CÍL (doplněný z paměti, aktuálně skrytý)
+                pygame.draw.rect(self.screen, (160, 140, 60), box_rect, 1)
+                pygame.draw.circle(self.screen, (180, 120, 40), (csx, csy), 4)
+
+            lbl_tag = f"C{idx+1}" if is_vis else f"C{idx+1} [Z]"
+            lbl_col = (255, 230, 180) if is_vis else (180, 170, 120)
+            self.screen.blit(self.font_bold.render(lbl_tag, True, lbl_col), (csx + bw // 2 + 3, csy - 7))
+
+        # Tlačítka startovní stěny pod grafickým obdélníkem
+        w_active = fm.start_wall_mode
+        info_y = field_y0 + draw_h + 8
+        self.screen.blit(self.font_bold.render("START. STĚNA:", True, (200, 210, 225)), (field_x0, info_y))
+        tx = field_x0 + 105
+
+        is_2 = (w_active == 2)
+        r2 = pygame.Rect(tx, info_y - 2, 140, 18)
+        pygame.draw.rect(self.screen, (30, 75, 45) if is_2 else (22, 26, 32), r2, 0, 3)
+        pygame.draw.rect(self.screen, (100, 255, 140) if is_2 else (45, 52, 65), r2, 1, 3)
+        self.screen.blit(self.font_bold.render("[2/ě] 2.4 m KRATŠÍ" + (" ✓" if is_2 else ""), True, (100, 255, 140) if is_2 else (130, 140, 155)), (tx + 4, info_y))
+        tx += 148
+
+        is_3 = (w_active == 3)
+        r3 = pygame.Rect(tx, info_y - 2, 130, 18)
+        pygame.draw.rect(self.screen, (30, 75, 45) if is_3 else (22, 26, 32), r3, 0, 3)
+        pygame.draw.rect(self.screen, (100, 255, 140) if is_3 else (45, 52, 65), r3, 1, 3)
+        self.screen.blit(self.font_bold.render("[3/š] 3.5 m DELŠÍ" + (" ✓" if is_3 else ""), True, (100, 255, 140) if is_3 else (130, 140, 155)), (tx + 4, info_y))
+
+        # ========================================================
+        # 2. STŘEDNÍ ODDÍL: KONTROLA PRAVIDEL SOUTĚŽE
+        # ========================================================
+        mid_x = 550
+        pygame.draw.line(self.screen, (40, 48, 60), (mid_x - 12, y_offset), (mid_x - 12, y_offset + FIELD_H), 1)
+
+        t_y = y_offset + 10
+        self.screen.blit(self.font_big.render("GEOMETRICKÁ PRAVIDLA SOUTĚŽE", True, (255, 215, 80)), (mid_x, t_y))
+        t_y += 24
+
+        n_t = len(field_targets)
+
+        # 1. Počet cílů (max 4)
+        c_ok = (n_t == 4)
+        sym1 = "✓" if c_ok else ("..." if n_t < 4 else "✗")
+        col1 = (100, 255, 120) if c_ok else ((240, 180, 50) if n_t < 4 else (255, 70, 70))
+        self.screen.blit(self.font_bold.render(f"{sym1} POČET CÍLŮ: {n_t}/4 ({'SPLNĚNO' if c_ok else f'nalezeno {n_t}'})", True, col1), (mid_x, t_y)); t_y += 18
+
+        # 2. Hranice hřiště (100% uvnitř pole)
+        rej_cnt = fm.rejected_outside_count
+        sym_in = "✓" if (rej_cnt == 0) else "✗"
+        col_in = (100, 255, 120) if (rej_cnt == 0) else (255, 70, 70)
+        msg_in = "vše uvnitř pole" if rej_cnt == 0 else f"{rej_cnt} bodů vně mantinelu odfiltrováno"
+        self.screen.blit(self.font_bold.render(f"{sym_in} HRANICE HŘIŠTĚ: 100% UVNITŘ ({msg_in})", True, col_in), (mid_x, t_y)); t_y += 18
+
+        # 3. Minimální rozestup 600-800 mm
+        dist_ok = True
+        min_pair_d = 9999.0
+        if n_t >= 2:
+            for i in range(n_t):
+                for j in range(i + 1, n_t):
+                    d = math.hypot(field_targets[i]['x'] - field_targets[j]['x'],
+                                   field_targets[i]['y'] - field_targets[j]['y'])
+                    if d < min_pair_d: min_pair_d = d
+                    if d < 600.0: dist_ok = False
+        sym2 = "✓" if dist_ok else "✗"
+        col2 = (100, 255, 120) if dist_ok else (255, 70, 70)
+        d_str = f"(min {min_pair_d:.0f} mm)" if n_t >= 2 else "(čekám na další cíle)"
+        self.screen.blit(self.font_bold.render(f"{sym2} MIN. ROZESTUP 600 mm: {'SPLNĚNO' if dist_ok else 'PORUŠENO'} {d_str}", True, col2), (mid_x, t_y)); t_y += 18
+
+        # 4. Stav doplňování cílů a zastínění
+        n_vis = sum(1 for t in field_targets if t.get('is_visible', True))
+        n_occ = n_t - n_vis
+        sym4 = "✓" if n_occ == 0 else "ℹ"
+        col4 = (100, 255, 120) if n_occ == 0 else (240, 200, 80)
+        occ_txt = f"{n_vis} viditelných, {n_occ} zastíněných (uchováno v paměti)" if n_occ > 0 else f"všech {n_t} cílů přímo viditelných"
+        self.screen.blit(self.font_bold.render(f"{sym4} STAV ZASTÍNĚNÍ: {occ_txt}", True, col4), (mid_x, t_y)); t_y += 24
+
+        # Tipy pod pravidly
+        self.screen.blit(self.font_bold.render("NÁPOVĚDA K SOUTĚŽI:", True, (200, 210, 225)), (mid_x, t_y)); t_y += 18
+        self.screen.blit(self.font_main.render("• [2] Kratší stěna 2.4 m | [3] Delší stěna 3.5 m | [P] Přepnout", True, (160, 175, 195)), (mid_x, t_y)); t_y += 16
+        self.screen.blit(self.font_main.render("• Zastíněný cíl zůstává v mapě: robot o něm ví a neztratí ho!", True, (100, 255, 140)), (mid_x, t_y)); t_y += 16
+        self.screen.blit(self.font_main.render("• Žlutá lomená čára ukazuje optimální trasu hašení svíček.", True, (255, 215, 80)), (mid_x, t_y))
+
+        # ========================================================
+        # 3. PRAVÝ ODDÍL: SEZNAM CÍLŮ V POLI & TRASA HAŠENÍ
+        # ========================================================
+        right_x = 1180
+        pygame.draw.line(self.screen, (40, 48, 60), (right_x - 12, y_offset), (right_x - 12, y_offset + FIELD_H), 1)
+
+        r_y = y_offset + 10
+        self.screen.blit(self.font_big.render("SEZNAM CÍLŮ V POLI & OPTIMÁLNÍ TRASA", True, (0, 220, 255)), (right_x, r_y))
+        r_y += 24
+
+        if not field_targets:
+            self.screen.blit(self.font_main.render("Zatím nebyly detekovány žádné cíle uvnitř hřiště.", True, (150, 160, 175)), (right_x, r_y))
+        else:
+            for idx, t in enumerate(route):
+                is_vis = t.get('is_visible', True)
+                status_txt = "VIDITELNÝ" if is_vis else "ZASTÍNĚNÝ (ZNÁMÝ)"
+                col_st = (100, 255, 120) if is_vis else (240, 180, 50)
+
+                t_name = f"CÍL #{idx+1} [POŘADÍ {idx+1}]"
+                self.screen.blit(self.font_bold.render(t_name, True, (255, 215, 0)), (right_x, r_y))
+                self.screen.blit(self.font_bold.render(f"[{status_txt}]", True, col_st), (right_x + 160, r_y))
+                r_y += 17
+
+                pos_str = f"Pozice: X={t['x']:+.0f} mm, Y={t['y']:+.0f} mm | R od robota: {t.get('dist_from_robot', 0):.0f} mm"
+                self.screen.blit(self.font_main.render(pos_str, True, (210, 215, 225)), (right_x + 10, r_y))
+                r_y += 18
+
+    # ========================================================
+    #  Hlavní smyčka
+    # ========================================================
     def run(self):
         while self.running:
             for event in pygame.event.get():
@@ -1363,9 +1363,9 @@ class DualLidarVisualizer:
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
                         self.handle_click(event.pos)
-                    elif event.button == 4: # Kolečko myši nahoru (zoom in)
+                    elif event.button == 4:
                         self.view_span_mm = max(1200.0, self.view_span_mm - 300.0)
-                    elif event.button == 5: # Kolečko myši dolů (zoom out)
+                    elif event.button == 5:
                         self.view_span_mm = min(6000.0, self.view_span_mm + 300.0)
 
                 elif event.type == pygame.KEYDOWN:
@@ -1376,9 +1376,52 @@ class DualLidarVisualizer:
                     elif event.key in [pygame.K_c, pygame.K_m]:
                         self.on_parameter_changed()
                     elif event.key == pygame.K_f:
+                        # Ruční přepnutí FoV 180° <-> 360°
                         self.fov_limited = not self.fov_limited
                         self.send_cmd(f"FOV {1 if self.fov_limited else 0}")
-                        self.on_parameter_changed()
+                        print(f"[FoV] Přepnuto na: {'180° Kužel (Start)' if self.fov_limited else '360° Celé pole'}")
+                    elif event.key == pygame.K_l:
+                        # ZAMKNUTÍ / ODEMKNUTÍ ETALONU
+                        if not self.localizer.locked:
+                            boxes = parse_box_list(self.last_frame.get("static_boxes", []))
+                            if not boxes:
+                                boxes = parse_box_list(self.last_frame.get("boxes", []))
+
+                            ok = self.localizer.lock_map(boxes)
+                            if ok:
+                                self.field_map.reset()
+                                self.field_map.ingest_boxes(boxes, 0.0, 0.0, 0.0)
+                                print(f"[LOC] Etalon uzamčen ({len(boxes)} cílů ze startu).")
+
+                                # Automatické přepnutí na 360° rozhled v poli
+                                if self.auto_fov_enabled and self.fov_limited:
+                                    self.fov_limited = False
+                                    self.send_cmd("FOV 0")
+                                    print("[FoV AUTO] Vyjíždíme do pole -> Automaticky aktivuji 360° PLNÝ ROZHLED!")
+                            else:
+                                print(f"[LOC] Nedostatek cílů ({len(boxes)}) – nechte stabilizovat boxy na startu.")
+                        else:
+                            self.localizer.unlock_map()
+                            self.field_map.reset()
+                            if self.auto_fov_enabled and not self.fov_limited:
+                                self.fov_limited = True
+                                self.send_cmd("FOV 1")
+                                print("[FoV AUTO] Návrat na start -> Automaticky aktivuji 180° DOPŘEDNÝ KUŽEL!")
+                            print("[LOC] Etalon odemčen. Můžete znovu nasbírat výchozí mapu.")
+
+                    elif event.key == pygame.K_n:
+                        self.field_map.reset()
+                        print("[MAPA] Nová mapa na aktuální pozici robota resetována.")
+                    elif event.key in [pygame.K_2, pygame.K_AT]:
+                        self.field_map.set_start_wall(2)
+                        print("[HŘIŠTĚ] Nastavena startovní stěna 2.4 m (Kratší)")
+                    elif event.key in [pygame.K_3, pygame.K_HASH]:
+                        self.field_map.set_start_wall(3)
+                        print("[HŘIŠTĚ] Nastavena startovní stěna 3.5 m (Delší)")
+                    elif event.key == pygame.K_p:
+                        m = self.field_map.toggle_start_wall()
+                        print(f"[HŘIŠTĚ] Startovní stěna přepnuta na: {m}.{4 if m==2 else 5} m")
+
                     elif event.key == pygame.K_r:
                         self.min_range = min(1000, self.min_range + 50)
                         self.send_cmd(f"RANGE {self.min_range} {self.max_range}")
@@ -1407,37 +1450,30 @@ class DualLidarVisualizer:
                         self.view_span_mm = max(1200.0, self.view_span_mm - 300.0)
                     elif event.key in [pygame.K_MINUS]:
                         self.view_span_mm = min(6000.0, self.view_span_mm + 300.0)
-                    elif event.key == pygame.K_b:
-                        self.show_boxes = not self.show_boxes
-                        print(f"[BOX] Zobrazení Bounding Boxů: {'ZAPNUTO' if self.show_boxes else 'VYPNUTO'}")
-                    elif event.key == pygame.K_v:
-                        self.show_legacy_detection = not self.show_legacy_detection
-                        print(f"[DET] Stará detekce stěn a svíček: {'ZAPNUTA' if self.show_legacy_detection else 'VYPNUTA'}")
-                    elif event.key == pygame.K_l:
-                        # ZAMKNUTÍ MAPY → spuštění lokalizace
-                        cc = self.model.get_confirmed_candles()
-                        cw = self.model.get_confirmed_walls()
-                        ok = self.localizer.lock_map(cc, cw)
-                        n_lm = len(cc) + len(cw)
-                        if ok:
-                            print(f"[LOC] Mapa zamčena! {n_lm} landmarků uloženo jako reference.")
-                        else:
-                            print(f"[LOC] Nedostatek landmarků ({n_lm}) – nejdřív nechte stabilizovat mapu.")
 
             self.read_serial()
 
             self.screen.fill(BG_COLOR)
             self.draw_left_live()
-            self.draw_right_stable()
+            self.draw_mid_original()
+            self.draw_right_comparison()
 
-            # Vertikální předěl mezi panely
-            pygame.draw.line(self.screen, (40, 48, 60), (PANEL_W, 0), (PANEL_W, WIN_H), 2)
+            # Vertikální předěly mezi horními panely
+            pygame.draw.line(self.screen, (40, 48, 60), (PANEL_W, 0), (PANEL_W, PANEL_H), 2)
+            pygame.draw.line(self.screen, (40, 48, 60), (PANEL_W * 2, 0), (PANEL_W * 2, PANEL_H), 2)
+
+            # Horizontální předěl nad spodní mapou hřiště
+            pygame.draw.line(self.screen, (60, 75, 95), (0, PANEL_H), (WIN_W, PANEL_H), 3)
+
+            # Spodní mapa hřiště
+            self.draw_field_map()
 
             pygame.display.flip()
             self.clock.tick(60)
 
         if self.ser: self.ser.close()
         pygame.quit()
+
 
 if __name__ == "__main__":
     port = get_serial_port()
