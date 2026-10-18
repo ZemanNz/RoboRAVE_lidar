@@ -1020,7 +1020,7 @@ class DualLidarVisualizer:
         self.screen.blit(self.font_main.render("• [L] Zamknout etalon -> automaticky aktivuje 360° plný rozhled v poli!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
 
     # ========================================================
-    #  PANEL 3: POROVNÁNÍ & LOKALIZACE ROBOTA (VÝPOČET POLOHY)
+    #  PANEL 3: POROVNÁNÍ & LOKALIZACE ROBOTA (DRUHÁ STATICKÁ MAPA & KOTVY)
     # ========================================================
     def draw_right_comparison(self):
         offset_x = PANEL_W * 2
@@ -1034,14 +1034,101 @@ class DualLidarVisualizer:
             bx = offset_x + 30; by = PANEL_H // 2 - 65
             self.screen.blit(msg_box, (bx, by))
             pygame.draw.rect(self.screen, (70, 60, 40), (bx, by, 540, 130), 1)
-            self.screen.blit(self.font_big.render("3. LOKALIZACE ROBOTA", True, (200, 200, 200)), (bx + 20, by + 12))
+            self.screen.blit(self.font_big.render("3. LOKALIZACE ROBOTA & DRUHÁ STATICKÁ MAPA", True, (200, 200, 200)), (bx + 20, by + 12))
             self.screen.blit(self.font_bold.render("Čekám na zamknutí etalonu na startu...", True, (240, 180, 50)), (bx + 20, by + 36))
             self.screen.blit(self.font_main.render("1. Nechte na startu ustálit boxy v panelu 2.", True, (160, 170, 185)), (bx + 20, by + 60))
             self.screen.blit(self.font_main.render("2. Stiskněte [L] pro zamknutí etalonu a aktivaci lokalizace.", True, (80, 255, 160)), (bx + 20, by + 80))
-            self.screen.blit(self.font_main.render("3. Při posunu robota se zde zobrazí poloha a paprsky shod.", True, (255, 120, 220)), (bx + 20, by + 100))
+            self.screen.blit(self.font_main.render("3. Zde se vykreslí druhá statická mapa z nového místa a kotvy.", True, (255, 120, 220)), (bx + 20, by + 100))
             return
 
-        # Rozhodovací paprsky shod mezi aktuálními inliery a referenčními body
+        # 1. GHOST STÍNY REFERENČNÍHO ETALONU ZE STARTU (pro vizuální porovnání)
+        for idx, rb in enumerate(loc.ref_boxes):
+            p_min = self.to_screen(rb['min_x'], rb['max_y'], offset_x)
+            p_max = self.to_screen(rb['max_x'], rb['min_y'], offset_x)
+            rx = min(p_min[0], p_max[0])
+            ry = min(p_min[1], p_max[1])
+            rw = max(8, abs(p_max[0] - p_min[0]))
+            rh = max(8, abs(p_max[1] - p_min[1]))
+            pygame.draw.rect(self.screen, (60, 75, 95), (rx, ry, rw, rh), 1)
+            scx, scy = self.to_screen(rb['cx'], rb['cy'], offset_x)
+            pygame.draw.circle(self.screen, (70, 85, 105), (scx, scy), 4, 1)
+            self.screen.blit(self.font_main.render(f"REF #{idx+1}", True, (90, 105, 125)), (rx + 2, max(4, ry - 14)))
+
+        # 2. VÝPOČET POLOHY AKTUÁLNÍCH BOUNDING BOXŮ Z NOVÉHO MÍSTA
+        curr_boxes = parse_box_list(self.last_frame.get("static_boxes", []))
+        if not curr_boxes:
+            curr_boxes = parse_box_list(self.last_frame.get("boxes", []))
+
+        cos_t = math.cos(math.radians(loc.robot_deg))
+        sin_t = math.sin(math.radians(loc.robot_deg))
+
+        transformed_boxes = []
+        for cl in curr_boxes:
+            cx_local = cl['cx']
+            cy_local = cl['cy']
+            # Střed boxu ve světě
+            wx = loc.robot_x + cx_local * cos_t + cy_local * sin_t
+            wy = loc.robot_y - cx_local * sin_t + cy_local * cos_t
+
+            # 4 rohy orientovaného Bounding Boxu
+            hw = cl['width'] * 0.5
+            hh = cl['height'] * 0.5
+            local_corners = [
+                (cx_local - hw, cy_local - hh),
+                (cx_local + hw, cy_local - hh),
+                (cx_local + hw, cy_local + hh),
+                (cx_local - hw, cy_local + hh)
+            ]
+            poly_scr = []
+            for lx, ly in local_corners:
+                g_cx = loc.robot_x + lx * cos_t + ly * sin_t
+                g_cy = loc.robot_y - lx * sin_t + ly * cos_t
+                poly_scr.append(self.to_screen(g_cx, g_cy, offset_x))
+
+            transformed_boxes.append({
+                'box': cl,
+                'wx': wx, 'wy': wy,
+                'poly_scr': poly_scr
+            })
+
+        # 3. KOTVY A VZDÁLENOSTI MEZI NOVÝMI BOUNDING BOXY (PŘÍMKY V POLI)
+        n_tb = len(transformed_boxes)
+        for i in range(n_tb):
+            for j in range(i + 1, n_tb):
+                b1 = transformed_boxes[i]
+                b2 = transformed_boxes[j]
+                d_cur = math.hypot(b1['wx'] - b2['wx'], b1['wy'] - b2['wy'])
+                p1 = self.to_screen(b1['wx'], b1['wy'], offset_x)
+                p2 = self.to_screen(b2['wx'], b2['wy'], offset_x)
+
+                # Porovnání s referenčními kotvami
+                is_k1 = False
+                is_k2 = False
+                if len(loc.anchors) >= 1 and abs(d_cur - loc.anchors[0]['dist']) < 130.0:
+                    is_k1 = True
+                elif len(loc.anchors) >= 2 and abs(d_cur - loc.anchors[1]['dist']) < 130.0:
+                    is_k2 = True
+
+                mx = (p1[0] + p2[0]) // 2
+                my = (p1[1] + p2[1]) // 2
+
+                if is_k1:
+                    # KOTVA 1 (Zlatá)
+                    pygame.draw.line(self.screen, (255, 215, 0), p1, p2, 4)
+                    lbl = self.font_bold.render(f"KOTVA 1: {int(d_cur)} mm", True, (255, 215, 0))
+                    self.screen.blit(lbl, (mx + 8, my - 16))
+                elif is_k2:
+                    # KOTVA 2 (Oranžová)
+                    pygame.draw.line(self.screen, (255, 150, 40), p1, p2, 3)
+                    lbl = self.font_bold.render(f"KOTVA 2: {int(d_cur)} mm", True, (255, 150, 40))
+                    self.screen.blit(lbl, (mx + 8, my + 6))
+                else:
+                    # Další spojnice
+                    pygame.draw.line(self.screen, (0, 180, 220), p1, p2, 1)
+                    lbl = self.font_main.render(f"{int(d_cur)} mm", True, (0, 200, 240))
+                    self.screen.blit(lbl, (mx + 6, my - 8))
+
+        # 4. ROZHODOVACÍ PAPRSKY SHOD MEZI INLIERY A REFERENČNÍMI BODY
         match = loc.last_match_info
         if match and match.get('inlier_pairs'):
             for ref_pt, cur_trans_pt, err in match['inlier_pairs']:
@@ -1049,29 +1136,48 @@ class DualLidarVisualizer:
                 cp = self.to_screen(cur_trans_pt[0], cur_trans_pt[1], offset_x)
                 pygame.draw.line(self.screen, (255, 60, 200), rp, cp, 2)
                 pygame.draw.circle(self.screen, (255, 200, 240), cp, 4)
+                mid_x = (rp[0] + cp[0]) // 2
+                mid_y = (rp[1] + cp[1]) // 2
+                self.screen.blit(self.font_main.render(f"Δ{err:.0f}mm", True, (255, 130, 220)), (mid_x + 4, mid_y - 6))
 
-        # Aktuální Bounding Boxy přetransformované do souřadnic hřiště
-        curr_boxes = parse_box_list(self.last_frame.get("static_boxes", []))
-        if not curr_boxes:
-            curr_boxes = parse_box_list(self.last_frame.get("boxes", []))
+        # 5. VYKRESLENÍ PLNÝCH ORIENTOVANÝCH BOUNDING BOXŮ Z NOVÉHO MÍSTA
+        for idx, tb in enumerate(transformed_boxes):
+            cl = tb['box']
+            wx = tb['wx']
+            wy = tb['wy']
+            poly_scr = tb['poly_scr']
 
-        cos_t = math.cos(math.radians(loc.robot_deg))
-        sin_t = math.sin(math.radians(loc.robot_deg))
-        for cl in curr_boxes:
-            wx = loc.robot_x + cl['cx'] * cos_t + cl['cy'] * sin_t
-            wy = loc.robot_y - cl['cx'] * sin_t + cl['cy'] * cos_t
+            box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
+
+            # Poloprůhledná výplň orientovaného boxu
+            s_poly = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
+            fill_col = (0, 200, 140, 35) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 160, 30, 35)
+            local_poly = [(pt[0] - offset_x, pt[1]) for pt in poly_scr]
+            pygame.draw.polygon(s_poly, fill_col, local_poly)
+            pygame.draw.polygon(s_poly, box_col, local_poly, 2)
+            self.screen.blit(s_poly, (offset_x, 0))
+
+            # Středový křížek
             scx, scy = self.to_screen(wx, wy, offset_x)
-            pygame.draw.circle(self.screen, (0, 240, 160), (scx, scy), 6)
-            pygame.draw.circle(self.screen, (255, 255, 255), (scx, scy), 2)
+            pygame.draw.circle(self.screen, (255, 230, 20), (scx, scy), 6)
+            pygame.draw.circle(self.screen, (20, 20, 20), (scx, scy), 2)
+            pygame.draw.line(self.screen, (255, 255, 255), (scx - 7, scy), (scx + 7, scy), 2)
+            pygame.draw.line(self.screen, (255, 255, 255), (scx, scy - 7), (scx, scy + 7), 2)
 
-        # Trajektorie robota
+            # Popisky nového boxu
+            lbl1 = self.font_bold.render(f"NOVÝ #{idx+1} [{cl['type']}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+            lbl2 = self.font_main.render(f"SVĚT: [{int(wx):+d}, {int(wy):+d}] | R od robota:{int(cl['dist_mm'])} mm", True, (255, 245, 140))
+            self.screen.blit(lbl1, (scx + 10, scy - 18))
+            self.screen.blit(lbl2, (scx + 10, scy - 4))
+
+        # 6. TRAJEKTORIE ROBOTA
         if len(loc.trajectory) >= 2:
             traj_px = [self.to_screen(tp[0], tp[1], offset_x) for tp in loc.trajectory]
             pygame.draw.lines(self.screen, (220, 50, 140), False, traj_px, 2)
             for tpt in traj_px[::4]:
                 pygame.draw.circle(self.screen, (255, 100, 180), tpt, 2)
 
-        # Růžový robot s natočením
+        # 7. RŮŽOVÝ ROBOT S NATOČENÍM
         rx, ry = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
         h_rad = math.radians(loc.robot_deg)
         cos_h = math.cos(h_rad); sin_h = math.sin(h_rad)
@@ -1112,7 +1218,7 @@ class DualLidarVisualizer:
         lbl_rob = self.font_bold.render(f"ROBOT [{loc.robot_x:+.0f}, {loc.robot_y:+.0f}] {loc.robot_deg:+.0f}° ({conf_pct}%)", True, PINK_LITE)
         self.screen.blit(lbl_rob, (rx + 16, ry - 10))
 
-        # Horní status panel
+        # 8. HORNÍ STATUS PANEL
         stat_box = pygame.Surface((570, 56))
         stat_box.set_alpha(220)
         stat_box.fill((10, 12, 16))
@@ -1129,15 +1235,15 @@ class DualLidarVisualizer:
         sub_str = f"Inliery: {inliers} | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
         self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 38))
 
-        # Spodní tip panel
+        # 9. SPODNÍ TIP PANEL
         tip_box = pygame.Surface((570, 75))
         tip_box.set_alpha(210)
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
-        self.screen.blit(self.font_bold.render("HIERARCHICKÉ KOTVY A 360° ROZHLED V POLI:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Zlatá: KOTVA 1 (nejdelší rozvor) | Oranžová: KOTVA 2 | Tyrkys: Trojúhelník", True, (240, 220, 80)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• Zastíněná svíčka nevadí: lokalizace běží dál i při zakrytí jedné z kotev!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_bold.render("DRUHÁ STATICKÁ MAPA & KOTVY Z NOVÉHO MÍSTA:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Zlatá: KOTVA 1 (nejdelší rozvor) | Oranžová: KOTVA 2 | Růžová: paprsky shod", True, (240, 220, 80)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Šedé obdélníky = etalon ze STARTu | Barevné obdélníky = boxy z nového místa", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
 
     # ========================================================
     #  PANEL 4: OBDÉLNÍKOVÁ MAPA CELÉHO HŘIŠTĚ (KUMULATIVNÍ CÍLE)
