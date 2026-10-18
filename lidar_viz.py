@@ -26,7 +26,7 @@ Ovládání:
   Klik myší   - Detailní inspekce souřadnic vybraného bodu / cíle
 """
 
-import sys, os, time, json, math, itertools
+import sys, os, time, json, math, itertools, collections
 import pygame
 import serial
 from serial.tools import list_ports
@@ -670,6 +670,147 @@ def draw_arrow(screen, color, p_start, p_end, width=3, tip_len=14, tip_width=8):
 
 
 # ============================================================
+#  BoxDetailStabilizer - Dlouhodobá stabilizace stěn a svíček v čase
+#  Zabraňuje přeblikávání, stabilizuje orientace stěn a nájezdové vektory.
+# ============================================================
+class TrackedBoxDetail:
+    def __init__(self, track_id, init_meas):
+        self.track_id = track_id
+        self.type_history = collections.deque(maxlen=14)
+        self.type_history.append(init_meas['type'])
+        self.confirmed_type = init_meas['type']
+        self.candle_world = init_meas['candle_world']
+        self.walls_world = list(init_meas['walls_world'])
+        self.approach_dir = init_meas['approach_dir']
+        self.waypoint_world = init_meas['waypoint_world']
+        self.hits = 1
+        self.missed = 0
+        self.travel_dist_mm = 0.0
+
+    def update(self, meas, rx, ry):
+        self.hits += 1
+        self.missed = 0
+        self.type_history.append(meas['type'])
+
+        # Stabilní typ podle historie (většinový konsensus):
+        if self.hits <= 2:
+            self.confirmed_type = meas['type']
+        else:
+            c_corner = self.type_history.count('CORNER')
+            c_wall   = self.type_history.count('WALL')
+            if c_corner >= 3:
+                self.confirmed_type = 'CORNER'
+            elif c_wall >= 4:
+                self.confirmed_type = 'WALL'
+            else:
+                self.confirmed_type = 'SOLO'
+
+        alpha = 0.22
+        # Vyhlazení polohy svíčky (EMA)
+        mc = meas['candle_world']
+        self.candle_world = (
+            (1.0 - alpha) * self.candle_world[0] + alpha * mc[0],
+            (1.0 - alpha) * self.candle_world[1] + alpha * mc[1]
+        )
+
+        # Vyhlazení stěn (pokud v tomto snímku byly detekovány, vyhladíme; pokud ne, zachováme předchozí!)
+        mw = meas['walls_world']
+        if mw:
+            if len(mw) == len(self.walls_world):
+                new_w = []
+                for (s1, e1), (s2, e2) in zip(self.walls_world, mw):
+                    ns = ((1.0 - alpha) * s1[0] + alpha * s2[0], (1.0 - alpha) * s1[1] + alpha * s2[1])
+                    ne = ((1.0 - alpha) * e1[0] + alpha * e2[0], (1.0 - alpha) * e1[1] + alpha * e2[1])
+                    new_w.append((ns, ne))
+                self.walls_world = new_w
+            else:
+                self.walls_world = list(mw)
+
+        # Vyhlazení směru nájezdu a cílového waypointu
+        mdir = meas['approach_dir']
+        adx = (1.0 - alpha) * self.approach_dir[0] + alpha * mdir[0]
+        ady = (1.0 - alpha) * self.approach_dir[1] + alpha * mdir[1]
+        alen = math.hypot(adx, ady)
+        if alen > 1e-4:
+            self.approach_dir = (adx / alen, ady / alen)
+
+        mwp = meas['waypoint_world']
+        self.waypoint_world = (
+            (1.0 - alpha) * self.waypoint_world[0] + alpha * mwp[0],
+            (1.0 - alpha) * self.waypoint_world[1] + alpha * mwp[1]
+        )
+        self.travel_dist_mm = math.hypot(self.waypoint_world[0] - rx, self.waypoint_world[1] - ry)
+
+
+class BoxDetailStabilizer:
+    def __init__(self):
+        self.tracks = {}
+        self.next_id = 1
+
+    def reset(self):
+        self.tracks.clear()
+        self.next_id = 1
+
+    def update_all(self, raw_details, rx, ry):
+        matched_ids = set()
+        out_list = []
+
+        for rd in raw_details:
+            cw = rd['candle_world']
+            best_id = None
+            best_d = 280.0
+
+            for tid, tr in self.tracks.items():
+                if tid in matched_ids: continue
+                d = math.hypot(tr.candle_world[0] - cw[0], tr.candle_world[1] - cw[1])
+                if d < best_d:
+                    best_d = d
+                    best_id = tid
+
+            if best_id is not None:
+                tr = self.tracks[best_id]
+                tr.update(rd, rx, ry)
+                matched_ids.add(best_id)
+            else:
+                tid = self.next_id
+                self.next_id += 1
+                tr = TrackedBoxDetail(tid, rd)
+                tr.travel_dist_mm = math.hypot(tr.waypoint_world[0] - rx, tr.waypoint_world[1] - ry)
+                self.tracks[tid] = tr
+                matched_ids.add(tid)
+
+            is_cor = (tr.confirmed_type == 'CORNER')
+            is_sol = (tr.confirmed_type == 'SOLO')
+            res = {
+                'box': rd.get('box', {}),
+                'type': tr.confirmed_type,
+                'is_corner': is_cor,
+                'is_solo': is_sol,
+                'candle_world': tr.candle_world,
+                'walls_world': tr.walls_world,
+                'waypoint_world': tr.waypoint_world,
+                'arrow_start': tr.waypoint_world,
+                'arrow_end': tr.candle_world,
+                'travel_dist_mm': tr.travel_dist_mm,
+                'approach_dir': tr.approach_dir,
+                'hits': tr.hits
+            }
+            out_list.append(res)
+
+        # Čištění ztracených cílů (až po 20 snímcích absence)
+        to_del = []
+        for tid, tr in self.tracks.items():
+            if tid not in matched_ids:
+                tr.missed += 1
+                if tr.missed > 20:
+                    to_del.append(tid)
+        for tid in to_del:
+            del self.tracks[tid]
+
+        return out_list
+
+
+# ============================================================
 #  Hlavní vícepanelový vizualizér
 # ============================================================
 class DualLidarVisualizer:
@@ -700,6 +841,7 @@ class DualLidarVisualizer:
         self.processed_boxes = []
         self.detect_details_enabled = False  # Klávesa [O] aktivuje jemnou detekci stěn a nájezdových cest
         self.current_box_details = []
+        self.detail_stabilizer = BoxDetailStabilizer()
 
         pygame.init()
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -743,6 +885,8 @@ class DualLidarVisualizer:
         self.localizer.unlock_map()
         self.field_map.reset()
         self.processed_boxes = []
+        self.current_box_details = []
+        self.detail_stabilizer.reset()
         self.send_cmd("RESET_MAP")
         print("[MAPA] Mapy vyresetovány -> sběr čistého etalonu.")
 
@@ -911,195 +1055,265 @@ class DualLidarVisualizer:
 
         return final_boxes
 
-    def extract_box_details_and_approach(self, box, cloud_data, rx, ry, th_rad):
+    def compute_raw_box_details(self, box, cloud_data, rx, ry, th_rad):
         """
-        Geometrická analýza stěn a svíčky STRIKTNĚ UVNITŘ BOUNDING BOXU:
-        1. Vyfiltruje body z cloud_data uvnitř hranic boxu.
-        2. Proloží stěnu/stěny (RANSAC).
-        3. Určí přesný střed svíčky.
-        4. Vypočítá nájezdovou šipku o délce 38 cm a Approach Waypoint.
+        Geometrická analýza stěn a svíčky STRIKTNĚ UVNITŘ BOUNDING BOXU (ve světových souřadnicích):
+        1. Vyfiltruje body z cloud_data uvnitř hranic boxu a převede do světa.
+        2. Proloží stěnu 1 (RANSAC).
+        3. Pokud existují kolmé body pro stěnu 2 -> ROH (určí vrchol V, obě ramena a osu otevřeného prostoru).
+        4. Pokud pouze 1 stěna -> určí kolmici od stěny přes svíčku dál do volného prostoru.
+        5. Šipky nikdy nekříží stěny: u rohu vedou středem otevřeného úhlu, u 1 stěny po kolmici z otevřené strany.
         """
         cos_t = math.cos(th_rad)
         sin_t = math.sin(th_rad)
 
-        margin = 25.0
+        margin = 35.0
         bx_min = box['min_x'] - margin
         bx_max = box['max_x'] + margin
         by_min = box['min_y'] - margin
         by_max = box['max_y'] + margin
 
-        # 1. Výběr bodů striktně uvnitř tohoto boxu
-        local_pts = []
+        # Výběr bodů striktně uvnitř boxu převedených přímo do světových souřadnic
+        world_pts = []
         if cloud_data and len(cloud_data) >= 3:
             n_cloud = len(cloud_data) // 3
             for i in range(n_cloud):
-                px = cloud_data[i * 3]
-                py = cloud_data[i * 3 + 1]
-                if bx_min <= px <= bx_max and by_min <= py <= by_max:
-                    local_pts.append((px, py))
+                lx = cloud_data[i * 3]
+                ly = cloud_data[i * 3 + 1]
+                if bx_min <= lx <= bx_max and by_min <= ly <= by_max:
+                    wx = rx + lx * cos_t + ly * sin_t
+                    wy = ry - lx * sin_t + ly * cos_t
+                    world_pts.append((wx, wy))
 
-        # Pomocná funkce převodu lokálního bodu na světový
-        def to_world(lx, ly):
-            wx = rx + lx * cos_t + ly * sin_t
-            wy = ry - lx * sin_t + ly * cos_t
-            return wx, wy
+        w_box_cx = rx + box['cx'] * cos_t + box['cy'] * sin_t
+        w_box_cy = ry - box['cx'] * sin_t + box['cy'] * cos_t
 
-        # Výchozí světová poloha středu boxu
-        w_cx, w_cy = to_world(box['cx'], box['cy'])
+        # 1. Malý box nebo málo bodů -> SAMOSTATNÁ VOLNÁ SVÍČKA
+        if len(world_pts) < 5 or box.get('span_mm', 0) < 160.0 or box.get('is_solo', False):
+            cand_x = sum(p[0] for p in world_pts) / len(world_pts) if world_pts else w_box_cx
+            cand_y = sum(p[1] for p in world_pts) / len(world_pts) if world_pts else w_box_cy
 
-        # Pokud máme málo bodů nebo malý box -> samostatná svíčka bez stěn
-        is_solo = box.get('is_solo', True) or len(local_pts) < 5 or box.get('span_mm', 0) < 150.0
-
-        if is_solo or len(local_pts) < 5:
-            # SAMOSTATNÁ SVÍČKA
-            c_cand_x = sum(p[0] for p in local_pts) / len(local_pts) if local_pts else box['cx']
-            c_cand_y = sum(p[1] for p in local_pts) / len(local_pts) if local_pts else box['cy']
-            cand_world = to_world(c_cand_x, c_cand_y)
-
-            # Vektor od robota ke svíčce
-            d_vec_x = cand_world[0] - rx
-            d_vec_y = cand_world[1] - ry
+            d_vec_x = cand_x - rx
+            d_vec_y = cand_y - ry
             d_len = math.hypot(d_vec_x, d_vec_y)
             if d_len > 10.0:
-                ux = d_vec_x / d_len
-                uy = d_vec_y / d_len
+                ux = d_vec_x / d_len; uy = d_vec_y / d_len
             else:
                 ux, uy = 0.0, 1.0
 
-            arrow_len = 380.0  # 38 cm nájezdová šipka
-            wp_x = cand_world[0] - ux * arrow_len
-            wp_y = cand_world[1] - uy * arrow_len
-            travel_dist = math.hypot(wp_x - rx, wp_y - ry)
+            wp_x = cand_x - ux * 380.0
+            wp_y = cand_y - uy * 380.0
 
             return {
                 'box': box,
-                'candle_world': cand_world,
+                'type': 'SOLO',
+                'candle_world': (cand_x, cand_y),
                 'walls_world': [],
                 'waypoint_world': (wp_x, wp_y),
-                'arrow_start': (wp_x, wp_y),
-                'arrow_end': cand_world,
-                'travel_dist_mm': travel_dist,
-                'is_solo': True,
-                'is_corner': False
+                'approach_dir': (ux, uy)
             }
 
-        # PRO VĚTŠÍ BOX: Hledání stěn uvnitř boxu pomocí RANSAC (úsečka délky 120 až 340 mm)
-        best_wall = None
-        best_inliers = []
+        # 2. Hledáme první stěnu (Wall 1) pomocí RANSAC ve světovém prostoru
+        best_w1_inliers = []
+        best_w1_line = None
+        n_p = len(world_pts)
+        step = 1 if n_p < 40 else 2
+        for i in range(0, min(n_p, 30), step):
+            p1 = world_pts[i]
+            for j in range(i + 1, min(n_p, 30), step):
+                p2 = world_pts[j]
+                d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                if d < 75.0: continue
+                nx = -(p2[1] - p1[1]) / d
+                ny = (p2[0] - p1[0]) / d
+                inliers = [p for p in world_pts if abs((p[0] - p1[0]) * nx + (p[1] - p1[1]) * ny) <= 22.0]
+                if len(inliers) > len(best_w1_inliers):
+                    best_w1_inliers = inliers
+                    best_w1_line = (p1, p2)
 
-        n_p = len(local_pts)
-        for i in range(min(n_p, 25)):
-            p1 = local_pts[i]
-            for j in range(i + 1, min(n_p, 25)):
-                p2 = local_pts[j]
-                seg_d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-                if seg_d < 90.0:
-                    continue
+        if not best_w1_line or len(best_w1_inliers) < 4:
+            cand_x = sum(p[0] for p in world_pts) / len(world_pts)
+            cand_y = sum(p[1] for p in world_pts) / len(world_pts)
+            d_vec_x = cand_x - rx; d_vec_y = cand_y - ry
+            d_len = max(1.0, math.hypot(d_vec_x, d_vec_y))
+            ux = d_vec_x / d_len; uy = d_vec_y / d_len
+            return {
+                'box': box,
+                'type': 'SOLO',
+                'candle_world': (cand_x, cand_y),
+                'walls_world': [],
+                'waypoint_world': (cand_x - ux * 380.0, cand_y - uy * 380.0),
+                'approach_dir': (ux, uy)
+            }
 
-                inliers = []
-                for p in local_pts:
-                    dist = abs((p2[1] - p1[1]) * p[0] - (p2[0] - p1[0]) * p[1] + p2[0] * p1[1] - p2[1] * p1[0]) / seg_d
-                    if dist <= 22.0:
-                        inliers.append(p)
+        # Geometrie stěny 1
+        p1, p2 = best_w1_line
+        dx = p2[0] - p1[0]; dy = p2[1] - p1[1]
+        L1 = math.hypot(dx, dy)
+        u1x = dx / L1; u1y = dy / L1
 
-                if len(inliers) > len(best_inliers):
-                    best_inliers = inliers
-                    best_wall = (p1, p2)
+        projs1 = [((p[0] - p1[0]) * u1x + (p[1] - p1[1]) * u1y) for p in best_w1_inliers]
+        min_t1 = min(projs1); max_t1 = max(projs1)
+        w1_s = (p1[0] + u1x * min_t1, p1[1] + u1y * min_t1)
+        w1_e = (p1[0] + u1x * max_t1, p1[1] + u1y * max_t1)
+        w1_len = max_t1 - min_t1
 
-        walls_world = []
-        is_corner = False
-        cand_world = (w_cx, w_cy)
+        outliers1 = [p for p in world_pts if p not in best_w1_inliers]
 
-        if best_wall and len(best_inliers) >= 4:
-            p1, p2 = best_wall
-            dx = p2[0] - p1[0]; dy = p2[1] - p1[1]
-            seg_len = math.hypot(dx, dy)
-            ux = dx / seg_len; uy = dy / seg_len
+        # 3. Hledáme druhou stěnu (Wall 2) kolmou k Wall 1
+        best_w2_inliers = []
+        best_w2_line = None
+        if len(outliers1) >= 4:
+            n_out = len(outliers1)
+            for i in range(min(n_out, 25)):
+                q1 = outliers1[i]
+                for j in range(i + 1, min(n_out, 25)):
+                    q2 = outliers1[j]
+                    qd = math.hypot(q2[0] - q1[0], q2[1] - q1[1])
+                    if qd < 65.0: continue
+                    qux = (q2[0] - q1[0]) / qd
+                    quy = (q2[1] - q1[1]) / qd
+                    dot = abs(u1x * qux + u1y * quy)
+                    if dot > 0.65: continue # požadavek kolmosti (50° až 130°)
+                    q_nx = -quy; q_ny = qux
+                    in2 = [p for p in outliers1 if abs((p[0] - q1[0]) * q_nx + (p[1] - q1[1]) * q_ny) <= 22.0]
+                    if len(in2) > len(best_w2_inliers):
+                        best_w2_inliers = in2
+                        best_w2_line = (q1, q2)
 
-            projs = [((p[0] - p1[0]) * ux + (p[1] - p1[1]) * uy) for p in best_inliers]
-            min_t = min(projs); max_t = max(projs)
+        # ========================================================
+        # VĚTEV A: ROH (2 STĚNY KOLEM SVÍČKY)
+        # ========================================================
+        if best_w2_line and len(best_w2_inliers) >= 3:
+            q1, q2 = best_w2_line
+            qdx = q2[0] - q1[0]; qdy = q2[1] - q1[1]
+            L2 = math.hypot(qdx, qdy)
+            u2x = qdx / L2; u2y = qdy / L2
 
-            w1_start = (p1[0] + ux * min_t, p1[1] + uy * min_t)
-            w1_end   = (p1[0] + ux * max_t, p1[1] + uy * max_t)
-            walls_world.append((to_world(w1_start[0], w1_start[1]), to_world(w1_end[0], w1_end[1])))
+            # Průsečík obou ramen stěn = Vrchol rohu V
+            cross = u1x * u2y - u1y * u2x
+            if abs(cross) > 1e-4:
+                s_param = ((q1[0] - p1[0]) * u2y - (q1[1] - p1[1]) * u2x) / cross
+                Vx = p1[0] + s_param * u1x
+                Vy = p1[1] + s_param * u1y
+            else:
+                Vx = (w1_s[0] + w1_e[0]) * 0.5
+                Vy = (w1_s[1] + w1_e[1]) * 0.5
+            V = (Vx, Vy)
 
-            outliers = [p for p in local_pts if p not in best_inliers]
+            # Orientujeme rameno 1 směrem OD vrcholu V podél stěny
+            d_s1 = math.hypot(w1_s[0] - Vx, w1_s[1] - Vy)
+            d_e1 = math.hypot(w1_e[0] - Vx, w1_e[1] - Vy)
+            far1 = w1_e if d_e1 > d_s1 else w1_s
+            len1 = max(140.0, max(d_s1, d_e1))
+            norm_arm1 = max(1.0, math.hypot(far1[0] - Vx, far1[1] - Vy))
+            arm1_x = (far1[0] - Vx) / norm_arm1
+            arm1_y = (far1[1] - Vy) / norm_arm1
+            wall1_seg = (V, (Vx + arm1_x * len1, Vy + arm1_y * len1))
 
-            if len(outliers) >= 4:
-                best_w2 = None
-                best_in2 = []
-                for i in range(len(outliers)):
-                    q1 = outliers[i]
-                    for j in range(i + 1, len(outliers)):
-                        q2 = outliers[j]
-                        qd = math.hypot(q2[0] - q1[0], q2[1] - q1[1])
-                        if qd < 80.0: continue
-                        in2 = [p for p in outliers if abs((q2[1] - q1[1]) * p[0] - (q2[0] - q1[0]) * p[1] + q2[0] * q1[1] - q2[1] * q1[0]) / qd <= 22.0]
-                        if len(in2) > len(best_in2):
-                            best_in2 = in2
-                            best_w2 = (q1, q2)
+            # Orientujeme rameno 2 směrem OD vrcholu V podél stěny
+            projs2 = [((p[0] - q1[0]) * u2x + (p[1] - q1[1]) * u2y) for p in best_w2_inliers]
+            w2_s = (q1[0] + u2x * min(projs2), q1[1] + u2y * min(projs2))
+            w2_e = (q1[0] + u2x * max(projs2), q1[1] + u2y * max(projs2))
+            d_s2 = math.hypot(w2_s[0] - Vx, w2_s[1] - Vy)
+            d_e2 = math.hypot(w2_e[0] - Vx, w2_e[1] - Vy)
+            far2 = w2_e if d_e2 > d_s2 else w2_s
+            len2 = max(140.0, max(d_s2, d_e2))
+            norm_arm2 = max(1.0, math.hypot(far2[0] - Vx, far2[1] - Vy))
+            arm2_x = (far2[0] - Vx) / norm_arm2
+            arm2_y = (far2[1] - Vy) / norm_arm2
+            wall2_seg = (V, (Vx + arm2_x * len2, Vy + arm2_y * len2))
 
-                if best_w2 and len(best_in2) >= 3:
-                    is_corner = True
-                    q1, q2 = best_w2
-                    qdx = q2[0] - q1[0]; qdy = q2[1] - q1[1]
-                    qlen = math.hypot(qdx, qdy)
-                    qux = qdx / qlen; quy = qdy / qlen
-                    qprojs = [((p[0] - q1[0]) * qux + (p[1] - q1[1]) * quy) for p in best_in2]
-                    w2_start = (q1[0] + qux * min(qprojs), q1[1] + quy * min(qprojs))
-                    w2_end   = (q1[0] + qux * max(qprojs), q1[1] + quy * max(qprojs))
-                    walls_world.append((to_world(w2_start[0], w2_start[1]), to_world(w2_end[0], w2_end[1])))
+            # Svíčka C: zbylé body uvnitř rohu
+            cand_pts = [p for p in outliers1 if p not in best_w2_inliers]
+            if cand_pts:
+                cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
+                cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
+            else:
+                cand_x = Vx + 85.0 * arm1_x + 85.0 * arm2_x
+                cand_y = Vy + 85.0 * arm1_y + 85.0 * arm2_y
 
-            cand_world = (w_cx, w_cy)
+            # Otevřený prostor: osa rohu (bisektor) mířící ven z rohu do volného hřiště
+            bisect_x = arm1_x + arm2_x
+            bisect_y = arm1_y + arm2_y
+            blen = math.hypot(bisect_x, bisect_y)
+            if blen > 0.01:
+                u_open_x = bisect_x / blen
+                u_open_y = bisect_y / blen
+            else:
+                u_open_x = 0.0; u_open_y = 1.0
 
-            # Normála stěny 1
-            nx = -uy; ny = ux
-            mid_w_x = (w1_start[0] + w1_end[0]) * 0.5
-            mid_w_y = (w1_start[1] + w1_end[1]) * 0.5
-            if (mid_w_x * nx + mid_w_y * ny) > 0:
-                nx, ny = -nx, -ny
+            # Waypoint je 380 mm v otevřeném prostoru před svíčkou
+            wp_x = cand_x + u_open_x * 380.0
+            wp_y = cand_y + u_open_y * 380.0
 
-            w_nx = nx * cos_t - ny * sin_t
-            w_ny = nx * sin_t + ny * cos_t
-            norm_len = math.hypot(w_nx, w_ny)
-            if norm_len > 0.01:
-                w_nx /= norm_len; w_ny /= norm_len
-
-            arrow_len = 380.0
-            wp_x = cand_world[0] - w_nx * arrow_len
-            wp_y = cand_world[1] - w_ny * arrow_len
-            travel_dist = math.hypot(wp_x - rx, wp_y - ry)
+            # Šipka míří Z otevřeného prostoru (od Waypointu) DO svíčky
+            app_dir = (-u_open_x, -u_open_y)
 
             return {
                 'box': box,
-                'candle_world': cand_world,
-                'walls_world': walls_world,
+                'type': 'CORNER',
+                'candle_world': (cand_x, cand_y),
+                'walls_world': [wall1_seg, wall2_seg],
                 'waypoint_world': (wp_x, wp_y),
-                'arrow_start': (wp_x, wp_y),
-                'arrow_end': cand_world,
-                'travel_dist_mm': travel_dist,
-                'is_solo': False,
-                'is_corner': is_corner
+                'approach_dir': app_dir
             }
+
+        # ========================================================
+        # VĚTEV B: 1 STĚNA (SVÍČKA CHRÁNĚNÁ JEDNOU DESKOU)
+        # ========================================================
+        wall1_seg = (w1_s, w1_e)
+
+        # Svíčka C z outliers
+        if outliers1:
+            cand_x = sum(p[0] for p in outliers1) / len(outliers1)
+            cand_y = sum(p[1] for p in outliers1) / len(outliers1)
         else:
-            d_vec_x = w_cx - rx; d_vec_y = w_cy - ry
-            d_len = math.hypot(d_vec_x, d_vec_y)
-            ux = d_vec_x / max(1.0, d_len); uy = d_vec_y / max(1.0, d_len)
-            arrow_len = 380.0
-            wp_x = w_cx - ux * arrow_len
-            wp_y = w_cy - uy * arrow_len
-            travel_dist = math.hypot(wp_x - rx, wp_y - ry)
-            return {
-                'box': box,
-                'candle_world': (w_cx, w_cy),
-                'walls_world': [],
-                'waypoint_world': (wp_x, wp_y),
-                'arrow_start': (wp_x, wp_y),
-                'arrow_end': (w_cx, w_cy),
-                'travel_dist_mm': travel_dist,
-                'is_solo': True,
-                'is_corner': False
-            }
+            mid_x = (w1_s[0] + w1_e[0]) * 0.5
+            mid_y = (w1_s[1] + w1_e[1]) * 0.5
+            cand_x = mid_x
+            cand_y = mid_y
+
+        # Pata kolmice P_proj na přímce stěny 1
+        t_proj = (cand_x - w1_s[0]) * u1x + (cand_y - w1_s[1]) * u1y
+        t_clamped = max(0.0, min(w1_len, t_proj))
+        p_proj_x = w1_s[0] + t_clamped * u1x
+        p_proj_y = w1_s[1] + t_clamped * u1y
+
+        # Kolmice: vektor ze stěny (pata kolmice) přes svíčku dál do otevřeného prostoru
+        perp_dx = cand_x - p_proj_x
+        perp_dy = cand_y - p_proj_y
+        perp_dist = math.hypot(perp_dx, perp_dy)
+
+        if perp_dist > 15.0:
+            norm_x = perp_dx / perp_dist
+            norm_y = perp_dy / perp_dist
+        else:
+            # Pokud svíčka leží přímo na přímce stěny, vezmeme normálu ke stěně mířící k robotovi
+            nx = -u1y; ny = u1x
+            mid_x = (w1_s[0] + w1_e[0]) * 0.5
+            mid_y = (w1_s[1] + w1_e[1]) * 0.5
+            if nx * (rx - mid_x) + ny * (ry - mid_y) < 0:
+                nx = -nx; ny = -ny
+            norm_x = nx; norm_y = ny
+            cand_x = p_proj_x + norm_x * 80.0
+            cand_y = p_proj_y + norm_y * 80.0
+
+        # Waypoint leží na kolmici od stěny přes svíčku a od svíčky dál o 380 mm
+        wp_x = cand_x + norm_x * 380.0
+        wp_y = cand_y + norm_y * 380.0
+
+        # Šipka míří od waypointu do svíčky (po kolmici ze strany otevřeného prostoru)
+        app_dir = (-norm_x, -norm_y)
+
+        return {
+            'box': box,
+            'type': 'WALL',
+            'candle_world': (cand_x, cand_y),
+            'walls_world': [wall1_seg],
+            'waypoint_world': (wp_x, wp_y),
+            'approach_dir': app_dir
+        }
 
     def read_serial(self):
         if not self.ser or not self.ser.is_open: return
@@ -1535,15 +1749,22 @@ class DualLidarVisualizer:
         self.current_box_details = []
         if self.detect_details_enabled:
             cloud_data = self.last_frame.get("cloud", [])
-            r_pos_scr = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
-
-            for idx, tb in enumerate(transformed_boxes):
+            raw_details = []
+            for tb in transformed_boxes:
                 cl = tb['box']
-                details = self.extract_box_details_and_approach(
+                raw_d = self.compute_raw_box_details(
                     cl, cloud_data, loc.robot_x, loc.robot_y, math.radians(loc.robot_deg)
                 )
-                self.current_box_details.append(details)
+                raw_details.append(raw_d)
 
+            # Časová stabilizace: filtrace záchvěvů, stálé typy cílů a plynulé nájezdové trasy
+            self.current_box_details = self.detail_stabilizer.update_all(
+                raw_details, loc.robot_x, loc.robot_y
+            )
+
+            r_pos_scr = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
+
+            for idx, details in enumerate(self.current_box_details):
                 wp_world = details['waypoint_world']
                 cand_world = details['candle_world']
                 wp_scr = self.to_screen(wp_world[0], wp_world[1], offset_x)
@@ -1561,12 +1782,12 @@ class DualLidarVisualizer:
                 pygame.draw.circle(self.screen, (255, 230, 0), wp_scr, 4)
                 pygame.draw.line(self.screen, (0, 255, 200), (wp_scr[0] - 12, wp_scr[1]), (wp_scr[0] + 12, wp_scr[1]), 1)
                 pygame.draw.line(self.screen, (0, 255, 200), (wp_scr[0], wp_scr[1] - 12), (wp_scr[0], wp_scr[1] + 12), 1)
-                self.screen.blit(self.font_bold.render(f"NÁJEZD #{idx+1}", True, (0, 255, 220)), (wp_scr[0] + 12, wp_scr[1] - 8))
+                self.screen.blit(self.font_bold.render(f"NÁJEZD #{idx+1} [38 cm]", True, (0, 255, 220)), (wp_scr[0] + 12, wp_scr[1] - 8))
 
-                # 3. Nájezdová šipka 38 cm mířící do plamene svíčky
+                # 3. Nájezdová šipka 38 cm mířící do plamene svíčky (středem otevřeného úhlu nebo po kolmici)
                 draw_arrow(self.screen, (255, 75, 40), wp_scr, cand_scr, width=4, tip_len=18, tip_width=9)
 
-                # 4. Detekované stěny uvnitř boxu
+                # 4. Detekované stabilizované stěny uvnitř boxu
                 for w_seg in details['walls_world']:
                     wp1 = self.to_screen(w_seg[0][0], w_seg[0][1], offset_x)
                     wp2 = self.to_screen(w_seg[1][0], w_seg[1][1], offset_x)
@@ -1578,7 +1799,7 @@ class DualLidarVisualizer:
                 pygame.draw.circle(self.screen, (255, 50, 30), cand_scr, 8)
                 pygame.draw.circle(self.screen, (255, 220, 0), cand_scr, 5)
                 pygame.draw.circle(self.screen, (255, 255, 255), cand_scr, 2)
-                type_tag = "ROH" if details['is_corner'] else ("STĚNA" if not details['is_solo'] else "VOLNÁ")
+                type_tag = "ROH (2 STĚNY)" if details['is_corner'] else ("1 STĚNA" if not details['is_solo'] else "VOLNÁ")
                 self.screen.blit(self.font_bold.render(f"🔥 SVÍČKA [{type_tag}] #{idx+1}", True, (255, 215, 60)), (cand_scr[0] + 10, cand_scr[1] + 8))
 
         # 6. TRAJEKTORIE ROBOTA
@@ -1654,8 +1875,8 @@ class DualLidarVisualizer:
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
         self.screen.blit(self.font_bold.render("DRUHÁ STATICKÁ MAPA & NÁJEZDOVÉ ŠIPKY (KLÁVESA [O]):", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Červené šipky = nájezdové vektory 38 cm ze správného směru přímo do svíčky", True, (255, 120, 80)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• Tyrkysové čáry = trasy od lidaru k bodům nájezdu (stěny a svíčky striktně v boxech)", True, (0, 240, 255)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_main.render("• Červené šipky = nájezd 38 cm (středem otevřeného úhlu u rohu / po kolmici u stěny)", True, (255, 120, 80)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Časová stabilizace: stěny, svíčky a trasy drží pevně a nepřeblikávají!", True, (0, 240, 255)), (offset_x + 25, PANEL_H - 43))
 
     # ========================================================
     #  PANEL 4: OBDÉLNÍKOVÁ MAPA CELÉHO HŘIŠTĚ (KUMULATIVNÍ CÍLE)
@@ -1951,6 +2172,8 @@ class DualLidarVisualizer:
                         else:
                             self.localizer.unlock_map()
                             self.field_map.reset()
+                            self.current_box_details = []
+                            self.detail_stabilizer.reset()
                             if self.auto_fov_enabled and not self.fov_limited:
                                 self.fov_limited = True
                                 self.send_cmd("FOV 1")
@@ -1959,6 +2182,8 @@ class DualLidarVisualizer:
 
                     elif event.key == pygame.K_n:
                         self.field_map.reset()
+                        self.current_box_details = []
+                        self.detail_stabilizer.reset()
                         print("[MAPA] Nová mapa na aktuální pozici robota resetována.")
                     elif event.key in [pygame.K_2, pygame.K_AT]:
                         self.field_map.set_start_wall(2)
