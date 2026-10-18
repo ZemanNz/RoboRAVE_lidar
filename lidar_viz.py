@@ -678,6 +678,7 @@ class DualLidarVisualizer:
 
         self.localizer = RobotLocalizer()
         self.field_map = GlobalFieldMap()
+        self.processed_boxes = []
 
         pygame.init()
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -720,6 +721,7 @@ class DualLidarVisualizer:
         """Vyresetuje stav map a odešle RESET_MAP do ESP32."""
         self.localizer.unlock_map()
         self.field_map.reset()
+        self.processed_boxes = []
         self.send_cmd("RESET_MAP")
         print("[MAPA] Mapy vyresetovány -> sběr čistého etalonu.")
 
@@ -730,6 +732,163 @@ class DualLidarVisualizer:
         sx = int(cx + x_mm * scale)
         sy = int(cy - y_mm * scale)
         return sx, sy
+
+    def prioritize_and_recover_expected_boxes(self, raw_boxes, cloud_data):
+        """
+        Zvýhodnění reálných svíček a odlehčení náročnosti detekce v očekávaných místech:
+        1. Vyloučí/odsunue boxy, které leží mimo mantinely hřiště (nohy diváků, zdi místnosti).
+        2. Pro každou referenční svíčku ze STARTU vypočítá očekávanou polohu v lokálním souřadném systému robota.
+        3. Pokud je v očekávané zóně (< 250 mm) přítomen detekovaný box, potvrdí ho s nejvyšší prioritou.
+        4. Pokud svíčka chybí (problikává, je dál nebo má méně bodů), sníží náročnost:
+           prohledá mračno bodů v predikovaném místě a i při pouhých 2-3 bodech vytvoří zachráněný Bounding Box.
+        """
+        loc = self.localizer
+        if not loc.locked or len(loc.ref_boxes) == 0:
+            return list(raw_boxes)
+
+        rx = loc.robot_x
+        ry = loc.robot_y
+        r_deg = loc.robot_deg
+        th = math.radians(r_deg)
+        cos_t = math.cos(th)
+        sin_t = math.sin(th)
+
+        # Hranice hřiště pro detekci objektů za mantinelem
+        xmin, xmax, ymin, ymax = self.field_map.get_auto_field_bounds()
+        out_margin = 150.0  # mm tolerance za mantinelem
+
+        # Rozdělení na boxy uvnitř a vně hřiště
+        inside_boxes = []
+        outside_boxes = []
+
+        for b in raw_boxes:
+            b_copy = dict(b)
+            # Světové souřadnice středu boxu
+            wx = rx + b['cx'] * cos_t + b['cy'] * sin_t
+            wy = ry - b['cx'] * sin_t + b['cy'] * cos_t
+            b_copy['world_x'] = wx
+            b_copy['world_y'] = wy
+
+            is_outside = (wx < xmin - out_margin or wx > xmax + out_margin or
+                          wy < ymin - out_margin or wy > ymax + out_margin)
+            b_copy['is_outside'] = is_outside
+            if is_outside:
+                outside_boxes.append(b_copy)
+            else:
+                inside_boxes.append(b_copy)
+
+        # 2. Predikce lokální polohy každé referenční svíčky v senzoru robota
+        matched_inside_indices = set()
+        enhanced_boxes = []
+
+        for ref_idx, rb in enumerate(loc.ref_boxes):
+            # Globální poloha referenční svíčky
+            r_wx = rb['cx']
+            r_wy = rb['cy']
+
+            # Relativní vektor vůči robotovi
+            del_x = r_wx - rx
+            del_y = r_wy - ry
+
+            # Inverzní rotace do lokálního systému robota (+X doprava, +Y dopředu)
+            pred_lx = del_x * cos_t - del_y * sin_t
+            pred_ly = del_x * sin_t + del_y * cos_t
+            pred_dist = math.hypot(pred_lx, pred_ly)
+
+            # Hledáme, zda v okruhu 240 mm od predikované polohy máme box uvnitř hřiště
+            best_box_idx = -1
+            best_dist = 240.0
+
+            for idx, b in enumerate(inside_boxes):
+                if idx in matched_inside_indices:
+                    continue
+                d = math.hypot(b['cx'] - pred_lx, b['cy'] - pred_ly)
+                if d < best_dist:
+                    best_dist = d
+                    best_box_idx = idx
+
+            if best_box_idx >= 0:
+                # Nalezena očekávaná svíčka -> potvrdíme a zvýhodníme
+                b = inside_boxes[best_box_idx]
+                b['is_expected'] = True
+                b['expected_ref_idx'] = ref_idx + 1
+                b['pred_dist'] = pred_dist
+                enhanced_boxes.append(b)
+                matched_inside_indices.add(best_box_idx)
+            else:
+                # Svíčka v detekovaných boxech chybí (problikává nebo má málo bodů).
+                # Odlehčení náročnosti: prohledáme surové mračno bodů (cloud) v predikovaném místě!
+                if cloud_data and len(cloud_data) >= 3:
+                    pts_found = []
+                    n_cloud = len(cloud_data) // 3
+                    search_radius = 180.0
+                    search_radius_sq = search_radius * search_radius
+
+                    for i in range(n_cloud):
+                        px = cloud_data[i * 3]
+                        py = cloud_data[i * 3 + 1]
+                        dx = px - pred_lx
+                        dy = py - pred_ly
+                        if dx * dx + dy * dy <= search_radius_sq:
+                            pts_found.append((px, py))
+
+                    # Stačí pouhé 2 body (odlehčený práh pro očekávanou svíčku ze startu)
+                    if len(pts_found) >= 2:
+                        sum_x = sum(p[0] for p in pts_found)
+                        sum_y = sum(p[1] for p in pts_found)
+                        k = len(pts_found)
+                        c_x = sum_x / k
+                        c_y = sum_y / k
+                        min_x = min(p[0] for p in pts_found)
+                        max_x = max(p[0] for p in pts_found)
+                        min_y = min(p[1] for p in pts_found)
+                        max_y = max(p[1] for p in pts_found)
+                        w = max(35.0, max_x - min_x)
+                        h = max(35.0, max_y - min_y)
+                        span = math.hypot(w, h)
+                        dist = math.hypot(c_x, c_y)
+
+                        recovered_b = {
+                            'min_x': min_x, 'max_x': max_x,
+                            'min_y': min_y, 'max_y': max_y,
+                            'cx': c_x, 'cy': c_y,
+                            'width': w, 'height': h,
+                            'span_mm': span,
+                            'dist_mm': dist,
+                            'pts_count': k,
+                            'is_solo': (span < 160.0),
+                            'type': 'SVÍČKA' if span < 160.0 else 'SVÍČKA+STĚNA',
+                            'is_expected': True,
+                            'is_recovered': True,
+                            'expected_ref_idx': ref_idx + 1,
+                            'world_x': r_wx,
+                            'world_y': r_wy,
+                            'is_outside': False
+                        }
+                        enhanced_boxes.append(recovered_b)
+
+        # Přidáme zbylé nezařazené boxy uvnitř hřiště (které nepatří k žádné očekávané svíčce)
+        for idx, b in enumerate(inside_boxes):
+            if idx not in matched_inside_indices:
+                b['is_expected'] = False
+                enhanced_boxes.append(b)
+
+        # Seřazení:
+        # 1. Očekávané svíčky v hřišti (mají absolutní přednost)
+        # 2. Ostatní boxy uvnitř hřiště seřazené podle vzdálenosti
+        enhanced_boxes.sort(key=lambda x: (not x.get('is_expected', False), x.get('dist_mm', 9999.0)))
+
+        # Výsledný výběr: max 4 nejlepší boxy
+        final_boxes = enhanced_boxes[:4]
+
+        # Pokud by zbývalo místo (< 4) a neměli bychom nic jiného, zařadíme i box z outside (pro diagnostiku)
+        if len(final_boxes) < 4:
+            for ob in outside_boxes:
+                if len(final_boxes) >= 4:
+                    break
+                final_boxes.append(ob)
+
+        return final_boxes
 
     def read_serial(self):
         if not self.ser or not self.ser.is_open: return
@@ -745,15 +904,23 @@ class DualLidarVisualizer:
             self.last_frame = newest
             live_boxes = parse_box_list(newest.get("boxes", []))
             static_boxes = parse_box_list(newest.get("static_boxes", []))
+            cloud_data = newest.get("cloud", [])
+
+            # Zpracování a zvýhodnění očekávaných svíček v hřišti
+            raw_active = static_boxes if len(static_boxes) >= 2 else live_boxes
+            if self.localizer.locked:
+                self.processed_boxes = self.prioritize_and_recover_expected_boxes(raw_active, cloud_data)
+            else:
+                self.processed_boxes = static_boxes if static_boxes else live_boxes
+
+            active_b = self.processed_boxes
 
             # Pokud ještě není zamčeno [L], průběžně aktualizujeme globální model z pozice START=[0,0]
             if not self.localizer.locked:
-                active_b = static_boxes if static_boxes else live_boxes
                 if active_b:
                     self.field_map.ingest_boxes(active_b, 0.0, 0.0, 0.0)
             else:
                 # Po zamknutí provádíme lokalizaci robota podle aktuálních boxů
-                active_b = static_boxes if len(static_boxes) >= 2 else live_boxes
                 if len(active_b) >= 2:
                     self.localizer.estimate_pose(active_b)
 
@@ -844,9 +1011,9 @@ class DualLidarVisualizer:
                 v = min(255, max(30, intensity * 2 + 40))
                 self.screen.set_at((sx, sy), (v, v, v))
 
-        # Surové Bounding Boxy z ESP32
-        live_boxes = parse_box_list(self.last_frame.get("boxes", []))
-        for idx, cl in enumerate(live_boxes):
+        # Bounding Boxy: živé z ESP32 nebo obohacené v očekávaných zónách po zamknutí
+        boxes_to_draw = self.processed_boxes if (self.localizer.locked and self.processed_boxes) else parse_box_list(self.last_frame.get("boxes", []))
+        for idx, cl in enumerate(boxes_to_draw):
             p_min = self.to_screen(cl['min_x'], cl['max_y'], offset_x)
             p_max = self.to_screen(cl['max_x'], cl['min_y'], offset_x)
             rx = min(p_min[0], p_max[0])
@@ -854,14 +1021,27 @@ class DualLidarVisualizer:
             rw = max(8, abs(p_max[0] - p_min[0]))
             rh = max(8, abs(p_max[1] - p_min[1]))
 
-            box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
+            is_rec = cl.get('is_recovered', False)
+            is_exp = cl.get('is_expected', False)
+            is_out = cl.get('is_outside', False)
+
+            if is_rec:
+                box_col = (0, 230, 255)
+            elif is_exp:
+                box_col = (0, 255, 170) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 205, 40)
+            elif is_out:
+                box_col = (130, 130, 140)
+            else:
+                box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
+
             pygame.draw.rect(self.screen, box_col, (rx, ry, rw, rh), 2)
 
             scx, scy = self.to_screen(cl['cx'], cl['cy'], offset_x)
             pygame.draw.circle(self.screen, (255, 230, 20), (scx, scy), 5)
             pygame.draw.circle(self.screen, (20, 20, 20), (scx, scy), 2)
 
-            lbl1 = self.font_bold.render(f"BOX #{idx+1} [{cl['type']}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+            tag = " [ZACHRÁNĚNÁ]" if is_rec else (f" [★ ETALON #{cl.get('expected_ref_idx', '')}]" if is_exp else (" [VNĚ POLE]" if is_out else ""))
+            lbl1 = self.font_bold.render(f"BOX #{idx+1} [{cl['type']}]{tag}: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
             lbl2 = self.font_main.render(f"STŘED: [{int(cl['cx'])}, {int(cl['cy'])}] | R:{int(cl['dist_mm'])}mm ({cl['pts_count']}b)", True, (255, 240, 130))
             self.screen.blit(lbl1, (rx + 4, max(4, ry - 18)))
             self.screen.blit(lbl2, (scx + 8, scy - 7))
@@ -1024,7 +1204,7 @@ class DualLidarVisualizer:
             self.screen.blit(self.font_main.render(f"REF #{idx+1}", True, (90, 105, 125)), (rx + 2, max(4, ry - 14)))
 
         # 2. VÝPOČET POLOHY AKTUÁLNÍCH BOUNDING BOXŮ Z NOVÉHO MÍSTA
-        curr_boxes = parse_box_list(self.last_frame.get("static_boxes", []))
+        curr_boxes = self.processed_boxes if self.processed_boxes else parse_box_list(self.last_frame.get("static_boxes", []))
         if not curr_boxes:
             curr_boxes = parse_box_list(self.last_frame.get("boxes", []))
 
@@ -1099,11 +1279,25 @@ class DualLidarVisualizer:
             rw = max(10, abs(p_max[0] - p_min[0]))
             rh = max(10, abs(p_max[1] - p_min[1]))
 
-            box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
+            is_rec = cl.get('is_recovered', False)
+            is_exp = cl.get('is_expected', False)
+            is_out = cl.get('is_outside', False)
+
+            if is_rec:
+                box_col = (0, 230, 255)
+                fill_col = (0, 200, 240, 45)
+            elif is_exp:
+                box_col = (0, 255, 170) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 200, 40)
+                fill_col = (0, 200, 140, 35) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 170, 30, 35)
+            elif is_out:
+                box_col = (130, 130, 140)
+                fill_col = (100, 100, 110, 20)
+            else:
+                box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
+                fill_col = (0, 200, 140, 30) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 160, 30, 30)
 
             # Poloprůhledná výplň nenatočeného pravoúhlého boxu
             s_fill = pygame.Surface((rw, rh), pygame.SRCALPHA)
-            fill_col = (0, 200, 140, 30) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 160, 30, 30)
             s_fill.fill(fill_col)
             self.screen.blit(s_fill, (rx, ry))
             pygame.draw.rect(self.screen, box_col, (rx, ry, rw, rh), 2)
@@ -1116,8 +1310,9 @@ class DualLidarVisualizer:
             pygame.draw.line(self.screen, (255, 255, 255), (scx, scy - 7), (scx, scy + 7), 2)
 
             # Popisky nového boxu
-            lbl1 = self.font_bold.render(f"NOVÝ #{idx+1} [{cl['type']}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
-            lbl2 = self.font_main.render(f"SVĚT: [{int(wx):+d}, {int(wy):+d}] | R od robota:{int(cl['dist_mm'])} mm", True, (255, 245, 140))
+            tag = " [ZACHRÁNĚNÁ]" if is_rec else (f" [★ ETALON #{cl.get('expected_ref_idx', '')}]" if is_exp else (" [VNĚ POLE]" if is_out else ""))
+            lbl1 = self.font_bold.render(f"NOVÝ #{idx+1} [{cl['type']}]{tag}: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+            lbl2 = self.font_main.render(f"SVĚT: [{int(wx):+d}, {int(wy):+d}] | R:{int(cl['dist_mm'])} mm ({cl.get('pts_count', 0)}b)", True, (255, 245, 140))
             self.screen.blit(lbl1, (scx + 10, scy - 18))
             self.screen.blit(lbl2, (scx + 10, scy - 4))
 
@@ -1192,9 +1387,8 @@ class DualLidarVisualizer:
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
-        self.screen.blit(self.font_bold.render("DRUHÁ STATICKÁ MAPA & KOTVY Z NOVÉHO MÍSTA:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Barevné spojnice K1..K6 = spárované kotvy z etalonu (ověřené vnitřní úhly)", True, (240, 220, 80)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• Nenatočené pravoúhlé boxy AABB [wx, wy] odpovídající etalonu ze STARTu", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_main.render("• Prioritní boost očekávaných svíček v hřišti & záchrana ze surového mračna bodů", True, (0, 230, 240)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Objekty vně mantinelu jsou vyřazeny, skutečné svíčky mají vždy přednost!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
 
     # ========================================================
     #  PANEL 4: OBDÉLNÍKOVÁ MAPA CELÉHO HŘIŠTĚ (KUMULATIVNÍ CÍLE)
