@@ -160,65 +160,33 @@ class RobotLocalizer:
         ty = cy_d - (cx_s * sin_t + cy_s * cos_t)
         return tx, ty, theta
 
-    def estimate_pose(self, live_candles, live_walls):
+    def estimate_pose(self, new_candles, new_walls):
         """
-        Určí pozici a orientaci robota (x, y, theta) vůči referenční mapě
-        pomocí invariantních vzdáleností mezi svíčkami a stěnami.
-        Funguje při jakémkoliv pohybu i přemístění robota.
+        Určí pozici a orientaci robota (x, y, theta) porovnáním DVOU STABILNÍCH MAP:
+        Nové stabilní mapy (vyfiltrované na aktuálním místě) a Staré stabilní mapy (referenční etalon).
         """
         if not self.locked or (len(self.ref_candles) + len(self.ref_walls)) < 2:
             return False
 
         # Převod na standardní formát (x, y) pro svíčky a (mx, my) pro stěny
-        raw_cands = []
-        for c in live_candles:
+        cands = []
+        for c in new_candles:
             if isinstance(c, (list, tuple)):
-                raw_cands.append((float(c[0]), float(c[1])))
+                cands.append((float(c[0]), float(c[1])))
             elif isinstance(c, dict):
-                raw_cands.append((float(c['x']), float(c['y'])))
+                cands.append((float(c['x']), float(c['y'])))
 
-        raw_walls = []
-        for w in live_walls:
+        walls = []
+        for w in new_walls:
             if isinstance(w, (list, tuple)):
                 mx = (float(w[0]) + float(w[2])) * 0.5
                 my = (float(w[1]) + float(w[3])) * 0.5
-                raw_walls.append((mx, my))
+                walls.append((mx, my))
             elif isinstance(w, dict):
-                raw_walls.append((float(w['mx']), float(w['my'])))
+                walls.append((float(w['mx']), float(w['my'])))
 
-        # Krátkodobý tracker svíček (vyhlazuje chvění měření a překlenuje krátké výpadky na 1-2 snímky)
-        matched_tracker = set()
-        for cx, cy in raw_cands:
-            best_idx = -1
-            best_d = 100.0
-            for idx, tc in enumerate(self.candle_tracker):
-                if idx in matched_tracker: continue
-                d = math.hypot(tc['x'] - cx, tc['y'] - cy)
-                if d < best_d:
-                    best_d = d
-                    best_idx = idx
-            if best_idx >= 0:
-                self.candle_tracker[best_idx]['x'] = 0.7 * self.candle_tracker[best_idx]['x'] + 0.3 * cx
-                self.candle_tracker[best_idx]['y'] = 0.7 * self.candle_tracker[best_idx]['y'] + 0.3 * cy
-                self.candle_tracker[best_idx]['hits'] += 1
-                self.candle_tracker[best_idx]['missed'] = 0
-                matched_tracker.add(best_idx)
-            else:
-                self.candle_tracker.append({'x': cx, 'y': cy, 'hits': 1, 'missed': 0})
-                matched_tracker.add(len(self.candle_tracker) - 1)
-
-        for idx, tc in enumerate(self.candle_tracker):
-            if idx not in matched_tracker:
-                tc['missed'] += 1
-
-        # Rychlý rozpad (max 4 missed snímky = 0.6 s) -> při posunu robota nezůstávají duchové!
-        self.candle_tracker = [c for c in self.candle_tracker if c['missed'] <= 4]
-
-        # Výběr kandidátů na svíčky:
-        # Preferujeme stabilizované body z trackeru, případně přímo živé ze snímku
-        tracked_cands = [(c['x'], c['y']) for c in self.candle_tracker if c['hits'] >= 2]
-        cands = tracked_cands if len(tracked_cands) >= 2 else raw_cands
-        walls = raw_walls
+        if (len(cands) + len(walls)) < 2:
+            return False
 
         best_tx = None
         best_ty = None
@@ -228,12 +196,13 @@ class RobotLocalizer:
         best_match_info = None
 
         # ========================================================
-        # 1. PÁROVÁNÍ PODLE INVARIANTNÍCH VZDÁLENOSTÍ MEZI SVÍČKAMI
+        # 1. PÁROVÁNÍ PODLE INVARIANTNÍCH VZDÁLENOSTÍ MEZI STABILNÍMI SVÍČKAMI
         # ========================================================
         if len(cands) >= 2 and len(self.ref_candles) >= 2:
             for a in range(len(cands)):
                 for b in range(a + 1, len(cands)):
                     d_cur = math.hypot(cands[a][0] - cands[b][0], cands[a][1] - cands[b][1])
+                    if d_cur < 150.0: continue
 
                     # Hledáme odpovídající dvojici svíček v referenční mapě
                     for (ri, rj, d_ref) in self.ref_candle_dists:
@@ -375,48 +344,27 @@ class RobotLocalizer:
                                     }
 
         # ========================================================
-        # 3. APLIKACE VÝSLEDKU: STATICKÁ POLOHA, SETRVAČNOST A TRAJEKTORIE
+        # 3. APLIKACE VÝSLEDKU: STATICKÁ POLOHA POROVNÁNÍM DVOU STABILNÍCH MAP
         # ========================================================
         if best_inliers >= 2 and best_tx is not None:
             self.last_match_info = best_match_info
-            cur_rad = math.radians(self.robot_deg)
-            dist_diff = math.hypot(best_tx - self.robot_x, best_ty - self.robot_y)
-            ang_diff = abs(math.atan2(math.sin(best_theta - cur_rad), math.cos(best_theta - cur_rad)))
+            self.robot_x = best_tx
+            self.robot_y = best_ty
+            self.robot_deg = math.degrees(best_theta)
+            self.is_stationary = True
+            quality = min(1.0, best_inliers / max(2, len(self.ref_candles) + len(self.ref_walls)))
+            self.pose_confidence = quality
 
-            # Klidový zámek: pokud se poloha liší o méně než 20 mm a 1.5°, robot stojí na místě
-            # (Absolutně statická poloha lidaru bez sebemenšího třesu!)
-            if dist_diff < 20.0 and ang_diff < math.radians(1.5):
-                self.is_stationary = True
-                self.pose_confidence = min(1.0, self.pose_confidence + 0.05)
-            else:
-                self.is_stationary = False
-
-                # Pokud došlo k velkému přemístění (např. uživatel zvedl a posunul LiDAR o > 300 mm),
-                # reagujeme rychleji (alpha = 0.50), při normálním pohybu plynule setrvačně (alpha = 0.22)
-                alpha = 0.50 if dist_diff > 300.0 else 0.22
-
-                self.robot_x = (1.0 - alpha) * self.robot_x + alpha * best_tx
-                self.robot_y = (1.0 - alpha) * self.robot_y + alpha * best_ty
-
-                # Hladké vyhlazení úhlu na jednotkové kružnici
-                sin_b = (1.0 - alpha) * math.sin(cur_rad) + alpha * math.sin(best_theta)
-                cos_b = (1.0 - alpha) * math.cos(cur_rad) + alpha * math.cos(best_theta)
-                self.robot_deg = math.degrees(math.atan2(sin_b, cos_b))
-
-                quality = min(1.0, best_inliers / max(2, len(self.ref_candles) + len(self.ref_walls)))
-                self.pose_confidence = min(1.0, 0.7 * self.pose_confidence + 0.3 * quality)
-
-                # Záznam do projeté trajektorie (každých 25 mm)
-                last_pt = self.trajectory[-1]
-                if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 25.0:
-                    self.trajectory.append((self.robot_x, self.robot_y))
-                    if len(self.trajectory) > 300:
-                        self.trajectory.pop(0)
+            # Záznam do projeté trajektorie (každých 25 mm)
+            last_pt = self.trajectory[-1]
+            if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 25.0:
+                self.trajectory.append((self.robot_x, self.robot_y))
+                if len(self.trajectory) > 300:
+                    self.trajectory.pop(0)
 
             return True
         else:
-            # Krátkodobý výpadek měření – držíme pozici, jistota jemně klesá
-            self.pose_confidence = max(0.0, self.pose_confidence - 0.02)
+            self.pose_confidence = max(0.0, self.pose_confidence - 0.05)
             return False
 
     update_pose = estimate_pose
@@ -710,7 +658,8 @@ class DualLidarVisualizer:
             "walls": [], "candles": [], "cloud": []
         }
 
-        self.model = StableFieldModel()
+        self.ref_model = StableFieldModel()   # Stará stabilní mapa (na výchozím místě START)
+        self.curr_model = StableFieldModel()  # Nová stabilní mapa (na aktuálním místě robota)
         self.localizer = RobotLocalizer()
 
         pygame.init()
@@ -752,9 +701,10 @@ class DualLidarVisualizer:
 
     def on_parameter_changed(self):
         """Vždy při změně parametrů (FoV/dosah/intenzita) se vygeneruje čistá nová mapa."""
-        self.model.reset()
+        self.ref_model.reset()
+        self.curr_model.reset()
         self.localizer.unlock_map()
-        print("[MAPA] Parametry upraveny -> stabilní mapa i lokalizace resetovány.")
+        print("[MAPA] Parametry upraveny -> obě stabilní mapy i lokalizace resetovány.")
 
     def to_screen(self, x_mm, y_mm, panel_offset_x):
         cx = panel_offset_x + PANEL_W / 2.0
@@ -776,10 +726,20 @@ class DualLidarVisualizer:
 
         if newest is not None and not self.frozen:
             self.last_frame = newest
-            self.model.update(newest.get("candles", []), newest.get("walls", []))
-            # Lokalizace: odhad polohy robota v reálném čase z čerstvých dat senzoru
-            if self.localizer.locked:
-                self.localizer.estimate_pose(newest.get("candles", []), newest.get("walls", []))
+
+            if not self.localizer.locked:
+                # 1. PŘED ZAMKNUTÍM: Sbíráme Starou stabilní mapu na výchozím místě (START)
+                self.ref_model.update(newest.get("candles", []), newest.get("walls", []))
+            else:
+                # 2. PO ZAMKNUTÍ: Stará stabilní mapa je neměnná reference.
+                # Sbíráme Novou stabilní mapu na aktuálním stanovišti robota!
+                self.curr_model.update(newest.get("candles", []), newest.get("walls", []))
+
+                # Porovnáváme DVĚ STABILNÍ MAPY (potvrzené objekty z nového modelu proti starému etalonu)
+                new_cands = self.curr_model.get_confirmed_candles()
+                new_walls = self.curr_model.get_confirmed_walls()
+                if (len(new_cands) + len(new_walls)) >= 2:
+                    self.localizer.estimate_pose(new_cands, new_walls)
 
     def handle_click(self, pos):
         if pos[0] >= PANEL_W:
@@ -1067,8 +1027,8 @@ class DualLidarVisualizer:
             conf_candles = loc.ref_candles
             conf_walls   = loc.ref_walls
         else:
-            conf_candles = self.model.get_confirmed_candles()
-            conf_walls   = self.model.get_confirmed_walls()
+            conf_candles = self.ref_model.get_confirmed_candles()
+            conf_walls   = self.ref_model.get_confirmed_walls()
 
         # 1. Stěny a koridory původní referenční mapy
         for w in conf_walls:
@@ -1168,7 +1128,7 @@ class DualLidarVisualizer:
             sub_str = f"Referenční etalon: {len(conf_candles)} svíček, {len(conf_walls)} stěn | Pevná geometrie uložena"
         else:
             t_stat = self.font_big.render("2. PŮVODNÍ STATICKÁ MAPA [SBĚR]", True, (240, 180, 40))
-            sub_str = f"Svíčky: {len(conf_candles)}/4 | Stěny: {len(conf_walls)}/6 | Skenů: {self.model.total_scans} (stiskni [L] pro zamknutí)"
+            sub_str = f"Svíčky: {len(conf_candles)}/4 | Stěny: {len(conf_walls)}/6 | Skenů: {self.ref_model.total_scans} (stiskni [L] pro zamknutí)"
         self.screen.blit(t_stat, (offset_x + 25, 17))
         self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 40))
 
@@ -1253,27 +1213,42 @@ class DualLidarVisualizer:
         cos_h = math.cos(heading_rad)
         sin_h = math.sin(heading_rad)
 
-        # Transformované stěny (čerstvě viděné senzorem z polohy robota)
-        for w in self.last_frame.get("walls", []):
-            tw_x1 = loc.robot_x + w[0] * cos_h - w[1] * sin_h
-            tw_y1 = loc.robot_y + w[0] * sin_h + w[1] * cos_h
-            tw_x2 = loc.robot_x + w[2] * cos_h - w[3] * sin_h
-            tw_y2 = loc.robot_y + w[2] * sin_h + w[3] * cos_h
+        # 4. Potvrzené objekty z Nové stabilní mapy přetransformované do souřadnic hřiště
+        heading_rad = math.radians(loc.robot_deg)
+        cos_h = math.cos(heading_rad)
+        sin_h = math.sin(heading_rad)
 
-            self.draw_wall_corridor(tw_x1, tw_y1, tw_x2, tw_y2, w[4], offset_x)
+        curr_walls = self.curr_model.get_confirmed_walls()
+        curr_cands = self.curr_model.get_confirmed_candles()
+
+        # Transformované stěny z Nové stabilní mapy
+        for w in curr_walls:
+            tw_x1 = loc.robot_x + w['x1'] * cos_h - w['y1'] * sin_h
+            tw_y1 = loc.robot_y + w['x1'] * sin_h + w['y1'] * cos_h
+            tw_x2 = loc.robot_x + w['x2'] * cos_h - w['y2'] * sin_h
+            tw_y2 = loc.robot_y + w['x2'] * sin_h + w['y2'] * cos_h
+
+            self.draw_wall_corridor(tw_x1, tw_y1, tw_x2, tw_y2, w['len'], offset_x)
             p1 = self.to_screen(tw_x1, tw_y1, offset_x)
             p2 = self.to_screen(tw_x2, tw_y2, offset_x)
             pygame.draw.line(self.screen, (0, 255, 120), p1, p2, 4)
             pygame.draw.circle(self.screen, (100, 255, 160), p1, 3)
             pygame.draw.circle(self.screen, (100, 255, 160), p2, 3)
+            mx = (p1[0] + p2[0]) // 2
+            my = (p1[1] + p2[1]) // 2
+            lbl = self.font_bold.render(f"STĚNA {int(w['len'])}mm", True, (0, 255, 120))
+            self.screen.blit(lbl, (mx + 6, my - 7))
 
-        # Transformované svíčky (ze senzoru)
-        for c in self.last_frame.get("candles", []):
-            tc_x = loc.robot_x + c[0] * cos_h - c[1] * sin_h
-            tc_y = loc.robot_y + c[0] * sin_h + c[1] * cos_h
+        # Transformované svíčky z Nové stabilní mapy
+        for c in curr_cands:
+            tc_x = loc.robot_x + c['x'] * cos_h - c['y'] * sin_h
+            tc_y = loc.robot_y + c['x'] * sin_h + c['y'] * cos_h
             scx, scy = self.to_screen(tc_x, tc_y, offset_x)
             pygame.draw.circle(self.screen, (255, 50, 120), (scx, scy), 8)
             pygame.draw.circle(self.screen, (255, 230, 255), (scx, scy), 3)
+            w_info = f"[{c.get('walls_count', 0)} stěn]" if c.get('walls_count', 0) > 0 else "[BEZ STĚNY]"
+            lbl = self.font_bold.render(f"NOVÁ SVÍČKA {w_info}", True, (255, 90, 160))
+            self.screen.blit(lbl, (scx + 10, scy - 10))
 
         # ========================================================
         # 5. BAREVNÉ ROZHODOVACÍ PŘÍMKY A KORESPONDENCE (MATCHING)
@@ -1381,13 +1356,22 @@ class DualLidarVisualizer:
         stat_box.set_alpha(220)
         stat_box.fill((10, 12, 16))
         self.screen.blit(stat_box, (offset_x + 15, 12))
-        pygame.draw.rect(self.screen, (80, 255, 160), (offset_x + 15, 12, 570, 56), 1)
+
+        is_ready = (self.curr_model.total_scans >= 4 and len(curr_cands) >= 1)
+        border_col = (80, 255, 160) if is_ready else (240, 200, 60)
+        pygame.draw.rect(self.screen, border_col, (offset_x + 15, 12, 570, 56), 1)
 
         inliers_cnt = match.get('inliers', 0)
         avg_err_val = match.get('avg_error', 0.0)
-        t_stat = self.font_big.render("3. NOVÁ MAPA & POROVNÁNÍ 🔒 AKTIVNÍ", True, (80, 255, 160))
+
+        if is_ready:
+            t_stat = self.font_big.render("3. NOVÁ MAPA & POROVNÁNÍ 🔒 STABILNĚ SPÁROVÁNO", True, (80, 255, 160))
+            sub_str = f"Shoda: {inliers_cnt} inlierů | Chyba: {avg_err_val:.1f} mm | Od startu: {dist_from_start:.0f} mm (skenů: {self.curr_model.total_scans})"
+        else:
+            t_stat = self.font_big.render("3. NOVÁ MAPA: SBÍRÁM A STABILIZUJI DATA...", True, (240, 200, 60))
+            sub_str = f"Sbírám skeny nového místa: {self.curr_model.total_scans}/6 | Svíčky: {len(curr_cands)} | Stěny: {len(curr_walls)}"
+
         self.screen.blit(t_stat, (offset_x + 25, 17))
-        sub_str = f"Shoda: {inliers_cnt} inlierů | Chyba: {avg_err_val:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
         self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 40))
 
         # Barevný pruh jistoty
@@ -1406,9 +1390,9 @@ class DualLidarVisualizer:
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
-        self.screen.blit(self.font_bold.render("ROZHODOVACÍ ELEMENTY MAP-MATCHINGU:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Zlatá přímka: Kotevní dvojice se shodnou vzdáleností (invariant)", True, (255, 220, 60)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• Tyrkysové paprsky: Korespondence mezi původní a novou svíčkou", True, (0, 240, 255)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_bold.render("POROVNÁNÍ DVOU STABILNÍCH MAP:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• [N] Resetovat a nasbírat novou stabilní mapu na této pozici robota", True, (80, 255, 160)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Zlatá přímka: Kotevní dvojice se shodnou vzdáleností | Tyrkysová: Shoda svíček", True, (240, 220, 80)), (offset_x + 25, PANEL_H - 43))
 
     def run(self):
         while self.running:
@@ -1463,15 +1447,29 @@ class DualLidarVisualizer:
                     elif event.key in [pygame.K_MINUS]:
                         self.view_span_mm = min(6000.0, self.view_span_mm + 300.0)
                     elif event.key == pygame.K_l:
-                        # ZAMKNUTÍ MAPY → spuštění lokalizace
-                        cc = self.model.get_confirmed_candles()
-                        cw = self.model.get_confirmed_walls()
-                        ok = self.localizer.lock_map(cc, cw)
-                        n_lm = len(cc) + len(cw)
-                        if ok:
-                            print(f"[LOC] Mapa zamčena! {n_lm} landmarků uloženo jako reference.")
+                        # ZAMKNUTÍ NEBO ODEMKNUTÍ REFERENČNÍHO ETALONU
+                        if not self.localizer.locked:
+                            cc = self.ref_model.get_confirmed_candles()
+                            cw = self.ref_model.get_confirmed_walls()
+                            ok = self.localizer.lock_map(cc, cw)
+                            n_lm = len(cc) + len(cw)
+                            if ok:
+                                self.curr_model.reset()
+                                print(f"[LOC] Stará mapa zamčena jako referenční etalon ({n_lm} landmarků).")
+                                print(f"[LOC] Zahajuji sběr Nové stabilní mapy...")
+                            else:
+                                print(f"[LOC] Nedostatek landmarků ({n_lm}) – nechte stabilizovat starou mapu na startu.")
                         else:
-                            print(f"[LOC] Nedostatek landmarků ({n_lm}) – nejdřív nechte stabilizovat mapu.")
+                            self.localizer.unlock_map()
+                            self.ref_model.reset()
+                            self.curr_model.reset()
+                            print("[LOC] Mapa odemčena. Můžete znovu nasbírat původní etalon na startu.")
+
+                    elif event.key == pygame.K_n:
+                        if self.localizer.locked:
+                            self.curr_model.reset()
+                            self.localizer.last_match_info = None
+                            print("[LOC] Nová stabilní mapa resetována. Sbírám čistou novou mapu na aktuální pozici...")
 
             self.read_serial()
 
