@@ -22,9 +22,9 @@ CommProtocol comm(Serial);
 // Výchozí konfigurace filtrů
 FilterConfig config = {
     .min_range_mm = 130.0f,     // Mrtvá zóna D200
-    .max_range_mm = 4000.0f,    // Rozsah hřiště / testovací místnosti
+    .max_range_mm = 2400.0f,    // Výchozí rozsah 2.4 m ("2 metry něco")
     .min_intensity = 15,        // Práh odrazivosti
-    .fov_limited = false,       // false = 360°, true = dopředný kužel
+    .fov_limited = true,        // Výchozí 180° dopředný kužel
     .fov_angle_deg = 180.0f,    // Úhel dopředného kuželu
     .angle_offset_deg = 0.0f,   // Fyzické pootočení
     .blind_spot_enabled = false,

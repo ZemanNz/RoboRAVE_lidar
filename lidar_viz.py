@@ -752,12 +752,13 @@ class DualLidarVisualizer:
         self.running = True
         self.frozen = False
 
-        # Výchozí nastavení přesně dle specifikace a screenshotu
+        # Výchozí nastavení: 180° dopředný kužel a rozsah 2400 mm ("2 metry něco")
         self.fov_limited = True
         self.min_range = 130
-        self.max_range = 1800
+        self.max_range = 2400
         self.min_intensity = 15
         self.view_span_mm = 3500.0
+        self.last_sync_time = 0.0
 
         self.selected_object = None
 
@@ -785,10 +786,7 @@ class DualLidarVisualizer:
             self.font_big  = pygame.font.SysFont(None, 21)
 
         self.connect_serial()
-        # Nastavení výchozího 180° režimu do ESP32
-        self.send_cmd(f"FOV 1")
-        self.send_cmd(f"RANGE {self.min_range} {self.max_range}")
-        self.send_cmd(f"INTENSITY {self.min_intensity}")
+        self.sync_esp32_config()
 
     def connect_serial(self):
         try:
@@ -807,8 +805,15 @@ class DualLidarVisualizer:
                 self.ser.flush()
             except: pass
 
+    def sync_esp32_config(self):
+        """Vynutí odeslání nastavení FoV (180°), rozsahu a odrazivosti do ESP32."""
+        self.send_cmd(f"FOV {1 if self.fov_limited else 0}")
+        self.send_cmd(f"RANGE {self.min_range} {self.max_range}")
+        self.send_cmd(f"INTENSITY {self.min_intensity}")
+
     def on_parameter_changed(self):
         """Vždy při změně parametrů (FoV/dosah/intenzita) se vygeneruje čistá nová mapa."""
+        self.sync_esp32_config()
         self.ref_model.reset()
         self.curr_model.reset()
         self.localizer.unlock_map()
@@ -830,9 +835,68 @@ class DualLidarVisualizer:
                 line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                 if line.startswith("{") and line.endswith("}"):
                     newest = json.loads(line)
+                elif line.startswith("#"):
+                    # Detekce restartu ESP32 při pohybu nebo výpadku napájení
+                    if any(w in line for w in ["INIT", "Ready", "rst:", "boot"]):
+                        print(f"[SERIAL] Detekován restart ESP32 ({line}) -> Obnovuji konfiguraci...")
+                        self.sync_esp32_config()
             except: pass
 
         if newest is not None and not self.frozen:
+            # 1. Automatická kontrola a obnova parametrů ESP32 (detekce zbloudilých 360° nebo příliš vzdálených bodů)
+            cloud = newest.get("cloud", [])
+            n_pts = len(cloud) // 3
+            has_rear = False
+            has_overrange = False
+            for i in range(min(40, n_pts)):
+                px = cloud[i * 3]
+                py = cloud[i * 3 + 1]
+                if py < -100 and (px*px + py*py) > 40000:
+                    has_rear = True
+                if (px*px + py*py) > (self.max_range + 200)**2:
+                    has_overrange = True
+
+            now = time.time()
+            if ((self.fov_limited and has_rear) or has_overrange) and (now - self.last_sync_time > 1.0):
+                self.last_sync_time = now
+                print(f"[AUTO-SYNC] ESP32 ztratil nastavení (360°={has_rear}, nadlimit={has_overrange}) -> Vynucuji synchronizaci...")
+                self.sync_esp32_config()
+
+            # 2. Ochranné klientské vyčištění dat (pro případ, že ESP32 stihne poslat nefiltrovaný snímek)
+            max_r_sq = (self.max_range + 50) ** 2
+            filtered_cloud = []
+            for i in range(n_pts):
+                px = cloud[i * 3]
+                py = cloud[i * 3 + 1]
+                pi = cloud[i * 3 + 2]
+                if self.fov_limited and py < 0:
+                    continue
+                if (px*px + py*py) > max_r_sq:
+                    continue
+                filtered_cloud.extend([px, py, pi])
+            newest["cloud"] = filtered_cloud
+
+            filtered_walls = []
+            for w in newest.get("walls", []):
+                my = (w[1] + w[3]) * 0.5
+                mx = (w[0] + w[2]) * 0.5
+                if self.fov_limited and my < 0:
+                    continue
+                if (mx*mx + my*my) > max_r_sq:
+                    continue
+                filtered_walls.append(w)
+            newest["walls"] = filtered_walls
+
+            filtered_cands = []
+            for c in newest.get("candles", []):
+                cx, cy = c[0], c[1]
+                if self.fov_limited and cy < 0:
+                    continue
+                if (cx*cx + cy*cy) > max_r_sq:
+                    continue
+                filtered_cands.append(c)
+            newest["candles"] = filtered_cands
+
             self.last_frame = newest
 
             if not self.localizer.locked:
