@@ -650,6 +650,25 @@ class GlobalFieldMap:
         return route
 
 
+def draw_arrow(screen, color, p_start, p_end, width=3, tip_len=14, tip_width=8):
+    """Vykreslí orientovanou nájezdovou šipku s trojúhelníkovým hrotem."""
+    dx = p_end[0] - p_start[0]
+    dy = p_end[1] - p_start[1]
+    dist = math.hypot(dx, dy)
+    if dist < 6.0:
+        return
+    pygame.draw.line(screen, color, p_start, p_end, width)
+    ux = dx / dist
+    uy = dy / dist
+    nx = -uy
+    ny = ux
+    tip_base_x = p_end[0] - ux * tip_len
+    tip_base_y = p_end[1] - uy * tip_len
+    p1 = (int(tip_base_x + nx * tip_width), int(tip_base_y + ny * tip_width))
+    p2 = (int(tip_base_x - nx * tip_width), int(tip_base_y - ny * tip_width))
+    pygame.draw.polygon(screen, color, [p_end, p1, p2])
+
+
 # ============================================================
 #  Hlavní vícepanelový vizualizér
 # ============================================================
@@ -679,6 +698,8 @@ class DualLidarVisualizer:
         self.localizer = RobotLocalizer()
         self.field_map = GlobalFieldMap()
         self.processed_boxes = []
+        self.detect_details_enabled = False  # Klávesa [O] aktivuje jemnou detekci stěn a nájezdových cest
+        self.current_box_details = []
 
         pygame.init()
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -890,6 +911,196 @@ class DualLidarVisualizer:
 
         return final_boxes
 
+    def extract_box_details_and_approach(self, box, cloud_data, rx, ry, th_rad):
+        """
+        Geometrická analýza stěn a svíčky STRIKTNĚ UVNITŘ BOUNDING BOXU:
+        1. Vyfiltruje body z cloud_data uvnitř hranic boxu.
+        2. Proloží stěnu/stěny (RANSAC).
+        3. Určí přesný střed svíčky.
+        4. Vypočítá nájezdovou šipku o délce 38 cm a Approach Waypoint.
+        """
+        cos_t = math.cos(th_rad)
+        sin_t = math.sin(th_rad)
+
+        margin = 25.0
+        bx_min = box['min_x'] - margin
+        bx_max = box['max_x'] + margin
+        by_min = box['min_y'] - margin
+        by_max = box['max_y'] + margin
+
+        # 1. Výběr bodů striktně uvnitř tohoto boxu
+        local_pts = []
+        if cloud_data and len(cloud_data) >= 3:
+            n_cloud = len(cloud_data) // 3
+            for i in range(n_cloud):
+                px = cloud_data[i * 3]
+                py = cloud_data[i * 3 + 1]
+                if bx_min <= px <= bx_max and by_min <= py <= by_max:
+                    local_pts.append((px, py))
+
+        # Pomocná funkce převodu lokálního bodu na světový
+        def to_world(lx, ly):
+            wx = rx + lx * cos_t + ly * sin_t
+            wy = ry - lx * sin_t + ly * cos_t
+            return wx, wy
+
+        # Výchozí světová poloha středu boxu
+        w_cx, w_cy = to_world(box['cx'], box['cy'])
+
+        # Pokud máme málo bodů nebo malý box -> samostatná svíčka bez stěn
+        is_solo = box.get('is_solo', True) or len(local_pts) < 5 or box.get('span_mm', 0) < 150.0
+
+        if is_solo or len(local_pts) < 5:
+            # SAMOSTATNÁ SVÍČKA
+            c_cand_x = sum(p[0] for p in local_pts) / len(local_pts) if local_pts else box['cx']
+            c_cand_y = sum(p[1] for p in local_pts) / len(local_pts) if local_pts else box['cy']
+            cand_world = to_world(c_cand_x, c_cand_y)
+
+            # Vektor od robota ke svíčce
+            d_vec_x = cand_world[0] - rx
+            d_vec_y = cand_world[1] - ry
+            d_len = math.hypot(d_vec_x, d_vec_y)
+            if d_len > 10.0:
+                ux = d_vec_x / d_len
+                uy = d_vec_y / d_len
+            else:
+                ux, uy = 0.0, 1.0
+
+            arrow_len = 380.0  # 38 cm nájezdová šipka
+            wp_x = cand_world[0] - ux * arrow_len
+            wp_y = cand_world[1] - uy * arrow_len
+            travel_dist = math.hypot(wp_x - rx, wp_y - ry)
+
+            return {
+                'box': box,
+                'candle_world': cand_world,
+                'walls_world': [],
+                'waypoint_world': (wp_x, wp_y),
+                'arrow_start': (wp_x, wp_y),
+                'arrow_end': cand_world,
+                'travel_dist_mm': travel_dist,
+                'is_solo': True,
+                'is_corner': False
+            }
+
+        # PRO VĚTŠÍ BOX: Hledání stěn uvnitř boxu pomocí RANSAC (úsečka délky 120 až 340 mm)
+        best_wall = None
+        best_inliers = []
+
+        n_p = len(local_pts)
+        for i in range(min(n_p, 25)):
+            p1 = local_pts[i]
+            for j in range(i + 1, min(n_p, 25)):
+                p2 = local_pts[j]
+                seg_d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                if seg_d < 90.0:
+                    continue
+
+                inliers = []
+                for p in local_pts:
+                    dist = abs((p2[1] - p1[1]) * p[0] - (p2[0] - p1[0]) * p[1] + p2[0] * p1[1] - p2[1] * p1[0]) / seg_d
+                    if dist <= 22.0:
+                        inliers.append(p)
+
+                if len(inliers) > len(best_inliers):
+                    best_inliers = inliers
+                    best_wall = (p1, p2)
+
+        walls_world = []
+        is_corner = False
+        cand_world = (w_cx, w_cy)
+
+        if best_wall and len(best_inliers) >= 4:
+            p1, p2 = best_wall
+            dx = p2[0] - p1[0]; dy = p2[1] - p1[1]
+            seg_len = math.hypot(dx, dy)
+            ux = dx / seg_len; uy = dy / seg_len
+
+            projs = [((p[0] - p1[0]) * ux + (p[1] - p1[1]) * uy) for p in best_inliers]
+            min_t = min(projs); max_t = max(projs)
+
+            w1_start = (p1[0] + ux * min_t, p1[1] + uy * min_t)
+            w1_end   = (p1[0] + ux * max_t, p1[1] + uy * max_t)
+            walls_world.append((to_world(w1_start[0], w1_start[1]), to_world(w1_end[0], w1_end[1])))
+
+            outliers = [p for p in local_pts if p not in best_inliers]
+
+            if len(outliers) >= 4:
+                best_w2 = None
+                best_in2 = []
+                for i in range(len(outliers)):
+                    q1 = outliers[i]
+                    for j in range(i + 1, len(outliers)):
+                        q2 = outliers[j]
+                        qd = math.hypot(q2[0] - q1[0], q2[1] - q1[1])
+                        if qd < 80.0: continue
+                        in2 = [p for p in outliers if abs((q2[1] - q1[1]) * p[0] - (q2[0] - q1[0]) * p[1] + q2[0] * q1[1] - q2[1] * q1[0]) / qd <= 22.0]
+                        if len(in2) > len(best_in2):
+                            best_in2 = in2
+                            best_w2 = (q1, q2)
+
+                if best_w2 and len(best_in2) >= 3:
+                    is_corner = True
+                    q1, q2 = best_w2
+                    qdx = q2[0] - q1[0]; qdy = q2[1] - q1[1]
+                    qlen = math.hypot(qdx, qdy)
+                    qux = qdx / qlen; quy = qdy / qlen
+                    qprojs = [((p[0] - q1[0]) * qux + (p[1] - q1[1]) * quy) for p in best_in2]
+                    w2_start = (q1[0] + qux * min(qprojs), q1[1] + quy * min(qprojs))
+                    w2_end   = (q1[0] + qux * max(qprojs), q1[1] + quy * max(qprojs))
+                    walls_world.append((to_world(w2_start[0], w2_start[1]), to_world(w2_end[0], w2_end[1])))
+
+            cand_world = (w_cx, w_cy)
+
+            # Normála stěny 1
+            nx = -uy; ny = ux
+            mid_w_x = (w1_start[0] + w1_end[0]) * 0.5
+            mid_w_y = (w1_start[1] + w1_end[1]) * 0.5
+            if (mid_w_x * nx + mid_w_y * ny) > 0:
+                nx, ny = -nx, -ny
+
+            w_nx = nx * cos_t - ny * sin_t
+            w_ny = nx * sin_t + ny * cos_t
+            norm_len = math.hypot(w_nx, w_ny)
+            if norm_len > 0.01:
+                w_nx /= norm_len; w_ny /= norm_len
+
+            arrow_len = 380.0
+            wp_x = cand_world[0] - w_nx * arrow_len
+            wp_y = cand_world[1] - w_ny * arrow_len
+            travel_dist = math.hypot(wp_x - rx, wp_y - ry)
+
+            return {
+                'box': box,
+                'candle_world': cand_world,
+                'walls_world': walls_world,
+                'waypoint_world': (wp_x, wp_y),
+                'arrow_start': (wp_x, wp_y),
+                'arrow_end': cand_world,
+                'travel_dist_mm': travel_dist,
+                'is_solo': False,
+                'is_corner': is_corner
+            }
+        else:
+            d_vec_x = w_cx - rx; d_vec_y = w_cy - ry
+            d_len = math.hypot(d_vec_x, d_vec_y)
+            ux = d_vec_x / max(1.0, d_len); uy = d_vec_y / max(1.0, d_len)
+            arrow_len = 380.0
+            wp_x = w_cx - ux * arrow_len
+            wp_y = w_cy - uy * arrow_len
+            travel_dist = math.hypot(wp_x - rx, wp_y - ry)
+            return {
+                'box': box,
+                'candle_world': (w_cx, w_cy),
+                'walls_world': [],
+                'waypoint_world': (wp_x, wp_y),
+                'arrow_start': (wp_x, wp_y),
+                'arrow_end': (w_cx, w_cy),
+                'travel_dist_mm': travel_dist,
+                'is_solo': True,
+                'is_corner': False
+            }
+
     def read_serial(self):
         if not self.ser or not self.ser.is_open: return
         newest = None
@@ -1069,23 +1280,27 @@ class DualLidarVisualizer:
         row("Živé boxy (max 4):", f"{len(boxes_to_draw)} cílů", (0, 240, 160))
 
         # Ovládací HUD vlevo dole
-        cmd_panel = pygame.Surface((576, 95))
+        cmd_panel = pygame.Surface((576, 110))
         cmd_panel.set_alpha(220)
         cmd_panel.fill((10, 12, 16))
-        self.screen.blit(cmd_panel, (12, PANEL_H - 105))
-        pygame.draw.rect(self.screen, (55, 45, 30), (12, PANEL_H - 105, 576, 95), 1)
+        self.screen.blit(cmd_panel, (12, PANEL_H - 120))
+        pygame.draw.rect(self.screen, (55, 45, 30), (12, PANEL_H - 120, 576, 110), 1)
 
-        cy = PANEL_H - 99
-        self.screen.blit(self.font_bold.render("LADĚNÍ ZA BĚHU (PŘÍKAZY DO ESP32):", True, (240, 200, 80)), (22, cy)); cy += 20
+        cy = PANEL_H - 114
+        self.screen.blit(self.font_bold.render("LADĚNÍ ZA BĚHU (PŘÍKAZY DO ESP32):", True, (240, 200, 80)), (22, cy)); cy += 19
         fov_txt = "[F] FoV: 180° Kužel (Start)" if self.fov_limited else "[F] FoV: 360° Celé pole (V poli)"
         auto_badge = "[AUTO]" if self.auto_fov_enabled else ""
         freeze_txt = "[MEZERNÍK] ODMRAZIT" if self.frozen else "[MEZERNÍK] ZMRAZIT"
         c1 = self.font_main.render(f"{fov_txt} {auto_badge} | {freeze_txt}", True, (220, 220, 220))
         c2 = self.font_main.render(f"Rozsah: [R/E] Min: {self.min_range} mm | [T/G] Max: {self.max_range} mm", True, (170, 180, 195))
         c3 = self.font_main.render(f"Odrazivost: [I/K] Min Intenzita: {self.min_intensity} | [C] Resetovat mapy", True, (170, 180, 195))
-        self.screen.blit(c1, (22, cy)); cy += 17
-        self.screen.blit(c2, (22, cy)); cy += 17
-        self.screen.blit(c3, (22, cy))
+        det_col = (100, 255, 140) if self.detect_details_enabled else (180, 185, 195)
+        det_txt = "[ZAPNUTO - Stěny + Šipky 38cm]" if self.detect_details_enabled else "[VYPNUTO]"
+        c4 = self.font_bold.render(f"[O] Stěny & Nájezdy do svíček: {det_txt}", True, det_col)
+        self.screen.blit(c1, (22, cy)); cy += 16
+        self.screen.blit(c2, (22, cy)); cy += 16
+        self.screen.blit(c3, (22, cy)); cy += 16
+        self.screen.blit(c4, (22, cy))
 
         if self.selected_object:
             sel_panel = pygame.Surface((250, 60))
@@ -1316,6 +1531,56 @@ class DualLidarVisualizer:
             self.screen.blit(lbl1, (scx + 10, scy - 18))
             self.screen.blit(lbl2, (scx + 10, scy - 4))
 
+        # 5b. JEMNÁ DETEKCE STĚN, SVÍČEK A NÁJEZDOVÝCH ŠIPEK UVNITŘ BOUNDING BOXŮ (KLÁVESA [O])
+        self.current_box_details = []
+        if self.detect_details_enabled:
+            cloud_data = self.last_frame.get("cloud", [])
+            r_pos_scr = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
+
+            for idx, tb in enumerate(transformed_boxes):
+                cl = tb['box']
+                details = self.extract_box_details_and_approach(
+                    cl, cloud_data, loc.robot_x, loc.robot_y, math.radians(loc.robot_deg)
+                )
+                self.current_box_details.append(details)
+
+                wp_world = details['waypoint_world']
+                cand_world = details['candle_world']
+                wp_scr = self.to_screen(wp_world[0], wp_world[1], offset_x)
+                cand_scr = self.to_screen(cand_world[0], cand_world[1], offset_x)
+
+                # 1. Trasa od středu lidaru k Waypointu (nájezdovému bodu)
+                pygame.draw.line(self.screen, (0, 240, 255), r_pos_scr, wp_scr, 2)
+                mid_tr_x = (r_pos_scr[0] + wp_scr[0]) // 2
+                mid_tr_y = (r_pos_scr[1] + wp_scr[1]) // 2
+                lbl_path = self.font_bold.render(f"CESTA #{idx+1}: {int(details['travel_dist_mm'])} mm", True, (0, 255, 240))
+                self.screen.blit(lbl_path, (mid_tr_x + 6, mid_tr_y - 8))
+
+                # 2. Cílový bod nájezdu (Approach Waypoint - terčík)
+                pygame.draw.circle(self.screen, (0, 255, 200), wp_scr, 9, 2)
+                pygame.draw.circle(self.screen, (255, 230, 0), wp_scr, 4)
+                pygame.draw.line(self.screen, (0, 255, 200), (wp_scr[0] - 12, wp_scr[1]), (wp_scr[0] + 12, wp_scr[1]), 1)
+                pygame.draw.line(self.screen, (0, 255, 200), (wp_scr[0], wp_scr[1] - 12), (wp_scr[0], wp_scr[1] + 12), 1)
+                self.screen.blit(self.font_bold.render(f"NÁJEZD #{idx+1}", True, (0, 255, 220)), (wp_scr[0] + 12, wp_scr[1] - 8))
+
+                # 3. Nájezdová šipka 38 cm mířící do plamene svíčky
+                draw_arrow(self.screen, (255, 75, 40), wp_scr, cand_scr, width=4, tip_len=18, tip_width=9)
+
+                # 4. Detekované stěny uvnitř boxu
+                for w_seg in details['walls_world']:
+                    wp1 = self.to_screen(w_seg[0][0], w_seg[0][1], offset_x)
+                    wp2 = self.to_screen(w_seg[1][0], w_seg[1][1], offset_x)
+                    pygame.draw.line(self.screen, (255, 250, 130), wp1, wp2, 5)
+                    pygame.draw.circle(self.screen, (255, 255, 255), wp1, 3)
+                    pygame.draw.circle(self.screen, (255, 255, 255), wp2, 3)
+
+                # 5. Detekovaná svíčka (plamínek / kruh)
+                pygame.draw.circle(self.screen, (255, 50, 30), cand_scr, 8)
+                pygame.draw.circle(self.screen, (255, 220, 0), cand_scr, 5)
+                pygame.draw.circle(self.screen, (255, 255, 255), cand_scr, 2)
+                type_tag = "ROH" if details['is_corner'] else ("STĚNA" if not details['is_solo'] else "VOLNÁ")
+                self.screen.blit(self.font_bold.render(f"🔥 SVÍČKA [{type_tag}] #{idx+1}", True, (255, 215, 60)), (cand_scr[0] + 10, cand_scr[1] + 8))
+
         # 6. TRAJEKTORIE ROBOTA
         if len(loc.trajectory) >= 2:
             traj_px = [self.to_screen(tp[0], tp[1], offset_x) for tp in loc.trajectory]
@@ -1376,8 +1641,9 @@ class DualLidarVisualizer:
         err = match.get('avg_error', 0.0) if match else 0.0
         dist_from_start = math.hypot(loc.robot_x, loc.robot_y)
         fov_tag = "360° V POLI" if not self.fov_limited else "180° START"
+        opt_tag = " [O: NÁJEZDY ZAPNUTY]" if self.detect_details_enabled else " [O: NÁJEZDY Vypnuty]"
 
-        self.screen.blit(self.font_big.render(f"3. SHODA [{fov_tag}]: {pat_name}", True, (80, 255, 160)), (offset_x + 25, 17))
+        self.screen.blit(self.font_big.render(f"3. SHODA [{fov_tag}]{opt_tag}: {pat_name}", True, (255, 200, 60) if self.detect_details_enabled else (80, 255, 160)), (offset_x + 25, 17))
         sub_str = f"Inliery: {inliers} | Kotvy: {len(matched_anchors)}/6 | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
         self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 38))
 
@@ -1387,8 +1653,9 @@ class DualLidarVisualizer:
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
-        self.screen.blit(self.font_main.render("• Prioritní boost očekávaných svíček v hřišti & záchrana ze surového mračna bodů", True, (0, 230, 240)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• Objekty vně mantinelu jsou vyřazeny, skutečné svíčky mají vždy přednost!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_bold.render("DRUHÁ STATICKÁ MAPA & NÁJEZDOVÉ ŠIPKY (KLÁVESA [O]):", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Červené šipky = nájezdové vektory 38 cm ze správného směru přímo do svíčky", True, (255, 120, 80)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Tyrkysové čáry = trasy od lidaru k bodům nájezdu (stěny a svíčky striktně v boxech)", True, (0, 240, 255)), (offset_x + 25, PANEL_H - 43))
 
     # ========================================================
     #  PANEL 4: OBDÉLNÍKOVÁ MAPA CELÉHO HŘIŠTĚ (KUMULATIVNÍ CÍLE)
@@ -1502,6 +1769,36 @@ class DualLidarVisualizer:
             lbl_tag = f"C{idx+1}" if is_vis else f"C{idx+1} [Z]"
             lbl_col = (255, 230, 180) if is_vis else (180, 170, 120)
             self.screen.blit(self.font_bold.render(lbl_tag, True, lbl_col), (csx + bw // 2 + 3, csy - 7))
+
+        # Vykreslení stěn, svíček a nájezdových šipek přímo v poli (pokud je [O] aktivní)
+        if self.detect_details_enabled and self.current_box_details:
+            r_pos = fm.robot_pos
+            r_sx, r_sy = f_to_screen(r_pos[0], r_pos[1])
+            for idx, det in enumerate(self.current_box_details):
+                wp_w = det['waypoint_world']
+                cand_w = det['candle_world']
+                wp_s = f_to_screen(wp_w[0], wp_w[1])
+                cand_s = f_to_screen(cand_w[0], cand_w[1])
+
+                # Trasa od robota k Waypointu
+                pygame.draw.line(self.screen, (0, 240, 255), (r_sx, r_sy), wp_s, 2)
+
+                # Terčík waypointu
+                pygame.draw.circle(self.screen, (0, 255, 200), wp_s, 5, 1)
+                pygame.draw.circle(self.screen, (255, 230, 0), wp_s, 2)
+
+                # Nájezdová šipka
+                draw_arrow(self.screen, (255, 75, 40), wp_s, cand_s, width=2, tip_len=8, tip_width=4)
+
+                # Stěny uvnitř boxu
+                for w_seg in det['walls_world']:
+                    ws1 = f_to_screen(w_seg[0][0], w_seg[0][1])
+                    ws2 = f_to_screen(w_seg[1][0], w_seg[1][1])
+                    pygame.draw.line(self.screen, (255, 250, 130), ws1, ws2, 3)
+
+                # Svíčka (střed)
+                pygame.draw.circle(self.screen, (255, 50, 30), cand_s, 4)
+                pygame.draw.circle(self.screen, (255, 220, 0), cand_s, 2)
 
         # Tlačítka startovní stěny pod grafickým obdélníkem
         w_active = fm.start_wall_mode
@@ -1672,6 +1969,10 @@ class DualLidarVisualizer:
                     elif event.key == pygame.K_p:
                         m = self.field_map.toggle_start_wall()
                         print(f"[HŘIŠTĚ] Startovní stěna přepnuta na: {m}.{4 if m==2 else 5} m")
+                    elif event.key == pygame.K_o:
+                        self.detect_details_enabled = not self.detect_details_enabled
+                        st = "ZAPNUTA" if self.detect_details_enabled else "VYPNUTA"
+                        print(f"[DETAIL] Jemná detekce svíček, stěn a nájezdových cest: {st}")
 
                     elif event.key == pygame.K_r:
                         self.min_range = min(1000, self.min_range + 50)
