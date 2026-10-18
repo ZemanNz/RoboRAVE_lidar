@@ -1111,8 +1111,9 @@ class DualLidarVisualizer:
         self.running = True
         self.frozen = False
 
-        # Výchozí nastavení: 180° dopředný kužel a rozsah 2400 mm ("2 metry něco")
+        # Výchozí nastavení: 180° dopředný kužel pro čistý etalon na startu a rozsah 2400 mm
         self.fov_limited = True
+        self.auto_fov_enabled = True  # Automaticky: 180° na startu u zdi -> 360° po zamknutí a vyjetí do pole
         self.min_range = 130
         self.max_range = 2400
         self.min_intensity = 15
@@ -1167,13 +1168,15 @@ class DualLidarVisualizer:
             except: pass
 
     def sync_esp32_config(self):
-        """Vynutí odeslání nastavení FoV (180°), rozsahu a odrazivosti do ESP32."""
+        """Vynutí odeslání nastavení FoV (180° vs 360°), rozsahu a odrazivosti do ESP32."""
         self.send_cmd(f"FOV {1 if self.fov_limited else 0}")
         self.send_cmd(f"RANGE {self.min_range} {self.max_range}")
         self.send_cmd(f"INTENSITY {self.min_intensity}")
 
     def on_parameter_changed(self):
         """Vždy při změně parametrů (FoV/dosah/intenzita) se vygeneruje čistá nová mapa."""
+        if not self.localizer.locked:
+            self.fov_limited = True  # Na startu vždy 180° dopředu
         self.sync_esp32_config()
         self.ref_model.reset()
         self.curr_model.reset()
@@ -1516,11 +1519,11 @@ class DualLidarVisualizer:
         # ============================================================
         # 1. TELEMETRICKÝ PANEL (V LEVÉM HORNÍM ROHU)
         # ============================================================
-        panel = pygame.Surface((260, 200))
+        panel = pygame.Surface((260, 218))
         panel.set_alpha(215)
         panel.fill((10, 12, 16))
         self.screen.blit(panel, (12, 12))
-        pygame.draw.rect(self.screen, (30, 45, 60), (12, 12, 260, 200), 1)
+        pygame.draw.rect(self.screen, (30, 45, 60), (12, 12, 260, 218), 1)
 
         f = self.last_frame
         fps      = f.get("fps", 0.0)
@@ -1545,6 +1548,9 @@ class DualLidarVisualizer:
 
         row("Frekvence skenu:", f"{fps:.1f} Hz", (100, 255, 120) if fps > 4.5 else (255, 150, 0))
         row("Filtrované body:", f"{pts} bodů")
+        fov_str = "180° [START]" if self.fov_limited else "360° [V POLI]"
+        fov_col = (0, 220, 255) if self.fov_limited else (100, 255, 120)
+        row("Zorné pole (FoV):", fov_str, fov_col)
         row("Výpočet ESP32:", f"{calc_us/1000.0:.2f} ms", (0, 220, 255))
         row("Volná RAM ESP32:", f"{heap // 1024} kB")
         row("CRC8 Chyby:", f"{crc_err}", (255, 80, 80) if crc_err > 0 else (120, 200, 120))
@@ -1564,10 +1570,11 @@ class DualLidarVisualizer:
         h_title = self.font_bold.render("LADĚNÍ ZA BĚHU (PŘÍKAZY DO ESP32):", True, (240, 200, 80))
         self.screen.blit(h_title, (22, cy)); cy += 20
 
-        fov_txt = "[F] Režim: 180° Kužel" if self.fov_limited else "[F] Režim: 360° Celé pole"
-        freeze_txt = "[MEZERNÍK] ODMRAZIT" if self.frozen else "[MEZERNÍK] ZMRAZIT SKEN"
+        fov_txt = "[F] FoV: 180° Kužel (Start)" if self.fov_limited else "[F] FoV: 360° Celé pole (V poli)"
+        auto_badge = "[AUTO]" if self.auto_fov_enabled else ""
+        freeze_txt = "[MEZERNÍK] ODMRAZIT" if self.frozen else "[MEZERNÍK] ZMRAZIT"
         
-        c1 = self.font_main.render(f"{fov_txt} | {freeze_txt}", True, (220, 220, 220))
+        c1 = self.font_main.render(f"{fov_txt} {auto_badge} | {freeze_txt}", True, (220, 220, 220))
         c2 = self.font_main.render(f"Rozsah: [R/E] Min: {self.min_range} mm | [T/G] Max: {self.max_range} mm", True, (170, 180, 195))
         c3 = self.font_main.render(f"Odrazivost: [I/K] Min Intenzita: {self.min_intensity}", True, (170, 180, 195))
         self.screen.blit(c1, (22, cy)); cy += 17
@@ -1755,9 +1762,9 @@ class DualLidarVisualizer:
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (50, 45, 30), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
-        self.screen.blit(self.font_bold.render("REFERENČNÍ MAPA HŘIŠTĚ:", True, (240, 200, 80)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Slouží jako pevný souřadnicový systém vygenerovaný na výchozím místě robota.", True, (200, 210, 225)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• [L] Zamknout mapu jako etalon | [C] Resetovat a sbírat znovu", True, (150, 160, 180)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_bold.render("REFERENČNÍ ETALON (START 180°):", True, (240, 200, 80)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Čistý sken 180° dopředu ze startovní zdi eliminuje nežádoucí odrazy za polem.", True, (200, 210, 225)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• [L] Zamknout etalon -> automaticky aktivuje 360° plný rozhled v poli!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
 
     def draw_right_comparison(self):
         """3. PANEL: Nová statická mapa & Porovnání s referenční mapou a rozhodovací prvky."""
@@ -1985,12 +1992,13 @@ class DualLidarVisualizer:
 
         inliers_cnt = match.get('inliers', 0)
         avg_err_val = match.get('avg_error', 0.0)
+        fov_tag = "360° V POLI" if not self.fov_limited else "180° START"
 
         if is_ready:
-            t_stat = self.font_big.render(f"3. SHODA: {pattern_name}", True, (80, 255, 160))
+            t_stat = self.font_big.render(f"3. SHODA [{fov_tag}]: {pattern_name}", True, (80, 255, 160))
             sub_str = f"Inliery: {inliers_cnt} | Chyba: {avg_err_val:.1f} mm | Od startu: {dist_from_start:.0f} mm (skenů: {self.curr_model.total_scans})"
         else:
-            t_stat = self.font_big.render("3. NOVÁ MAPA: SBÍRÁM A POROVNÁVÁM...", True, (240, 200, 60))
+            t_stat = self.font_big.render(f"3. NOVÁ MAPA [{fov_tag}]: SBÍRÁM...", True, (240, 200, 60))
             sub_str = f"Skeny: {self.curr_model.total_scans}/6 | Svíčky: {len(curr_cands)} | Stěny: {len(curr_walls)} | Hledám kotvy..."
 
         self.screen.blit(t_stat, (offset_x + 25, 17))
@@ -2012,8 +2020,8 @@ class DualLidarVisualizer:
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
-        self.screen.blit(self.font_bold.render("HIERARCHICKÉ KOTVY A POROVNÁNÍ MAP:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Zlatá: KOTVA 1 (Primární) | Oranžová: KOTVA 2 (Záloha) | Tyrkys: Trojúhelník", True, (240, 220, 80)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_bold.render("HIERARCHICKÉ KOTVY A 360° ROZHLED V POLI:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Robot v poli vidí 360° dokola (svíčky i mantinely před i za sebou)!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 61))
         self.screen.blit(self.font_main.render("• [N] Reset a nový sběr na této pozici | [L] Odemknout/Zamknout výchozí start", True, (160, 200, 225)), (offset_x + 25, PANEL_H - 43))
 
     def draw_field_map(self):
@@ -2281,7 +2289,9 @@ class DualLidarVisualizer:
         r_y += 15
         self.screen.blit(self.font_main.render("• [3] nebo [š]: Start u DELŠÍ stěny 3.5 m", True, (100, 255, 140)), (right_x, r_y))
         r_y += 15
-        self.screen.blit(self.font_main.render("• [P]: Přepnout stěnu 2.4 m <-> 3.5 m | [L]: Zamknout etalon", True, (200, 215, 230)), (right_x, r_y))
+        self.screen.blit(self.font_main.render("• [L]: Zamknout etalon (180°) -> v poli automaticky 360°", True, (80, 255, 160)), (right_x, r_y))
+        r_y += 15
+        self.screen.blit(self.font_main.render("• [F]: Ruční přepnutí 180° / 360° | [P]: Přepnout stěnu", True, (200, 215, 230)), (right_x, r_y))
         r_y += 15
         self.screen.blit(self.font_main.render("• [N]: Reset nové mapy na pozici | [C]: Reset všeho", True, (160, 175, 195)), (right_x, r_y))
 
@@ -2306,9 +2316,15 @@ class DualLidarVisualizer:
                     elif event.key in [pygame.K_c, pygame.K_m]:
                         self.on_parameter_changed()
                     elif event.key == pygame.K_f:
+                        # MANUÁLNÍ PŘEPNUTÍ ZORNÉHO ÚHLU (FoV 180° <-> 360°)
                         self.fov_limited = not self.fov_limited
                         self.send_cmd(f"FOV {1 if self.fov_limited else 0}")
-                        self.on_parameter_changed()
+                        mode_str = "180° Dopředný kužel (start)" if self.fov_limited else "360° Plný rozhled (v poli)"
+                        print(f"[FoV] Ručně přepnuto na: {mode_str}")
+                        if not self.localizer.locked:
+                            self.ref_model.reset()
+                        else:
+                            self.curr_model.reset()
                     elif event.key == pygame.K_r:
                         self.min_range = min(1000, self.min_range + 50)
                         self.send_cmd(f"RANGE {self.min_range} {self.max_range}")
@@ -2363,8 +2379,15 @@ class DualLidarVisualizer:
                                 self.field_map.reset()
                                 self.field_map.ingest_candles(cc)
                                 self.field_map.ingest_walls(cw)
-                                print(f"[LOC] Stará mapa zamčena jako referenční etalon ({n_lm} landmarků).")
-                                print(f"[LOC] Zahajuji sběr Nové stabilní mapy a kumulativní mapování hřiště...")
+                                print(f"[LOC] Stará mapa zamčena jako referenční etalon ({n_lm} landmarků z 180° skenu).")
+
+                                # AUTOMATICKÉ PŘEPNUTÍ NA 360° ROZHLED V POLI
+                                if self.auto_fov_enabled and self.fov_limited:
+                                    self.fov_limited = False
+                                    self.send_cmd("FOV 0")
+                                    print("[FoV AUTO] Robot vyjíždí do pole -> Automaticky aktivuji 360° PLNÝ ROZHLED!")
+
+                                print(f"[LOC] Zahajuji sběr Nové stabilní mapy v 360° a kumulativní mapování hřiště...")
                             else:
                                 print(f"[LOC] Nedostatek landmarků ({n_lm}) – nechte stabilizovat starou mapu na startu.")
                         else:
@@ -2372,6 +2395,13 @@ class DualLidarVisualizer:
                             self.ref_model.reset()
                             self.curr_model.reset()
                             self.field_map.reset()
+
+                            # AUTOMATICKÝ NÁVRAT DO 180° KUŽELU NA STARTU
+                            if self.auto_fov_enabled and not self.fov_limited:
+                                self.fov_limited = True
+                                self.send_cmd("FOV 1")
+                                print("[FoV AUTO] Návrat na start u zdi -> Automaticky aktivuji 180° DOPŘEDNÝ KUŽEL!")
+
                             print("[LOC] Mapa odemčena. Můžete znovu nasbírat původní etalon na startu.")
 
                     elif event.key == pygame.K_n:
