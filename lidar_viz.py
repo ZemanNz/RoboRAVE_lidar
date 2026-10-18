@@ -645,11 +645,10 @@ class StableFieldModel:
                 c_copy = dict(c)
                 c_copy['walls_count'] = walls_within_25cm
                 c_copy['closest_wall_dist'] = closest_dist
-                # Skóre: svíčky s více stěnami (2-3) mají nejvyšší jistotu, volná svíčka má garantovanou hodnotu
-                if walls_within_25cm == 0:
-                    score = 2200.0 + c['hits'] * 10.0  # Volná svíčka v poli (vždy musí být právě 1!)
-                else:
-                    score = walls_within_25cm * 2000.0 + c['hits'] * 10.0 + max(0.0, 250.0 - closest_dist)
+                # Skóre: přednost mají svíčky se stěnou (2 stěny > 1 stěna > 0 stěn)
+                score = walls_within_25cm * 2000.0 + c['hits'] * 10.0
+                if walls_within_25cm > 0:
+                    score += max(0.0, 250.0 - closest_dist)
                 c_copy['score'] = score
                 candidates.append(c_copy)
 
@@ -691,46 +690,32 @@ class StableFieldModel:
         # Seřadíme sestupně podle skóre
         candidates.sort(key=lambda x: x['score'], reverse=True)
 
-        # Výběr s pravidly soutěže Kybernoid:
-        # 1. Rozestup svíček alespoň 80 cm (780 mm)
-        # 2. PŘESNĚ JEDNA svíčka bez stěny (max 1 volná, max 3 se stěnou!)
+        # Výběr s pravidly:
+        # 1. Rozestup svíček alespoň 80 cm (800 mm)
+        # 2. Maximálně JEDNA svíčka bez stěny (dvě svíčky bez stěny nemohou být)
         filtered = []
         isolated_count = 0
-        walled_count = 0
-        rejected_excess_walled = []
 
         for cand in candidates:
             if len(filtered) >= 4:
                 break
 
             is_isolated = (cand['walls_count'] == 0)
-
-            # Pravidlo 1: Maximálně 1 svíčka bez stěny v poli
-            if is_isolated:
-                if isolated_count >= 1:
-                    continue
-            else:
-                # Pravidlo 2: Maximálně 3 svíčky se stěnou (4. se stěnou nesmí vytlačit volnou svíčku!)
-                if walled_count >= 3:
-                    rejected_excess_walled.append(cand)
-                    continue
+            if is_isolated and isolated_count >= 1:
+                # Už máme jednu samostatnou svíčku bez stěny, další bez stěny je vyloučena!
+                continue
 
             # Kontrola vzdálenosti 80 cm od už vybraných
-            too_close = any(math.hypot(cand['x'] - f['x'], cand['y'] - f['y']) < 780.0 for f in filtered)
+            too_close = False
+            for f in filtered:
+                if math.hypot(cand['x'] - f['x'], cand['y'] - f['y']) < 800.0:
+                    too_close = True
+                    break
+
             if not too_close:
                 if is_isolated:
                     isolated_count += 1
-                else:
-                    walled_count += 1
                 filtered.append(cand)
-            elif not is_isolated:
-                rejected_excess_walled.append(cand)
-
-        # Penalizace / útlum pravděpodobnosti pro nadbytečné svíčky se stěnou v dlouhodobé mapě
-        for rej in rejected_excess_walled:
-            for sc in self.candles:
-                if math.hypot(sc['x'] - rej['x'], sc['y'] - rej['y']) < 70.0:
-                    sc['hits'] = max(1, int(sc['hits'] * 0.85))
 
         return filtered
 
@@ -948,13 +933,24 @@ class GlobalFieldMap:
                 gc['walls_count'] = max(gc.get('walls_count', 0), c.get('walls_count', 0))
                 matched.add(best_idx)
             else:
-                if len(self.candles) < 8:
+                if len(self.candles) < 16:
                     self.candles.append({
                         'x': cx, 'y': cy,
                         'hits': c.get('hits', 1),
                         'walls_count': c.get('walls_count', 0),
                         'source': 'sensor'
                     })
+
+        # Pravidelná jemná údržba dlouhodobé mapy (jednou za 30 reálných měření):
+        # Odstranění zbloudilých bodů s nízkým počtem hitů, pokud se paměť zaplňuje
+        if self.total_updates % 30 == 0 and len(self.candles) > 8:
+            xmin, xmax, ymin, ymax = self.get_auto_field_bounds()
+            survivors = []
+            for gc in self.candles:
+                in_field = (xmin - 150.0 <= gc['x'] <= xmax + 150.0 and ymin - 150.0 <= gc['y'] <= ymax + 150.0)
+                if gc['hits'] >= 3 or in_field:
+                    survivors.append(gc)
+            self.candles = survivors
 
     def ingest_walls(self, walls_abs):
         """
@@ -999,16 +995,21 @@ class GlobalFieldMap:
 
     def get_field_candles(self, max_count=4):
         """
-        Vrátí nejvýše max_count svíček po aplikaci:
-          1. Přísného prostorového filtru (pouze svíčky UVNITŘ hřiště).
-          2. Fialového koridoru stěn (svíčka nesmí ležet v ose stěny).
-          3. Pravidel soutěže (rozestup min 800 mm, max 1 volná svíčka bez stěny).
+        Vrátí nejvýše max_count (4) svíček po aplikaci dlouhodobé strategie v obdélníku hřiště:
+          1. Přísný prostorový filtr (pouze svíčky UVNITŘ hřiště).
+          2. Fialový koridor stěn (svíčka nesmí ležet v ose stěny).
+          3. Skladba soutěže Kybernoid v poli:
+             - Max 3 svíčky se stěnou (walls_count >= 1)
+             - Max 1 volná svíčka bez stěny (walls_count == 0)
+             - Rozestup mezi svíčkami min 780 mm
+          4. Výpočet reálné pravděpodobnosti/jistoty pro každou svíčku bez mutace dat.
         """
         xmin, xmax, ymin, ymax = self.get_auto_field_bounds()
         margin = 35.0  # Bezpečnostní okraj od obvodových stěn
 
         good_walls = self.get_field_walls()
-        candidates = []
+        walled_pool = []
+        isolated_pool = []
         rejected_outside = 0
 
         for c in self.candles:
@@ -1050,56 +1051,58 @@ class GlobalFieldMap:
 
             if not in_wall:
                 walls_cnt = max(c.get('walls_count', 0), walls_near)
-                # Volná svíčka (walls_cnt == 0) musí mít férové skóre (2200 + hits*10),
-                # aby ji nepřebily falešné odrazy se stěnou (walls_near == 1)!
-                if walls_cnt == 0:
-                    score = 2200.0 + c['hits'] * 10.0
-                else:
-                    score = walls_cnt * 2000.0 + c['hits'] * 10.0
-
-                candidates.append({
-                    'x': c['x'], 'y': c['y'],
+                cand_info = {
+                    'x': c['x'],
+                    'y': c['y'],
                     'hits': c['hits'],
-                    'walls_count': walls_cnt,
-                    'score': score
-                })
+                    'walls_count': walls_cnt
+                }
+                if walls_cnt > 0:
+                    # Svíčky u stěny: skóre podle počtu stěn a hitů
+                    cand_info['score'] = walls_cnt * 2000.0 + c['hits'] * 10.0
+                    walled_pool.append(cand_info)
+                else:
+                    # Volná svíčka bez stěny
+                    cand_info['score'] = c['hits'] * 10.0
+                    isolated_pool.append(cand_info)
 
         self.rejected_outside_count = rejected_outside
-        candidates.sort(key=lambda x: x['score'], reverse=True)
 
-        # 3. VÝBĚR S PRAVIDLY: rozestup min 800 mm, PŘESNĚ JEDNA volná svíčka bez stěny a max 3 se stěnou
+        # Seřadíme oba pooly podle kvality
+        walled_pool.sort(key=lambda x: x['score'], reverse=True)
+        isolated_pool.sort(key=lambda x: x['score'], reverse=True)
+
         selected = []
-        isolated_count = 0
-        walled_count = 0
-        rejected_excess_walled = []
 
-        for cand in candidates:
+        # A. Výběr svíček se stěnou: maximálně 3 do hřiště (čtvrtá je z pravidel vyloučena!)
+        for cand in walled_pool:
+            if len(selected) >= 3:
+                cand['status'] = 'excess_walled'
+                cand['prob'] = max(5, min(25, int(cand['hits'] * 0.5)))
+                continue
+
+            too_close = any(math.hypot(cand['x'] - s['x'], cand['y'] - s['y']) < 780.0 for s in selected)
+            if not too_close:
+                cand['status'] = 'confirmed_walled'
+                if cand['walls_count'] >= 2:
+                    cand['prob'] = min(99, 70 + min(28, cand['hits'] * 2))
+                else:
+                    cand['prob'] = min(92, 45 + min(45, cand['hits'] * 2))
+                selected.append(cand)
+            else:
+                cand['status'] = 'conflict_distance'
+                cand['prob'] = max(5, min(20, int(cand['hits'] * 0.3)))
+
+        # B. Výběr volné svíčky v prostoru: maximálně 1 v hřišti
+        for cand in isolated_pool:
             if len(selected) >= max_count:
                 break
-            is_iso = (cand['walls_count'] == 0)
-            if is_iso:
-                if isolated_count >= 1:
-                    continue
-            else:
-                if walled_count >= 3:
-                    rejected_excess_walled.append(cand)
-                    continue
-
-            too_close = any(math.hypot(cand['x'] - s['x'], cand['y'] - s['y']) < 800.0 for s in selected)
+            too_close = any(math.hypot(cand['x'] - s['x'], cand['y'] - s['y']) < 780.0 for s in selected)
             if not too_close:
-                if is_iso:
-                    isolated_count += 1
-                else:
-                    walled_count += 1
+                cand['status'] = 'confirmed_isolated'
+                cand['prob'] = min(95, 50 + min(45, cand['hits'] * 3))
                 selected.append(cand)
-            elif not is_iso:
-                rejected_excess_walled.append(cand)
-
-        # Penalizace / útlum pravděpodobnosti pro nadbytečné svíčky se stěnou v dlouhodobé globální mapě
-        for rej in rejected_excess_walled:
-            for gc in self.candles:
-                if math.hypot(gc['x'] - rej['x'], gc['y'] - rej['y']) < 70.0:
-                    gc['hits'] = max(1, int(gc['hits'] * 0.85))
+                break  # V hřišti je PŘESNĚ JEDNA volná svíčka
 
         return selected
 
@@ -2142,12 +2145,14 @@ class DualLidarVisualizer:
         for idx, c in enumerate(field_candles):
             csx, csy = f_to_screen(c['x'], c['y'])
             has_wall = c.get('walls_count', 0) > 0
-            ring_col = (255, 150, 60) if has_wall else (255, 60, 60)
-            pygame.draw.circle(self.screen, (40, 10, 10), (csx, csy), 10)
+            ring_col = (255, 150, 60) if has_wall else (0, 220, 255)
+            core_col = (255, 40, 40) if has_wall else (0, 180, 240)
+            pygame.draw.circle(self.screen, (20, 20, 30), (csx, csy), 10)
             pygame.draw.circle(self.screen, ring_col, (csx, csy), 9, 2)
-            pygame.draw.circle(self.screen, (255, 40, 40), (csx, csy), 5)
+            pygame.draw.circle(self.screen, core_col, (csx, csy), 5)
             pygame.draw.circle(self.screen, (255, 255, 200), (csx, csy), 2)
-            lbl_c = self.font_bold.render(f"S{idx+1}", True, (255, 230, 180))
+            lbl_col = (255, 230, 180) if has_wall else (180, 240, 255)
+            lbl_c = self.font_bold.render(f"S{idx+1}", True, lbl_col)
             self.screen.blit(lbl_c, (csx + 10, csy - 7))
 
         # START pozice [0, 0]
@@ -2289,7 +2294,8 @@ class DualLidarVisualizer:
                 else:
                     wt = "[VOLNÁ V PROSTORU (0 stěn)]"
                     w_col = (0, 220, 255)
-                txt = f"S{i+1}: X={c['x']:+.0f} mm, Y={c['y']:+.0f} mm  {wt}  (hitů: {c['hits']})"
+                prob_str = f"  (jistota: {c.get('prob', 90)}%, hitů: {c['hits']})"
+                txt = f"S{i+1}: X={c['x']:+.0f} mm, Y={c['y']:+.0f} mm  {wt}{prob_str}"
                 self.screen.blit(self.font_main.render(txt, True, w_col), (mid_x, t_y))
                 t_y += 15
 
