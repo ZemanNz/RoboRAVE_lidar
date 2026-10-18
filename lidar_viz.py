@@ -719,38 +719,6 @@ class StableFieldModel:
 
         return filtered
 
-    def get_candidate_candles(self):
-        """Vrátí svíčky v šedé zóně (1 <= hits < 4), které neleží v koridoru stěny."""
-        soft = [c for c in self.candles if 1 <= c.get('hits', 0) < 4 and c.get('missed', 0) <= 6]
-        conf_walls = self.get_confirmed_walls()
-        candidates = []
-        for c in soft:
-            in_wall = False
-            for w in conf_walls:
-                dx = w['x2'] - w['x1']
-                dy = w['y2'] - w['y1']
-                L = math.hypot(dx, dy)
-                if L < 10.0: continue
-                ux = dx / L
-                uy = dy / L
-                nx = -uy
-                ny = ux
-                vx = c['x'] - w['x1']
-                vy = c['y'] - w['y1']
-                proj_t = vx * ux + vy * uy
-                d_perp = abs(vx * nx + vy * ny)
-                if d_perp <= 55.0 and -150.0 <= proj_t <= L + 150.0:
-                    in_wall = True
-                    break
-            if not in_wall:
-                candidates.append(dict(c))
-        return candidates
-
-    def get_candidate_walls(self):
-        """Vrátí stěny v šedé zóně (1 <= hits < 4)."""
-        soft = [w for w in self.walls if 1 <= w.get('hits', 0) < 4 and w.get('missed', 0) <= 6]
-        return [dict(w) for w in soft]
-
     def get_confirmed_walls(self):
         valid = [w for w in self.walls if w['hits'] >= 4]
         valid.sort(key=lambda w: w['hits'], reverse=True)
@@ -806,25 +774,18 @@ class GlobalFieldMap:
     """
     Kumulativní mapa celého hřiště v absolutních souřadnicích (START = [0,0]).
     Sbírá svíčky a stěny postupně, jak robot objíždí hřiště.
-    Dynamicky napasovává obdélník pole podle zvolené startovní stěny (2.4 m nebo 3.5 m).
-    
-    Klíčové vlastnosti:
-      - ZPEVNĚNÍ HŘIŠTĚ (Field Anchor Locking): Po stisku [L] na startu se pole pevně
-        uzamkne a drží v prostoru bez jakéhokoliv přeskakování či posouvání.
-      - PRAVIDLO MIN. 20 cm OD MANTINELU: Svíčky jsou vždy alespoň 200 mm od stěn hřiště.
-        Jakýkoliv odraz na čáře mantinelu je striktně vyřazen (Wall-Edge Reject).
-      - DVOJÍ DETEKCE & MULTI-VIEW PRAVDĚPODOBNOSTNÍ FÚZE:
-        * Tier 1 (Potvrzené svíčky): P >= 0.52 a hits >= 2 (max 4 svíčky).
-        * Tier 2 (Kandidáti v šedé zóně): P >= 0.20, měkké hypotézy čekající na další důkaz.
-        * Multi-view bonus: Když robot spatří objekt z nového stanoviště (>160 mm od
-          dřívějších úhlů pohledu), pravděpodobnost skokově vzroste a kandidát je povýšen!
+    Dynamicky napasovává obdélník pole podle zvolené startovní stěny (2.4 m nebo 3.5 m)
+    a polohy detekovaných svíček tak, aby všechny platné svíčky ležely uvnitř pole.
+    Vynucuje pravidla soutěže:
+      - Pouze objekty UVNITŘ napasovaného pole (co je vně, není svíčka/stěna)
+      - Max 4 svíčky (rozestup min 800 mm, max 1 bez stěny)
+      - Max 6 stěn (nepřekrývající se)
+      - Svíčka nesmí ležet v koridoru stěny
     """
 
-    CANDLE_WALL_MIN_DIST = 190.0  # mm: Pravidlo min. 20 cm od mantinelů hřiště (s tolerancí LIDAR šumu)
-
     def __init__(self):
-        self.candles = []               # Seznam pravděpodobnostních hypotéz svíček
-        self.walls = []                 # Seznam stěn hřiště
+        self.candles = []      # [{'x': float, 'y': float, 'hits': int, 'walls_count': int, ...}]
+        self.walls = []        # [{'x1','y1','x2','y2','mx','my','len','hits': int}]
         self.robot_start = (0.0, 0.0)   # Výchozí pozice START
         self.robot_pos = (0.0, 0.0)     # Aktuální pozice
         self.robot_deg = 0.0            # Aktuální natočení
@@ -832,47 +793,23 @@ class GlobalFieldMap:
         self.total_updates = 0
         self.start_wall_mode = 2        # 2 = 2.4 m (Kratší stěna), 3 = 3.5 m (Delší stěna)
         self.smooth_bounds = None       # [xmin, xmax, ymin, ymax]
-        self.field_anchor_locked = False # Zpevnění pole po stisku [L]
-        self.locked_bounds = None       # Pevné souřadnice uzamčeného pole
-        self.rejected_outside_count = 0 # Počet bodů vyřazených vně hřiště
-        self.rejected_wall_edge_count = 0 # Počet bodů vyřazených pro porušení odstupu 20 cm od mantinelu
+        self.rejected_outside_count = 0 # Počet bodů vyřazených mimo hranice hřiště
 
-    def lock_field_anchor(self):
-        """Zpevní hranice hřiště v prostoru – po zamknutí etalonu se hřiště nemění a neposkakuje."""
-        bounds = self.get_auto_field_bounds()
-        self.locked_bounds = tuple(bounds)
-        self.field_anchor_locked = True
-        print(f"[POLE] Hřiště pevně ZAMČENO a UKOTVENO v prostoru: X=[{bounds[0]:.0f}, {bounds[1]:.0f}], Y=[{bounds[2]:.0f}, {bounds[3]:.0f}] mm")
-
-    def unlock_field_anchor(self):
-        """Odemkne pole a umožní opět dynamickou adaptaci."""
-        self.field_anchor_locked = False
-        self.locked_bounds = None
-        print("[POLE] Hřiště ODEMČENO (povolena dynamická adaptace).")
-
-    def reset(self, full=True):
+    def reset(self):
         self.candles.clear()
         self.walls.clear()
         self.robot_pos = (0.0, 0.0)
         self.robot_deg = 0.0
         self.trajectory = [(0.0, 0.0)]
         self.total_updates = 0
+        self.smooth_bounds = None
         self.rejected_outside_count = 0
-        self.rejected_wall_edge_count = 0
-        if full:
-            self.smooth_bounds = None
-            self.field_anchor_locked = False
-            self.locked_bounds = None
 
     def set_start_wall(self, mode):
         """Nastaví startovní stěnu: 2 pro 2.4 m, 3 pro 3.5 m."""
         if mode in (2, 3) and self.start_wall_mode != mode:
             self.start_wall_mode = mode
             self.smooth_bounds = None  # Okamžitý skok na nové rozměry
-            if self.field_anchor_locked:
-                self.field_anchor_locked = False
-                self.locked_bounds = None
-                self.lock_field_anchor()
 
     def toggle_start_wall(self):
         """Přepne mezi startovní stěnou 2.4 m a 3.5 m."""
@@ -887,23 +824,24 @@ class GlobalFieldMap:
 
     def get_auto_field_bounds(self):
         """
-        Vrátí hranice hřiště [xmin, xmax, ymin, ymax].
-        Pokud je pole zpevněno (field_anchor_locked), vrací absolutně fixní souřadnice locked_bounds.
-        Jinak adaptivně napasuje pole na základě startu robota a stabilních svíček a vyhladí EMA.
+        Automaticky spočítá a vyhladí hranice hřiště [xmin, xmax, ymin, ymax].
+        Napasuje pole tak, aby:
+          1. Robot u startovní stěny [0,0] byl bezpečně uvnitř.
+          2. Všechny kvalitní svíčky a stěny byly rovnoměrně vycentrovány v šířce W.
+          3. Celá délka L sahala dopředu od zadní stěny.
         """
-        if self.field_anchor_locked and self.locked_bounds is not None:
-            return self.locked_bounds
-
         W, L = self.get_field_dims()
 
         # Body pro usazení hřiště: start robota [0,0], aktuální robot [rx, ry] a trajektorie
         x_pts = [0.0, self.robot_pos[0]]
         y_pts = [0.0, self.robot_pos[1]]
 
+        # Zahrneme body trajektorie
         for tp in self.trajectory:
             x_pts.append(tp[0])
             y_pts.append(tp[1])
 
+        # Svíčky s alespoň 1 hitem v rozumném dosahu
         cand_x = []
         cand_y = []
         for c in self.candles:
@@ -920,14 +858,18 @@ class GlobalFieldMap:
         target_ymax = target_ymin + L
 
         # 2. OSA X (Šířka hřiště):
+        # Všechny spolehlivé objekty vycentrujeme do šířky W
         min_x = min(x_pts)
         max_x = max(x_pts)
         span_x = max_x - min_x
 
         if span_x <= (W - 80.0):
+            # Všechny body se krásně vejdou do šířky W -> vycentrujeme je symetricky
             mid_x = (min_x + max_x) * 0.5
             target_xmin = mid_x - W * 0.5
         else:
+            # Pokud je rozpětí bodů větší než W (např. zbloudilý odraz),
+            # upřednostníme robota a nejstabilnější svíčky (hits >= 2)
             reliable_x = [0.0, self.robot_pos[0]]
             for c in self.candles:
                 if c.get('hits', 0) >= 2 and abs(c['x']) <= W:
@@ -936,6 +878,7 @@ class GlobalFieldMap:
             target_xmin = mid_x - W * 0.5
 
         # Robot na startu [0, 0] musí ležet uvnitř pole s rezervou min 100 mm od levé i pravé zdi:
+        # target_xmin <= -100  a  target_xmin + W >= +100 (tj. target_xmin >= 100 - W)
         target_xmin = max(100.0 - W, min(-100.0, target_xmin))
         target_xmax = target_xmin + W
 
@@ -962,17 +905,15 @@ class GlobalFieldMap:
             if len(self.trajectory) > 600:
                 self.trajectory.pop(0)
 
-    def ingest_candles(self, candles_abs, robot_pos=(0.0, 0.0), is_soft=False):
+    def ingest_candles(self, candles_abs):
         """
         Přijme seznam svíček v absolutních souřadnicích hřiště (START=[0,0]).
-        Páruje do 200 mm s existujícími hypotézami a akumuluje multi-view evidenci.
+        Páruje do 200 mm s existujícími a přidává nové.
         """
         self.total_updates += 1
         matched = set()
-        r_pos = (float(robot_pos[0]), float(robot_pos[1]))
-
         for c in candles_abs:
-            cx, cy = float(c['x']), float(c['y'])
+            cx, cy = c['x'], c['y']
             best_idx = -1
             best_d = 200.0
             for idx, gc in enumerate(self.candles):
@@ -985,60 +926,27 @@ class GlobalFieldMap:
 
             if best_idx >= 0:
                 gc = self.candles[best_idx]
-                vps = gc.get('viewpoints', [])
-                min_vp_dist = min([math.hypot(r_pos[0] - vp[0], r_pos[1] - vp[1]) for vp in vps]) if vps else 999.0
-
-                # MULTI-VIEW BASELINE BONUS:
-                # Pokud robot pozoruje objekt z nového stanoviště (> 160 mm od předchozích úhlů),
-                # jedná se o nezávislé potvrzení z jiného úhlu -> skokový růst jistoty!
-                cur_prob = gc.get('prob', 0.5)
-                if min_vp_dist >= 160.0:
-                    bonus = 0.38 if not is_soft else 0.25
-                    gc['prob'] = min(0.99, cur_prob + (1.0 - cur_prob) * bonus)
-                    if 'viewpoints' not in gc:
-                        gc['viewpoints'] = []
-                    gc['viewpoints'].append(r_pos)
-                    if len(gc['viewpoints']) > 12:
-                        gc['viewpoints'].pop(0)
-                else:
-                    step = 0.05 if is_soft else 0.10
-                    gc['prob'] = min(0.99, cur_prob + (1.0 - cur_prob) * step)
-
-                # EMA vyhlazení pozice
-                alpha = 0.12 if is_soft else 0.18
+                alpha = 0.15
                 gc['x'] = (1.0 - alpha) * gc['x'] + alpha * cx
                 gc['y'] = (1.0 - alpha) * gc['y'] + alpha * cy
-                gc['hits'] = gc.get('hits', 0) + 1
+                gc['hits'] += 1
                 gc['walls_count'] = max(gc.get('walls_count', 0), c.get('walls_count', 0))
-                gc['last_update'] = self.total_updates
                 matched.add(best_idx)
             else:
-                if len(self.candles) < 14:
+                if len(self.candles) < 8:
                     self.candles.append({
                         'x': cx, 'y': cy,
-                        'prob': 0.28 if is_soft else 0.58,
-                        'hits': c.get('hits', 1 if is_soft else 3),
+                        'hits': c.get('hits', 1),
                         'walls_count': c.get('walls_count', 0),
-                        'viewpoints': [r_pos],
-                        'last_update': self.total_updates,
-                        'source': 'soft_candidate' if is_soft else 'sensor'
+                        'source': 'sensor'
                     })
 
-        # Pravidelný úklid slabých neaktivních hypotéz bez multi-view podpory
-        if self.total_updates % 20 == 0:
-            self.candles = [
-                c for c in self.candles
-                if (self.total_updates - c.get('last_update', 0) < 35) or
-                   (c.get('prob', 0) >= 0.50 and len(c.get('viewpoints', [])) >= 2)
-            ]
-
-    def ingest_walls(self, walls_abs, robot_pos=(0.0, 0.0)):
+    def ingest_walls(self, walls_abs):
         """
         Přijme seznam stěn v absolutních souřadnicích hřiště.
         Páruje středy do 250 mm s existujícími a přidává nové.
         """
         matched = set()
-        r_pos = (float(robot_pos[0]), float(robot_pos[1]))
         for w in walls_abs:
             mx = (w['x1'] + w['x2']) * 0.5
             my = (w['y1'] + w['y2']) * 0.5
@@ -1062,61 +970,56 @@ class GlobalFieldMap:
                 gw['mx'] = (gw['x1'] + gw['x2']) * 0.5
                 gw['my'] = (gw['y1'] + gw['y2']) * 0.5
                 gw['len'] = math.hypot(gw['x2'] - gw['x1'], gw['y2'] - gw['y1'])
-                gw['hits'] = gw.get('hits', 0) + 1
-                gw['last_update'] = self.total_updates
+                gw['hits'] += 1
                 matched.add(best_idx)
             else:
-                if len(self.walls) < 14:
+                if len(self.walls) < 12:
                     self.walls.append({
                         'x1': w['x1'], 'y1': w['y1'],
                         'x2': w['x2'], 'y2': w['y2'],
                         'mx': mx, 'my': my,
                         'len': w.get('len', math.hypot(w['x2'] - w['x1'], w['y2'] - w['y1'])),
-                        'hits': w.get('hits', 1),
-                        'last_update': self.total_updates
+                        'hits': w.get('hits', 1)
                     })
 
     def get_field_candles(self, max_count=4):
         """
-        Vrátí nejvýše max_count POTVRZENÝCH svíček (Tier 1):
-          1. Pravidlo min. 20 cm od mantinelů hřiště: Svíčka nesmí ležet na čáře ani blíž než 190 mm.
-          2. Fialový koridor stěn: Svíčka nesmí ležet v ose stěny.
-          3. Pravděpodobnost a podpora: prob >= 0.52 a hits >= 2 (nebo opora o stěnu).
-          4. Pravidla soutěže: rozestup min 800 mm, max 1 volná svíčka bez stěny.
+        Vrátí nejvýše max_count svíček po aplikaci:
+          1. Přísného prostorového filtru (pouze svíčky UVNITŘ hřiště).
+          2. Fialového koridoru stěn (svíčka nesmí ležet v ose stěny).
+          3. Pravidel soutěže (rozestup min 800 mm, max 1 volná svíčka bez stěny).
         """
         xmin, xmax, ymin, ymax = self.get_auto_field_bounds()
-        m_dist = self.CANDLE_WALL_MIN_DIST  # 190 mm (20 cm s tolerancí)
+        margin = 35.0  # Bezpečnostní okraj od obvodových stěn
 
         good_walls = self.get_field_walls()
         candidates = []
         rejected_outside = 0
-        rejected_wall_edge = 0
 
         for c in self.candles:
-            cx, cy = c['x'], c['y']
+            if c.get('hits', 0) < 1:
+                continue
 
-            # A. Bod zcela mimo hřiště
-            if not (xmin <= cx <= xmax and ymin <= cy <= ymax):
+            # 1. PŘÍSNÝ FILTR HRANIC POLE: Co je mimo pole, NENÍ svíčka!
+            if not (xmin + margin <= c['x'] <= xmax - margin and ymin + margin <= c['y'] <= ymax - margin):
                 rejected_outside += 1
                 continue
 
-            # B. PRAVIDLO MIN. 20 CM OD MANTINELU:
-            # Svíčky jsou v soutěži vždy alespoň 20 cm od kraje pole. Pokud je na čáře nebo blízko zdi, je vyřazena!
-            if not (xmin + m_dist <= cx <= xmax - m_dist and ymin + m_dist <= cy <= ymax - m_dist):
-                rejected_wall_edge += 1
-                continue
-
-            # C. Fialový koridor stěny
+            # 2. FILTR FIALOVÉHO KORIDORU STĚNY
             in_wall = False
             walls_near = 0
             for w in good_walls:
                 dx = w['x2'] - w['x1']
                 dy = w['y2'] - w['y1']
                 L = w['len']
-                if L < 10.0: continue
-                ux, uy = dx / L, dy / L
-                nx, ny = -uy, ux
-                vx, vy = cx - w['x1'], cy - w['y1']
+                if L < 10.0:
+                    continue
+                ux = dx / L
+                uy = dy / L
+                nx = -uy
+                ny = ux
+                vx = c['x'] - w['x1']
+                vy = c['y'] - w['y1']
                 proj_t = vx * ux + vy * uy
                 d_perp = abs(vx * nx + vy * ny)
 
@@ -1127,34 +1030,21 @@ class GlobalFieldMap:
                 t_cl = max(0.0, min(L, proj_t))
                 wx = w['x1'] + t_cl * ux
                 wy = w['y1'] + t_cl * uy
-                if math.hypot(cx - wx, cy - wy) <= 250.0:
+                if math.hypot(c['x'] - wx, c['y'] - wy) <= 250.0:
                     walls_near += 1
 
-            if in_wall:
-                continue
-
-            prob = c.get('prob', 0.5)
-            hits = c.get('hits', 1)
-            vps = c.get('viewpoints', [])
-            wnear = max(c.get('walls_count', 0), walls_near)
-
-            # Podmínka pro Tier 1: Vysoká pravděpodobnost (>= 0.52) a spolehlivost
-            if (prob >= 0.52 and hits >= 2) or (wnear > 0 and hits >= 3) or (len(vps) >= 2 and prob >= 0.48):
-                score = prob * 3000.0 + wnear * 2000.0 + len(vps) * 500.0 + hits * 10.0
+            if not in_wall:
                 candidates.append({
-                    'x': cx, 'y': cy,
-                    'prob': prob,
-                    'hits': hits,
-                    'walls_count': wnear,
-                    'viewpoints': list(vps),
-                    'score': score
+                    'x': c['x'], 'y': c['y'],
+                    'hits': c['hits'],
+                    'walls_count': max(c.get('walls_count', 0), walls_near),
+                    'score': c['hits'] * 10.0 + walls_near * 2000.0
                 })
 
         self.rejected_outside_count = rejected_outside
-        self.rejected_wall_edge_count = rejected_wall_edge
         candidates.sort(key=lambda x: x['score'], reverse=True)
 
-        # Výběr s pravidly: rozestup min 800 mm, max 1 volná svíčka bez stěny
+        # 3. VÝBĚR S PRAVIDLY: rozestup min 800 mm, max 1 volná svíčka bez stěny
         selected = []
         isolated_count = 0
         for cand in candidates:
@@ -1170,62 +1060,6 @@ class GlobalFieldMap:
                 selected.append(cand)
 
         return selected
-
-    def get_candidate_candles(self, max_count=6):
-        """
-        Vrátí KANDIDÁTY V ŠEDÉ ZÓNĚ (Tier 2):
-        Hypotézy, které se do Tier 1 ještě nevešly (málo hitů nebo čekají na multi-view potvrzení),
-        ale splňují pravidlo 20 cm od mantinelu a neleží v koridoru stěny.
-        """
-        confirmed = self.get_field_candles()
-        conf_coords = [(c['x'], c['y']) for c in confirmed]
-
-        xmin, xmax, ymin, ymax = self.get_auto_field_bounds()
-        m_dist = self.CANDLE_WALL_MIN_DIST
-        good_walls = self.get_field_walls()
-
-        tier2 = []
-        for c in self.candles:
-            cx, cy = c['x'], c['y']
-
-            # Musí ležet v zóně hřiště (min 20 cm od mantinelu)
-            if not (xmin + m_dist <= cx <= xmax - m_dist and ymin + m_dist <= cy <= ymax - m_dist):
-                continue
-
-            # Nesmí duplikovat už potvrzenou Tier 1 svíčku (do 300 mm)
-            if any(math.hypot(cx - fx, cy - fy) < 300.0 for fx, fy in conf_coords):
-                continue
-
-            # Nesmí ležet v ose stěny
-            in_wall = False
-            for w in good_walls:
-                dx = w['x2'] - w['x1']
-                dy = w['y2'] - w['y1']
-                L = w['len']
-                if L < 10.0: continue
-                ux, uy = dx / L, dy / L
-                nx, ny = -uy, ux
-                vx, vy = cx - w['x1'], cy - w['y1']
-                proj_t = vx * ux + vy * uy
-                d_perp = abs(vx * nx + vy * ny)
-                if d_perp <= 55.0 and -150.0 <= proj_t <= L + 150.0:
-                    in_wall = True
-                    break
-            if in_wall:
-                continue
-
-            prob = c.get('prob', 0.3)
-            if prob >= 0.20:
-                tier2.append({
-                    'x': cx, 'y': cy,
-                    'prob': prob,
-                    'hits': c.get('hits', 1),
-                    'walls_count': c.get('walls_count', 0),
-                    'viewpoints': list(c.get('viewpoints', []))
-                })
-
-        tier2.sort(key=lambda x: x['prob'], reverse=True)
-        return tier2[:max_count]
 
     def get_field_walls(self, max_count=6):
         """Vrátí nejvýše max_count stěn bez překryvů, které leží uvnitř hřiště."""
@@ -1346,8 +1180,7 @@ class DualLidarVisualizer:
         self.sync_esp32_config()
         self.ref_model.reset()
         self.curr_model.reset()
-        self.field_map.unlock_field_anchor()
-        self.field_map.reset(full=True)
+        self.field_map.reset()
         self.localizer.unlock_map()
         print("[MAPA] Parametry upraveny -> stabilní mapy, mapa hřiště i lokalizace resetovány.")
 
@@ -1438,13 +1271,9 @@ class DualLidarVisualizer:
                 # Průběžně plníme globální mapu hřiště z výchozí pozice (poloha = [0,0], natočení = 0°)
                 ref_c = self.ref_model.get_confirmed_candles()
                 ref_w = self.ref_model.get_confirmed_walls()
-                cand_c = self.ref_model.get_candidate_candles()
-                if ref_c:
-                    self.field_map.ingest_candles(ref_c, robot_pos=(0.0, 0.0), is_soft=False)
-                if cand_c:
-                    self.field_map.ingest_candles(cand_c, robot_pos=(0.0, 0.0), is_soft=True)
-                if ref_w:
-                    self.field_map.ingest_walls(ref_w, robot_pos=(0.0, 0.0))
+                if ref_c or ref_w:
+                    self.field_map.ingest_candles(ref_c)
+                    self.field_map.ingest_walls(ref_w)
             else:
                 # 2. PO ZAMKNUTÍ: Stará stabilní mapa je neměnná reference.
                 # Sbíráme Novou stabilní mapu na aktuálním stanovišti robota!
@@ -1453,7 +1282,6 @@ class DualLidarVisualizer:
                 # Porovnáváme DVĚ STABILNÍ MAPY (potvrzené objekty z nového modelu proti starému etalonu)
                 new_cands = self.curr_model.get_confirmed_candles()
                 new_walls = self.curr_model.get_confirmed_walls()
-                cand_cands = self.curr_model.get_candidate_candles()
                 if (len(new_cands) + len(new_walls)) >= 2:
                     self.localizer.estimate_pose(new_cands, new_walls)
 
@@ -1463,29 +1291,13 @@ class DualLidarVisualizer:
                     heading_rad = math.radians(loc.robot_deg)
                     cos_h = math.cos(heading_rad)
                     sin_h = math.sin(heading_rad)
-                    r_pos = (loc.robot_x, loc.robot_y)
 
-                    # Transformace potvrzených svíček (Tier 1)
+                    # Transformace svíček do absolutních souřadnic hřiště
                     abs_candles = []
                     for c in new_cands:
                         ax = loc.robot_x + c['x'] * cos_h + c['y'] * sin_h
                         ay = loc.robot_y - c['x'] * sin_h + c['y'] * cos_h
-                        abs_candles.append({
-                            'x': ax, 'y': ay,
-                            'walls_count': c.get('walls_count', 0),
-                            'hits': c.get('hits', 4)
-                        })
-
-                    # Transformace kandidátů v šedé zóně (Tier 2)
-                    abs_candidate_candles = []
-                    for c in cand_cands:
-                        ax = loc.robot_x + c['x'] * cos_h + c['y'] * sin_h
-                        ay = loc.robot_y - c['x'] * sin_h + c['y'] * cos_h
-                        abs_candidate_candles.append({
-                            'x': ax, 'y': ay,
-                            'walls_count': c.get('walls_count', 0),
-                            'hits': c.get('hits', 1)
-                        })
+                        abs_candles.append({'x': ax, 'y': ay, 'walls_count': c.get('walls_count', 0)})
 
                     # Transformace stěn do absolutních souřadnic hřiště
                     abs_walls = []
@@ -1496,16 +1308,11 @@ class DualLidarVisualizer:
                         ay2 = loc.robot_y - w['x2'] * sin_h + w['y2'] * cos_h
                         abs_walls.append({
                             'x1': ax1, 'y1': ay1, 'x2': ax2, 'y2': ay2,
-                            'len': w.get('len', math.hypot(ax2 - ax1, ay2 - ay1)),
-                            'hits': w.get('hits', 4)
+                            'len': w.get('len', math.hypot(ax2 - ax1, ay2 - ay1))
                         })
 
-                    if abs_candles:
-                        self.field_map.ingest_candles(abs_candles, robot_pos=r_pos, is_soft=False)
-                    if abs_candidate_candles:
-                        self.field_map.ingest_candles(abs_candidate_candles, robot_pos=r_pos, is_soft=True)
-                    if abs_walls:
-                        self.field_map.ingest_walls(abs_walls, robot_pos=r_pos)
+                    self.field_map.ingest_candles(abs_candles)
+                    self.field_map.ingest_walls(abs_walls)
                     self.field_map.update_robot_pose(loc.robot_x, loc.robot_y, loc.robot_deg)
 
     def handle_click(self, pos):
@@ -2273,22 +2080,6 @@ class DualLidarVisualizer:
             pygame.draw.line(self.screen, (28, 62, 40), p1, p2, 1)
             gy += 500.0
 
-        # Vnitřní 20cm bezpečnostní mantinelová linie (svíčky smí ležet pouze uvnitř)
-        in_xmin = xmin + 200.0
-        in_xmax = xmax - 200.0
-        in_ymin = ymin + 200.0
-        in_ymax = ymax - 200.0
-        if in_xmax > in_xmin and in_ymax > in_ymin:
-            in_pts = [
-                f_to_screen(in_xmin, in_ymin),
-                f_to_screen(in_xmax, in_ymin),
-                f_to_screen(in_xmax, in_ymax),
-                f_to_screen(in_xmin, in_ymax)
-            ]
-            pygame.draw.polygon(self.screen, (34, 75, 52), in_pts, 1)
-            lbl_20 = self.font_main.render("20 cm mantinel", True, (65, 140, 95))
-            self.screen.blit(lbl_20, (in_pts[0][0] + 4, in_pts[0][1] - 14))
-
         # Rozměry u stěn hřiště
         lbl_w = self.font_main.render(f"{field_w_mm:.0f} mm", True, (80, 160, 110))
         self.screen.blit(lbl_w, ((f_rect_pts[0][0] + f_rect_pts[1][0]) // 2 - lbl_w.get_width() // 2, f_rect_pts[0][1] + 2))
@@ -2304,29 +2095,17 @@ class DualLidarVisualizer:
             pygame.draw.circle(self.screen, (100, 255, 160), wp1, 3)
             pygame.draw.circle(self.screen, (100, 255, 160), wp2, 3)
 
-        # Svíčky v šedé zóně (Tier 2 - kandidáti čekající na multi-view potvrzení)
-        field_candidates = fm.get_candidate_candles()
-        for idx, cand in enumerate(field_candidates):
-            csx, csy = f_to_screen(cand['x'], cand['y'])
-            c_prob = cand.get('prob', 0.3)
-            c_views = len(cand.get('viewpoints', []))
-            pygame.draw.circle(self.screen, (160, 150, 40), (csx, csy), 9, 1)
-            pygame.draw.circle(self.screen, (220, 200, 60), (csx, csy), 3)
-            lbl_cand = self.font_main.render(f"? {int(c_prob*100)}% ({c_views} úhly)", True, (240, 220, 100))
-            self.screen.blit(lbl_cand, (csx + 10, csy - 7))
-
-        # Svíčky uvnitř pole (Tier 1 - plně potvrzené)
+        # Svíčky uvnitř pole
         field_candles = fm.get_field_candles()
         for idx, c in enumerate(field_candles):
             csx, csy = f_to_screen(c['x'], c['y'])
             has_wall = c.get('walls_count', 0) > 0
             ring_col = (255, 150, 60) if has_wall else (255, 60, 60)
-            c_prob = c.get('prob', 0.95)
             pygame.draw.circle(self.screen, (40, 10, 10), (csx, csy), 10)
             pygame.draw.circle(self.screen, ring_col, (csx, csy), 9, 2)
             pygame.draw.circle(self.screen, (255, 40, 40), (csx, csy), 5)
             pygame.draw.circle(self.screen, (255, 255, 200), (csx, csy), 2)
-            lbl_c = self.font_bold.render(f"S{idx+1} ({int(c_prob*100)}%)", True, (255, 230, 180))
+            lbl_c = self.font_bold.render(f"S{idx+1}", True, (255, 230, 180))
             self.screen.blit(lbl_c, (csx + 10, csy - 7))
 
         # START pozice [0, 0]
@@ -2380,21 +2159,9 @@ class DualLidarVisualizer:
         pygame.draw.rect(self.screen, col_3_bg, r3, 0, 3)
         pygame.draw.rect(self.screen, col_3_txt if is_3 else (45, 52, 65), r3, 1, 3)
         self.screen.blit(lbl_3, (tx + 4, info_y))
-        tx += r3.width + 8
-
-        # Indikátor ukotvení hřiště
-        is_locked = fm.field_anchor_locked
-        lock_bg = (25, 70, 42) if is_locked else (50, 40, 18)
-        lock_col = (90, 255, 160) if is_locked else (240, 190, 60)
-        lock_tag = "🔒 POLE UKOTVENO" if is_locked else "🔓 AUTO-FIT ([L] ukotví)"
-        lbl_lock = self.font_bold.render(lock_tag, True, lock_col)
-        r_lock = pygame.Rect(tx, info_y - 2, lbl_lock.get_width() + 8, 18)
-        pygame.draw.rect(self.screen, lock_bg, r_lock, 0, 3)
-        pygame.draw.rect(self.screen, lock_col, r_lock, 1, 3)
-        self.screen.blit(lbl_lock, (tx + 4, info_y))
 
         # Auto-fit rozsah text
-        fit_str = f"Hranice pole: X ∈ [{xmin:+.0f}, {xmax:+.0f}] mm | Y ∈ [{ymin:+.0f}, {ymax:+.0f}] mm"
+        fit_str = f"Auto-fit: X ∈ [{xmin:+.0f}, {xmax:+.0f}] mm | Y ∈ [{ymin:+.0f}, {ymax:+.0f}] mm"
         self.screen.blit(self.font_main.render(fit_str, True, (130, 175, 150)), (field_x0, info_y + 20))
 
         # ========================================================
@@ -2417,14 +2184,13 @@ class DualLidarVisualizer:
         self.screen.blit(self.font_bold.render(f"{sym1} POČET SVÍČEK: {n_c}/4 ({'SPLNĚNO' if c_ok else f'nalezeno {n_c}'})", True, col1), (mid_x, t_y))
         t_y += 17
 
-        # Pravidlo 2: Odstup svíček od mantinelů min. 20 cm (žádná svíčka na čáře!)
-        rej_out = fm.rejected_outside_count
-        rej_edge = fm.rejected_wall_edge_count
-        edge_ok = (rej_edge == 0 and rej_out == 0)
-        sym_edge = "✓" if edge_ok else ("..." if n_c == 0 else "✗")
-        col_edge = (100, 255, 120) if edge_ok else (255, 70, 70)
-        edge_detail = "všechny ≥ 20 cm od mantinelů" if rej_edge == 0 else f"{rej_edge} odrazů na zdi (<20cm) vyřazeno"
-        self.screen.blit(self.font_bold.render(f"{sym_edge} ODSTUP OD STĚN: MIN 20 cm ({edge_detail})", True, col_edge), (mid_x, t_y))
+        # Pravidlo 2: Všechny svíčky v poli (100% UVNITŘ, žádná vně)
+        rej_cnt = fm.rejected_outside_count
+        all_in = (rej_cnt == 0 and n_c > 0)
+        sym_in = "✓" if (rej_cnt == 0) else "✗"
+        col_in = (100, 255, 120) if (rej_cnt == 0) else (255, 70, 70)
+        msg_in = "všechny uvnitř pole" if rej_cnt == 0 else f"{rej_cnt} bodů vně vyřazeno"
+        self.screen.blit(self.font_bold.render(f"{sym_in} HRANICE HŘIŠTĚ: 100% UVNITŘ ({n_c}/{n_c} v poli, {msg_in})", True, col_in), (mid_x, t_y))
         t_y += 17
 
         # Pravidlo 3: Rozestup min 800 mm
@@ -2456,15 +2222,7 @@ class DualLidarVisualizer:
         sym4 = "✓" if w_ok else "✗"
         col4 = (100, 255, 120) if w_ok else (255, 70, 70)
         self.screen.blit(self.font_bold.render(f"{sym4} STĚNY HŘIŠTĚ: {n_w}/6 (bez kolizí a uvnitř pole)", True, col4), (mid_x, t_y))
-        t_y += 17
-
-        # Pravidlo 6: DVOJÍ DETEKCE & MULTI-VIEW OPORA
-        n_cand = len(field_candidates)
-        mv_cands = sum(1 for c in field_candles if len(c.get('viewpoints', [])) >= 2)
-        self.screen.blit(self.font_bold.render(f"✓ DVOJÍ DETEKCE: {n_c} potvrzeno (Tier 1) | {n_cand} v šedé zóně (Tier 2)", True, (80, 225, 255)), (mid_x, t_y))
-        t_y += 15
-        self.screen.blit(self.font_main.render(f"  • Multi-view fúze: {mv_cands}/{max(1, n_c)} svíček ověřeno z více úhlů pohledu", True, (160, 220, 245)), (mid_x, t_y))
-        t_y += 20
+        t_y += 22
 
         # Detailní rozpis jednotlivých svíček
         self.screen.blit(self.font_bold.render("DOSAZENÉ SVÍČKY V POLI [X, Y]:", True, (200, 210, 225)), (mid_x, t_y))
@@ -2475,11 +2233,9 @@ class DualLidarVisualizer:
         else:
             for i, c in enumerate(field_candles):
                 wc = c.get('walls_count', 0)
-                prob_pct = int(c.get('prob', 0.95) * 100)
-                n_angles = len(c.get('viewpoints', []))
                 wt = f"[U STĚNY: {wc}]" if wc > 0 else "[VOLNÁ SVÍČKA]"
                 w_col = (255, 170, 70) if wc > 0 else (255, 100, 100)
-                txt = f"S{i+1}: X={c['x']:+.0f} Y={c['y']:+.0f} mm | P={prob_pct}% ({n_angles} úhly) {wt}"
+                txt = f"S{i+1}: X={c['x']:+.0f} mm, Y={c['y']:+.0f} mm  {wt}  (hitů: {c['hits']})"
                 self.screen.blit(self.font_main.render(txt, True, w_col), (mid_x, t_y))
                 t_y += 15
 
@@ -2619,11 +2375,10 @@ class DualLidarVisualizer:
                             n_lm = len(cc) + len(cw)
                             if ok:
                                 self.curr_model.reset()
-                                # ZPEVNĚNÍ POLE A UKOTVENÍ V PROSTORU (pole již neskáče a drží)
-                                self.field_map.lock_field_anchor()
-                                self.field_map.reset(full=False)
-                                self.field_map.ingest_candles(cc, robot_pos=(0.0, 0.0), is_soft=False)
-                                self.field_map.ingest_walls(cw, robot_pos=(0.0, 0.0))
+                                # Globální mapa začíná s potvrzeným etalonem
+                                self.field_map.reset()
+                                self.field_map.ingest_candles(cc)
+                                self.field_map.ingest_walls(cw)
                                 print(f"[LOC] Stará mapa zamčena jako referenční etalon ({n_lm} landmarků z 180° skenu).")
 
                                 # AUTOMATICKÉ PŘEPNUTÍ NA 360° ROZHLED V POLI
@@ -2639,8 +2394,7 @@ class DualLidarVisualizer:
                             self.localizer.unlock_map()
                             self.ref_model.reset()
                             self.curr_model.reset()
-                            self.field_map.unlock_field_anchor()
-                            self.field_map.reset(full=True)
+                            self.field_map.reset()
 
                             # AUTOMATICKÝ NÁVRAT DO 180° KUŽELU NA STARTU
                             if self.auto_fov_enabled and not self.fov_limited:
