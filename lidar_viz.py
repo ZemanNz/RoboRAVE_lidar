@@ -1066,7 +1066,7 @@ class DualLidarVisualizer:
         row("Filtrováno bodů:", f"{f.get('pts', 0)} bodů")
         row("Výpočet na ESP32:", f"{f.get('calc_us', 0)} µs", (0, 220, 255))
         row("Volná RAM ESP32:", f"{f.get('heap', 0) // 1024} kB")
-        row("Živé boxy (max 4):", f"{len(live_boxes)} cílů", (0, 240, 160))
+        row("Živé boxy (max 4):", f"{len(boxes_to_draw)} cílů", (0, 240, 160))
 
         # Ovládací HUD vlevo dole
         cmd_panel = pygame.Surface((576, 95))
