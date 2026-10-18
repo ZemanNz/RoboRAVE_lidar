@@ -8,6 +8,9 @@ Dva panely vedle sebe:
   2. PRAVÝ PANEL: Stabilní herní mapa (World Model) + LOKALIZACE ROBOTA.
 
 Klávesové zkratky a ovládání:
+  [2 / ě]     - Startovní stěna 2.4 m (Kratší stěna) -> auto-fit pole 2.4 x 3.5 m
+  [3 / š]     - Startovní stěna 3.5 m (Delší stěna)  -> auto-fit pole 3.5 x 2.4 m
+  [P]         - Přepnout startovní stěnu (2.4 m <-> 3.5 m)
   [F]         - Přepnout režim: 180° Kužel / 360° Celé pole (výchozí 180°)
   [MEZERNÍK]  - Zmrazit / Odmrazit obraz (Freeze)
   [R / E]     - Min vzdálenost (+50 / -50 mm)
@@ -15,6 +18,7 @@ Klávesové zkratky a ovládání:
   [I / K]     - Min intenzita (+5 / -5)
   [C]         - Vymazat a přepočítat stabilní mapu hřiště
   [L]         - ZAMKNOUT mapu jako referenční svět (spustí lokalizaci)
+  [N]         - Resetovat novou stabilní mapu na aktuální pozici
   [+ / -]     - Zoom in / Zoom out (funguje také kolečko myši)
   Klik myší   - Detailní inspekce souřadnic vybraného bodu / objektu
 """
@@ -32,47 +36,24 @@ WIN_W       = PANEL_W * 3
 WIN_H       = PANEL_H + FIELD_H
 
 # Rozměry soutěžního hřiště Kybernoid (mm)
-FIELD_W_MM  = 3500.0   # Délka hřiště (delší strana)
-FIELD_H_MM  = 2400.0   # Šířka hřiště (kratší strana)
+FIELD_W_MM  = 3500.0   # Delší strana hřiště
+FIELD_H_MM  = 2400.0   # Kratší strana hřiště
 
-# Možné startovní konfigurace robota v obdélníku hřiště (přepínatelné klávesou [P])
-FIELD_MODES = [
-    {
-        "name": "Kratší stěna (střed)",
-        "fw": 2400.0, "fh": 3500.0,
-        "x_min": -1200.0, "x_max": 1200.0,
-        "y_min": -200.0,  "y_max": 3300.0,
-        "desc": "Robot 20 cm od stěny 2.4 m, uprostřed"
+# Konfigurace startovních stěn (přepínatelné klávesami [2/ě] a [3/š] nebo [P])
+WALL_CONFIGS = {
+    2: {
+        "name": "2.4 m (Kratší stěna)",
+        "w": 2400.0, "l": 3500.0,
+        "key_hint": "[2 / ě]",
+        "desc": "Robot u stěny 2.4 m, pole sahá 3.5 m dopředu"
     },
-    {
-        "name": "Kratší stěna (levý roh)",
-        "fw": 2400.0, "fh": 3500.0,
-        "x_min": -200.0,  "x_max": 2200.0,
-        "y_min": -200.0,  "y_max": 3300.0,
-        "desc": "Robot 20 cm od spodní a levé stěny"
-    },
-    {
-        "name": "Kratší stěna (pravý roh)",
-        "fw": 2400.0, "fh": 3500.0,
-        "x_min": -2200.0, "x_max": 200.0,
-        "y_min": -200.0,  "y_max": 3300.0,
-        "desc": "Robot 20 cm od spodní a pravé stěny"
-    },
-    {
-        "name": "Delší stěna (střed)",
-        "fw": 3500.0, "fh": 2400.0,
-        "x_min": -1750.0, "x_max": 1750.0,
-        "y_min": -200.0,  "y_max": 2200.0,
-        "desc": "Robot 20 cm od stěny 3.5 m, uprostřed"
-    },
-    {
-        "name": "Delší stěna (levý roh)",
-        "fw": 3500.0, "fh": 2400.0,
-        "x_min": -200.0,  "x_max": 3300.0,
-        "y_min": -200.0,  "y_max": 2200.0,
-        "desc": "Robot 20 cm od spodní stěny 3.5 m a levé stěny"
+    3: {
+        "name": "3.5 m (Delší stěna)",
+        "w": 3500.0, "l": 2400.0,
+        "key_hint": "[3 / š]",
+        "desc": "Robot u stěny 3.5 m, pole sahá 2.4 m dopředu"
     }
-]
+}
 
 # Barvy
 BG_COLOR     = (18, 20, 24)
@@ -793,7 +774,10 @@ class GlobalFieldMap:
     """
     Kumulativní mapa celého hřiště v absolutních souřadnicích (START = [0,0]).
     Sbírá svíčky a stěny postupně, jak robot objíždí hřiště.
+    Dynamicky napasovává obdélník pole podle zvolené startovní stěny (2.4 m nebo 3.5 m)
+    a polohy detekovaných svíček tak, aby všechny platné svíčky ležely uvnitř pole.
     Vynucuje pravidla soutěže:
+      - Pouze objekty UVNITŘ napasovaného pole (co je vně, není svíčka/stěna)
       - Max 4 svíčky (rozestup min 800 mm, max 1 bez stěny)
       - Max 6 stěn (nepřekrývající se)
       - Svíčka nesmí ležet v koridoru stěny
@@ -807,6 +791,9 @@ class GlobalFieldMap:
         self.robot_deg = 0.0            # Aktuální natočení
         self.trajectory = [(0.0, 0.0)]  # Celková trajektorie
         self.total_updates = 0
+        self.start_wall_mode = 2        # 2 = 2.4 m (Kratší stěna), 3 = 3.5 m (Delší stěna)
+        self.smooth_bounds = None       # [xmin, xmax, ymin, ymax]
+        self.rejected_outside_count = 0 # Počet bodů vyřazených mimo hranice hřiště
 
     def reset(self):
         self.candles.clear()
@@ -815,6 +802,99 @@ class GlobalFieldMap:
         self.robot_deg = 0.0
         self.trajectory = [(0.0, 0.0)]
         self.total_updates = 0
+        self.smooth_bounds = None
+        self.rejected_outside_count = 0
+
+    def set_start_wall(self, mode):
+        """Nastaví startovní stěnu: 2 pro 2.4 m, 3 pro 3.5 m."""
+        if mode in (2, 3) and self.start_wall_mode != mode:
+            self.start_wall_mode = mode
+            self.smooth_bounds = None  # Okamžitý skok na nové rozměry
+
+    def toggle_start_wall(self):
+        """Přepne mezi startovní stěnou 2.4 m a 3.5 m."""
+        new_mode = 3 if self.start_wall_mode == 2 else 2
+        self.set_start_wall(new_mode)
+        return self.start_wall_mode
+
+    def get_field_dims(self):
+        """Vrátí nominální šířku W (podél X) a délku L (podél Y)."""
+        cfg = WALL_CONFIGS.get(self.start_wall_mode, WALL_CONFIGS[2])
+        return cfg["w"], cfg["l"]
+
+    def get_auto_field_bounds(self):
+        """
+        Automaticky spočítá a vyhladí hranice hřiště [xmin, xmax, ymin, ymax].
+        Napasuje pole tak, aby:
+          1. Robot u startovní stěny [0,0] byl bezpečně uvnitř.
+          2. Všechny kvalitní svíčky a stěny byly rovnoměrně vycentrovány v šířce W.
+          3. Celá délka L sahala dopředu od zadní stěny.
+        """
+        W, L = self.get_field_dims()
+
+        # Body pro usazení hřiště: start robota [0,0], aktuální robot [rx, ry] a trajektorie
+        x_pts = [0.0, self.robot_pos[0]]
+        y_pts = [0.0, self.robot_pos[1]]
+
+        # Zahrneme body trajektorie
+        for tp in self.trajectory:
+            x_pts.append(tp[0])
+            y_pts.append(tp[1])
+
+        # Svíčky s alespoň 1 hitem v rozumném dosahu
+        cand_x = []
+        cand_y = []
+        for c in self.candles:
+            if c.get('hits', 0) >= 1 and abs(c['x']) <= 4500.0 and -800.0 <= c['y'] <= 5000.0:
+                cand_x.append(c['x'])
+                cand_y.append(c['y'])
+                x_pts.append(c['x'])
+                y_pts.append(c['y'])
+
+        # 1. OSA Y (Hloubka od zadní startovní stěny):
+        # Robot začíná cca 20 cm (200 mm) od zadní stěny -> stěna na Y = -200 mm
+        min_y = min(y_pts)
+        target_ymin = min(-200.0, min_y - 80.0)
+        target_ymax = target_ymin + L
+
+        # 2. OSA X (Šířka hřiště):
+        # Všechny spolehlivé objekty vycentrujeme do šířky W
+        min_x = min(x_pts)
+        max_x = max(x_pts)
+        span_x = max_x - min_x
+
+        if span_x <= (W - 80.0):
+            # Všechny body se krásně vejdou do šířky W -> vycentrujeme je symetricky
+            mid_x = (min_x + max_x) * 0.5
+            target_xmin = mid_x - W * 0.5
+        else:
+            # Pokud je rozpětí bodů větší než W (např. zbloudilý odraz),
+            # upřednostníme robota a nejstabilnější svíčky (hits >= 2)
+            reliable_x = [0.0, self.robot_pos[0]]
+            for c in self.candles:
+                if c.get('hits', 0) >= 2 and abs(c['x']) <= W:
+                    reliable_x.append(c['x'])
+            mid_x = (min(reliable_x) + max(reliable_x)) * 0.5
+            target_xmin = mid_x - W * 0.5
+
+        # Robot na startu [0, 0] musí ležet uvnitř pole s rezervou min 100 mm od levé i pravé zdi:
+        # target_xmin <= -100  a  target_xmin + W >= +100 (tj. target_xmin >= 100 - W)
+        target_xmin = max(100.0 - W, min(-100.0, target_xmin))
+        target_xmax = target_xmin + W
+
+        target_bounds = [target_xmin, target_xmax, target_ymin, target_ymax]
+
+        # 3. Vyhlazení (EMA - Exponential Moving Average):
+        if self.smooth_bounds is None:
+            self.smooth_bounds = list(target_bounds)
+        else:
+            alpha = 0.15
+            self.smooth_bounds[0] = (1.0 - alpha) * self.smooth_bounds[0] + alpha * target_xmin
+            self.smooth_bounds[1] = self.smooth_bounds[0] + W
+            self.smooth_bounds[2] = (1.0 - alpha) * self.smooth_bounds[2] + alpha * target_ymin
+            self.smooth_bounds[3] = self.smooth_bounds[2] + L
+
+        return tuple(self.smooth_bounds)
 
     def update_robot_pose(self, rx, ry, rdeg):
         """Aktualizuje polohu robota a trajektorii."""
@@ -903,14 +983,29 @@ class GlobalFieldMap:
                     })
 
     def get_field_candles(self, max_count=4):
-        """Vrátí nejvýše max_count svíček po aplikaci pravidel soutěže."""
-        # Nejprve vyfiltrujeme svíčky v koridoru stěn
+        """
+        Vrátí nejvýše max_count svíček po aplikaci:
+          1. Přísného prostorového filtru (pouze svíčky UVNITŘ hřiště).
+          2. Fialového koridoru stěn (svíčka nesmí ležet v ose stěny).
+          3. Pravidel soutěže (rozestup min 800 mm, max 1 volná svíčka bez stěny).
+        """
+        xmin, xmax, ymin, ymax = self.get_auto_field_bounds()
+        margin = 35.0  # Bezpečnostní okraj od obvodových stěn
+
         good_walls = self.get_field_walls()
         candidates = []
+        rejected_outside = 0
 
         for c in self.candles:
-            if c['hits'] < 1:
+            if c.get('hits', 0) < 1:
                 continue
+
+            # 1. PŘÍSNÝ FILTR HRANIC POLE: Co je mimo pole, NENÍ svíčka!
+            if not (xmin + margin <= c['x'] <= xmax - margin and ymin + margin <= c['y'] <= ymax - margin):
+                rejected_outside += 1
+                continue
+
+            # 2. FILTR FIALOVÉHO KORIDORU STĚNY
             in_wall = False
             walls_near = 0
             for w in good_walls:
@@ -946,9 +1041,10 @@ class GlobalFieldMap:
                     'score': c['hits'] * 10.0 + walls_near * 2000.0
                 })
 
+        self.rejected_outside_count = rejected_outside
         candidates.sort(key=lambda x: x['score'], reverse=True)
 
-        # Výběr s pravidly: rozestup 800 mm, max 1 bez stěny
+        # 3. VÝBĚR S PRAVIDLY: rozestup min 800 mm, max 1 volná svíčka bez stěny
         selected = []
         isolated_count = 0
         for cand in candidates:
@@ -962,15 +1058,24 @@ class GlobalFieldMap:
                 if is_iso:
                     isolated_count += 1
                 selected.append(cand)
+
         return selected
 
     def get_field_walls(self, max_count=6):
-        """Vrátí nejvýše max_count stěn bez překryvů."""
-        valid = [w for w in self.walls if w['hits'] >= 2]
-        valid.sort(key=lambda w: w['hits'], reverse=True)
+        """Vrátí nejvýše max_count stěn bez překryvů, které leží uvnitř hřiště."""
+        xmin, xmax, ymin, ymax = self.get_auto_field_bounds()
+        valid = [w for w in self.walls if w.get('hits', 0) >= 2]
+
+        # Filtrujeme stěny, které by ležely zcela mimo pole
+        in_bounds_walls = []
+        for w in valid:
+            if (xmin - 80.0 <= w['mx'] <= xmax + 80.0 and ymin - 80.0 <= w['my'] <= ymax + 80.0):
+                in_bounds_walls.append(w)
+
+        in_bounds_walls.sort(key=lambda w: w['hits'], reverse=True)
 
         selected = []
-        for w in valid:
+        for w in in_bounds_walls:
             if len(selected) >= max_count:
                 break
             conflict = False
@@ -1261,12 +1366,13 @@ class DualLidarVisualizer:
             lbl = self.font_main.render(f"{d_m:.1f} m", True, (90, 100, 115))
             self.screen.blit(lbl, (cx + 5, cy - r_px - 8))
 
-        # Obrys hřiště 2400 x 3500 mm
-        hw = 2400 / 2.0
+        # Obrys hřiště podle aktivní startovní stěny (2.4x3.5 m nebo 3.5x2.4 m)
+        fw, fl = self.field_map.get_field_dims()
+        hw = fw / 2.0
         p1 = self.to_screen(-hw, 0, offset_x)
         p2 = self.to_screen( hw, 0, offset_x)
-        p3 = self.to_screen( hw, 3500, offset_x)
-        p4 = self.to_screen(-hw, 3500, offset_x)
+        p3 = self.to_screen( hw, fl, offset_x)
+        p4 = self.to_screen(-hw, fl, offset_x)
         pygame.draw.polygon(self.screen, (28, 44, 34), [p1, p2, p3, p4], 1)
 
         if panel_idx == 0:
@@ -1911,60 +2017,60 @@ class DualLidarVisualizer:
         self.screen.blit(self.font_main.render("• [N] Reset a nový sběr na této pozici | [L] Odemknout/Zamknout výchozí start", True, (160, 200, 225)), (offset_x + 25, PANEL_H - 43))
 
     def draw_field_map(self):
-        """4. PANEL (DOLE): Obdélníková mapa celého hřiště s kumulativním dosazováním svíček a stěn."""
+        """4. PANEL (DOLE): Obdélníková mapa celého hřiště s dynamickým auto-fitem podle stěny 2.4/3.5 m."""
         fm = self.field_map
         y_offset = PANEL_H  # Y = 560 px
-        mode = FIELD_MODES[self.field_mode_idx]
+        xmin, xmax, ymin, ymax = fm.get_auto_field_bounds()
 
         # Pozadí spodního panelu
         panel_rect = pygame.Rect(0, y_offset, WIN_W, FIELD_H)
         pygame.draw.rect(self.screen, (12, 14, 18), panel_rect)
 
         # ========================================================
-        # 1. LEVÝ ODDÍL: GRAFICKÝ OBDÉLNÍK HŘIŠTĚ (3500 x 2400 mm)
+        # 1. LEVÝ ODDÍL: GRAFICKÝ OBDÉLNÍK HŘIŠTĚ (Auto-fit)
         # ========================================================
         avail_w = 510.0
-        avail_h = float(FIELD_H - 55)  # ~245 px
+        avail_h = float(FIELD_H - 58)  # ~242 px
 
-        field_w_mm = mode["fw"]
-        field_h_mm = mode["fh"]
-        scale = min(avail_w / field_w_mm, avail_h / field_h_mm)
+        field_w_mm = xmax - xmin
+        field_h_mm = ymax - ymin
+        scale = min(avail_w / max(100.0, field_w_mm), avail_h / max(100.0, field_h_mm))
 
         draw_w = int(field_w_mm * scale)
         draw_h = int(field_h_mm * scale)
 
         field_x0 = 20 + int((avail_w - draw_w) / 2.0)
-        field_y0 = y_offset + 18 + int((avail_h - draw_h) / 2.0)
+        field_y0 = y_offset + 14 + int((avail_h - draw_h) / 2.0)
 
         def f_to_screen(fx, fy):
-            sx = field_x0 + int((fx - mode["x_min"]) * scale)
-            sy = field_y0 + draw_h - int((fy - mode["y_min"]) * scale)
+            sx = field_x0 + int((fx - xmin) * scale)
+            sy = field_y0 + draw_h - int((fy - ymin) * scale)
             return sx, sy
 
         # Plocha hřiště (tmavě zelená)
         f_rect_pts = [
-            f_to_screen(mode["x_min"], mode["y_min"]),
-            f_to_screen(mode["x_max"], mode["y_min"]),
-            f_to_screen(mode["x_max"], mode["y_max"]),
-            f_to_screen(mode["x_min"], mode["y_max"])
+            f_to_screen(xmin, ymin),
+            f_to_screen(xmax, ymin),
+            f_to_screen(xmax, ymax),
+            f_to_screen(xmin, ymax)
         ]
         pygame.draw.polygon(self.screen, (22, 48, 32), f_rect_pts, 0)
         pygame.draw.polygon(self.screen, (50, 180, 90), f_rect_pts, 2)
 
         # Vnitřní mřížka po 500 mm
-        gx = int(mode["x_min"] // 500 * 500)
-        while gx <= mode["x_max"]:
-            p1 = f_to_screen(gx, mode["y_min"])
-            p2 = f_to_screen(gx, mode["y_max"])
+        gx = math.ceil(xmin / 500.0) * 500.0
+        while gx <= xmax:
+            p1 = f_to_screen(gx, ymin)
+            p2 = f_to_screen(gx, ymax)
             pygame.draw.line(self.screen, (28, 62, 40), p1, p2, 1)
-            gx += 500
+            gx += 500.0
 
-        gy = int(mode["y_min"] // 500 * 500)
-        while gy <= mode["y_max"]:
-            p1 = f_to_screen(mode["x_min"], gy)
-            p2 = f_to_screen(mode["x_max"], gy)
+        gy = math.ceil(ymin / 500.0) * 500.0
+        while gy <= ymax:
+            p1 = f_to_screen(xmin, gy)
+            p2 = f_to_screen(xmax, gy)
             pygame.draw.line(self.screen, (28, 62, 40), p1, p2, 1)
-            gy += 500
+            gy += 500.0
 
         # Rozměry u stěn hřiště
         lbl_w = self.font_main.render(f"{field_w_mm:.0f} mm", True, (80, 160, 110))
@@ -2016,9 +2122,39 @@ class DualLidarVisualizer:
             tip_y = int(rob_sy - 14 * math.cos(h_rad))
             pygame.draw.line(self.screen, (255, 120, 220), (rob_sx, rob_sy), (tip_x, tip_y), 2)
 
-        # Popisek startovního režimu pod hřištěm
-        lbl_pm = self.font_bold.render(f"[P] Start: {mode['name']} ({mode['desc']})", True, (240, 200, 70))
-        self.screen.blit(lbl_pm, (field_x0, field_y0 + draw_h + 8))
+        # Ovládací indikátory startovní stěny pod hřištěm
+        w_active = fm.start_wall_mode
+        info_y = field_y0 + draw_h + 8
+        t_st = self.font_bold.render("START. STĚNA:", True, (200, 210, 225))
+        self.screen.blit(t_st, (field_x0, info_y))
+        tx = field_x0 + t_st.get_width() + 8
+
+        # Tlačítko [2/ě] 2.4 m
+        is_2 = (w_active == 2)
+        col_2_bg = (30, 75, 45) if is_2 else (22, 26, 32)
+        col_2_txt = (100, 255, 140) if is_2 else (130, 140, 155)
+        tag_2 = "[2/ě] 2.4 m KRATŠÍ [AKTIVNÍ]" if is_2 else "[2/ě] 2.4 m"
+        lbl_2 = self.font_bold.render(tag_2, True, col_2_txt)
+        r2 = pygame.Rect(tx, info_y - 2, lbl_2.get_width() + 8, 18)
+        pygame.draw.rect(self.screen, col_2_bg, r2, 0, 3)
+        pygame.draw.rect(self.screen, col_2_txt if is_2 else (45, 52, 65), r2, 1, 3)
+        self.screen.blit(lbl_2, (tx + 4, info_y))
+        tx += r2.width + 6
+
+        # Tlačítko [3/š] 3.5 m
+        is_3 = (w_active == 3)
+        col_3_bg = (30, 75, 45) if is_3 else (22, 26, 32)
+        col_3_txt = (100, 255, 140) if is_3 else (130, 140, 155)
+        tag_3 = "[3/š] 3.5 m DELŠÍ [AKTIVNÍ]" if is_3 else "[3/š] 3.5 m"
+        lbl_3 = self.font_bold.render(tag_3, True, col_3_txt)
+        r3 = pygame.Rect(tx, info_y - 2, lbl_3.get_width() + 8, 18)
+        pygame.draw.rect(self.screen, col_3_bg, r3, 0, 3)
+        pygame.draw.rect(self.screen, col_3_txt if is_3 else (45, 52, 65), r3, 1, 3)
+        self.screen.blit(lbl_3, (tx + 4, info_y))
+
+        # Auto-fit rozsah text
+        fit_str = f"Auto-fit: X ∈ [{xmin:+.0f}, {xmax:+.0f}] mm | Y ∈ [{ymin:+.0f}, {ymax:+.0f}] mm"
+        self.screen.blit(self.font_main.render(fit_str, True, (130, 175, 150)), (field_x0, info_y + 20))
 
         # ========================================================
         # 2. STŘEDNÍ ODDÍL: KONTROLA PRAVIDEL & DETAIL SVÍČEK
@@ -2026,9 +2162,9 @@ class DualLidarVisualizer:
         mid_x = 550
         pygame.draw.line(self.screen, (40, 48, 60), (mid_x - 10, y_offset), (mid_x - 10, y_offset + FIELD_H), 1)
 
-        t_y = y_offset + 12
+        t_y = y_offset + 10
         self.screen.blit(self.font_big.render("GEOMETRICKÁ PRAVIDLA SOUTĚŽE", True, (255, 215, 80)), (mid_x, t_y))
-        t_y += 24
+        t_y += 22
 
         n_c = len(field_candles)
         n_w = len(field_walls)
@@ -2038,9 +2174,18 @@ class DualLidarVisualizer:
         sym1 = "✓" if c_ok else ("..." if n_c < 4 else "✗")
         col1 = (100, 255, 120) if c_ok else ((240, 180, 50) if n_c < 4 else (255, 70, 70))
         self.screen.blit(self.font_bold.render(f"{sym1} POČET SVÍČEK: {n_c}/4 ({'SPLNĚNO' if c_ok else f'nalezeno {n_c}'})", True, col1), (mid_x, t_y))
-        t_y += 18
+        t_y += 17
 
-        # Pravidlo 2: Rozestup min 800 mm
+        # Pravidlo 2: Všechny svíčky v poli (100% UVNITŘ, žádná vně)
+        rej_cnt = fm.rejected_outside_count
+        all_in = (rej_cnt == 0 and n_c > 0)
+        sym_in = "✓" if (rej_cnt == 0) else "✗"
+        col_in = (100, 255, 120) if (rej_cnt == 0) else (255, 70, 70)
+        msg_in = "všechny uvnitř pole" if rej_cnt == 0 else f"{rej_cnt} bodů vně vyřazeno"
+        self.screen.blit(self.font_bold.render(f"{sym_in} HRANICE HŘIŠTĚ: 100% UVNITŘ ({n_c}/{n_c} v poli, {msg_in})", True, col_in), (mid_x, t_y))
+        t_y += 17
+
+        # Pravidlo 3: Rozestup min 800 mm
         dist_ok = True
         min_pair_d = 9999.0
         if n_c >= 2:
@@ -2054,26 +2199,26 @@ class DualLidarVisualizer:
         col2 = (100, 255, 120) if dist_ok else (255, 70, 70)
         d_str = f"(min {min_pair_d:.0f} mm)" if n_c >= 2 else "(čekám na další svíčky)"
         self.screen.blit(self.font_bold.render(f"{sym2} MIN. ROZESTUP 800 mm: {'SPLNĚNO' if dist_ok else 'PORUŠENO'} {d_str}", True, col2), (mid_x, t_y))
-        t_y += 18
+        t_y += 17
 
-        # Pravidlo 3: Max 1 volná svíčka bez stěny
+        # Pravidlo 4: Max 1 volná svíčka bez stěny
         iso_cnt = sum(1 for c in field_candles if c.get('walls_count', 0) == 0)
         iso_ok = (iso_cnt <= 1)
         sym3 = "✓" if iso_ok else "✗"
         col3 = (100, 255, 120) if iso_ok else (255, 70, 70)
         self.screen.blit(self.font_bold.render(f"{sym3} MAX 1 VOLNÁ SVÍČKA: {'SPLNĚNO' if iso_ok else 'PŘEKROČENO'} ({iso_cnt} volná)", True, col3), (mid_x, t_y))
-        t_y += 18
+        t_y += 17
 
-        # Pravidlo 4: Stěny (max 6 bez překryvů)
+        # Pravidlo 5: Stěny (max 6 bez překryvů)
         w_ok = (n_w <= 6)
         sym4 = "✓" if w_ok else "✗"
         col4 = (100, 255, 120) if w_ok else (255, 70, 70)
-        self.screen.blit(self.font_bold.render(f"{sym4} STĚNY HŘIŠTĚ: {n_w}/6 (bez kolizí a překryvů)", True, col4), (mid_x, t_y))
-        t_y += 24
+        self.screen.blit(self.font_bold.render(f"{sym4} STĚNY HŘIŠTĚ: {n_w}/6 (bez kolizí a uvnitř pole)", True, col4), (mid_x, t_y))
+        t_y += 22
 
         # Detailní rozpis jednotlivých svíček
         self.screen.blit(self.font_bold.render("DOSAZENÉ SVÍČKY V POLI [X, Y]:", True, (200, 210, 225)), (mid_x, t_y))
-        t_y += 18
+        t_y += 17
 
         if n_c == 0:
             self.screen.blit(self.font_main.render("Zatím nepotvrzeny žádné stabilní svíčky...", True, (140, 145, 155)), (mid_x, t_y))
@@ -2084,7 +2229,7 @@ class DualLidarVisualizer:
                 w_col = (255, 170, 70) if wc > 0 else (255, 100, 100)
                 txt = f"S{i+1}: X={c['x']:+.0f} mm, Y={c['y']:+.0f} mm  {wt}  (hitů: {c['hits']})"
                 self.screen.blit(self.font_main.render(txt, True, w_col), (mid_x, t_y))
-                t_y += 16
+                t_y += 15
 
         # ========================================================
         # 3. PRAVÝ ODDÍL: CELKOVÝ OBRAZ, LOKALIZACE & POKRYTÍ
@@ -2092,9 +2237,9 @@ class DualLidarVisualizer:
         right_x = 1200
         pygame.draw.line(self.screen, (40, 48, 60), (right_x - 10, y_offset), (right_x - 10, y_offset + FIELD_H), 1)
 
-        r_y = y_offset + 12
+        r_y = y_offset + 10
         self.screen.blit(self.font_big.render("CELKOVÝ OBRAZ HŘIŠTĚ", True, (0, 220, 255)), (right_x, r_y))
-        r_y += 24
+        r_y += 22
 
         # Stav mapování
         loc = self.localizer
@@ -2106,37 +2251,39 @@ class DualLidarVisualizer:
             st_txt = f"🔒 MAPOVÁNÍ AKTIVNÍ ({p_name})"
             st_col = (80, 255, 160)
         self.screen.blit(self.font_bold.render(st_txt, True, st_col), (right_x, r_y))
-        r_y += 22
+        r_y += 20
 
         # Pokrytí hřiště bar
         total_items = n_c + n_w
         cov_pct = min(100, int((n_c / 4.0 * 60.0) + (min(6, n_w) / 6.0 * 40.0)))
         cov_col = (80, 255, 160) if cov_pct >= 85 else ((240, 200, 60) if cov_pct >= 50 else (255, 90, 90))
         self.screen.blit(self.font_bold.render(f"POKRYTÍ HŘIŠTĚ: {cov_pct}%", True, cov_col), (right_x, r_y))
-        r_y += 17
+        r_y += 16
 
         bar_w = 340
         pygame.draw.rect(self.screen, (30, 35, 45), (right_x, r_y, bar_w, 8))
         pygame.draw.rect(self.screen, cov_col, (right_x, r_y, int(bar_w * cov_pct / 100.0), 8))
-        r_y += 18
+        r_y += 17
 
         # Poloha robota
         dist_s = math.hypot(rx, ry)
         self.screen.blit(self.font_bold.render(f"POZICE ROBOTA OD STARTU:", True, (255, 130, 200)), (right_x, r_y))
-        r_y += 18
+        r_y += 17
         self.screen.blit(self.font_main.render(f"• X: {rx:+.0f} mm | Y: {ry:+.0f} mm | Vzdálenost: {dist_s:.0f} mm", True, (220, 220, 225)), (right_x, r_y))
-        r_y += 16
+        r_y += 15
         self.screen.blit(self.font_main.render(f"• Natočení: {fm.robot_deg:+.1f}° | Jistota: {int(loc.pose_confidence * 100)}%", True, (200, 200, 210)), (right_x, r_y))
-        r_y += 22
+        r_y += 20
 
         # Rychlá nápověda kláves
-        self.screen.blit(self.font_bold.render("OVLÁDÁNÍ MAPOVÁNÍ:", True, (240, 200, 80)), (right_x, r_y))
-        r_y += 18
-        self.screen.blit(self.font_main.render("• [P] Přepnout startovní pozici robota v hřišti", True, (200, 215, 230)), (right_x, r_y))
-        r_y += 16
-        self.screen.blit(self.font_main.render("• [L] Zamknout výchozí etalon a začít mapovat", True, (80, 255, 160)), (right_x, r_y))
-        r_y += 16
-        self.screen.blit(self.font_main.render("• [N] Reset nové mapy na této pozici | [C] Reset všeho", True, (160, 175, 195)), (right_x, r_y))
+        self.screen.blit(self.font_bold.render("OVLÁDÁNÍ STARTOVNÍCH STĚN A MAPY:", True, (240, 200, 80)), (right_x, r_y))
+        r_y += 17
+        self.screen.blit(self.font_main.render("• [2] nebo [ě]: Start u KRATŠÍ stěny 2.4 m", True, (100, 255, 140)), (right_x, r_y))
+        r_y += 15
+        self.screen.blit(self.font_main.render("• [3] nebo [š]: Start u DELŠÍ stěny 3.5 m", True, (100, 255, 140)), (right_x, r_y))
+        r_y += 15
+        self.screen.blit(self.font_main.render("• [P]: Přepnout stěnu 2.4 m <-> 3.5 m | [L]: Zamknout etalon", True, (200, 215, 230)), (right_x, r_y))
+        r_y += 15
+        self.screen.blit(self.font_main.render("• [N]: Reset nové mapy na pozici | [C]: Reset všeho", True, (160, 175, 195)), (right_x, r_y))
 
     def run(self):
         while self.running:
@@ -2190,11 +2337,19 @@ class DualLidarVisualizer:
                         self.view_span_mm = max(1200.0, self.view_span_mm - 300.0)
                     elif event.key in [pygame.K_MINUS]:
                         self.view_span_mm = min(6000.0, self.view_span_mm + 300.0)
+
+                    # VOLBA STARTOVNÍ STĚNY: [2 / ě] pro 2.4 m, [3 / š] pro 3.5 m, [P] pro přepínání
+                    elif event.key in [pygame.K_2, pygame.K_KP2] or getattr(event, 'unicode', '') in ['2', 'ě', 'Ě']:
+                        self.field_map.set_start_wall(2)
+                        print("[POLE] Aktivována startovní stěna: 2.4 m (Kratší stěna) [Klávesa 2 / ě]")
+                    elif event.key in [pygame.K_3, pygame.K_KP3] or getattr(event, 'unicode', '') in ['3', 'š', 'Š']:
+                        self.field_map.set_start_wall(3)
+                        print("[POLE] Aktivována startovní stěna: 3.5 m (Delší stěna) [Klávesa 3 / š]")
                     elif event.key == pygame.K_p:
-                        # PŘEPNUTÍ STARTOVNÍ POZICE V HŘIŠTI
-                        self.field_mode_idx = (self.field_mode_idx + 1) % len(FIELD_MODES)
-                        m = FIELD_MODES[self.field_mode_idx]
-                        print(f"[POLE] Startovní režim hřiště přepnut: {m['name']} ({m['desc']})")
+                        new_mode = self.field_map.toggle_start_wall()
+                        w_str = "2.4 m (Kratší stěna)" if new_mode == 2 else "3.5 m (Delší stěna)"
+                        print(f"[POLE] Startovní stěna přepnuta: {w_str} [Klávesa P]")
+
                     elif event.key == pygame.K_l:
                         # ZAMKNUTÍ NEBO ODEMKNUTÍ REFERENČNÍHO ETALONU
                         if not self.localizer.locked:
