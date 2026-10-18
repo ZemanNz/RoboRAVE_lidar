@@ -1358,8 +1358,10 @@ public:
 
         if (bestW1Count < 4) {
             target.type = TARGET_SOLO;
-            target.candle_x = sumX / (float)boxPtCount;
-            target.candle_y = sumY / (float)boxPtCount;
+            target.candle_x = (boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx;
+            target.candle_y = (boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy;
+            target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
+            target.candle_y = fmaxf(box.min_y, fminf(box.max_y, target.candle_y));
             target.wall_count = 0;
             float dLen = hypotf(target.candle_x, target.candle_y);
             float ux = (dLen > 10.0f) ? (target.candle_x / dLen) : 0.0f;
@@ -1533,6 +1535,10 @@ public:
             float u_open_x = (blen > 0.01f) ? (bisect_x / blen) : 0.0f;
             float u_open_y = (blen > 0.01f) ? (bisect_y / blen) : 1.0f;
 
+            // Bezpečnostní pojistka: svíčka se NIKDY nesmí ocitnout mimo svůj Bounding Box!
+            target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
+            target.candle_y = fmaxf(box.min_y, fminf(box.max_y, target.candle_y));
+
             target.waypoint_x = target.candle_x + u_open_x * 380.0f;
             target.waypoint_y = target.candle_y + u_open_y * 380.0f;
             target.approach_dx = -u_open_x;
@@ -1591,6 +1597,10 @@ public:
             target.candle_x = p_proj_x + norm_x * 80.0f;
             target.candle_y = p_proj_y + norm_y * 80.0f;
         }
+
+        // Bezpečnostní pojistka: svíčka se NIKDY nesmí ocitnout mimo svůj Bounding Box!
+        target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
+        target.candle_y = fmaxf(box.min_y, fminf(box.max_y, target.candle_y));
 
         target.waypoint_x = target.candle_x + norm_x * 380.0f;
         target.waypoint_y = target.candle_y + norm_y * 380.0f;
@@ -1857,10 +1867,13 @@ public:
         int poolCount = 0;
 
         for (int i = 0; i < MAX_TRACKED_BOXES; i++) {
-            if (_trackedTargets[i].active && _trackedTargets[i].hits >= minHits) {
-                pool[poolCount] = _trackedTargets[i].target;
-                poolHits[poolCount] = _trackedTargets[i].hits;
-                poolCount++;
+            if (_trackedTargets[i].active && _trackedTargets[i].hits >= minHits && _trackedTargets[i].missed <= 3) {
+                // Svíčka musí ležet před robotem v poli (Y >= 30 mm)
+                if (_trackedTargets[i].target.candle_y >= 30.0f) {
+                    pool[poolCount] = _trackedTargets[i].target;
+                    poolHits[poolCount] = _trackedTargets[i].hits;
+                    poolCount++;
+                }
             }
         }
 

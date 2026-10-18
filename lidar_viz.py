@@ -1452,16 +1452,6 @@ class DualLidarVisualizer:
                     self.field_map.ingest_boxes(active_b, loc.robot_x, loc.robot_y, loc.robot_deg)
                     self.field_map.update_robot_pose(loc.robot_x, loc.robot_y, loc.robot_deg)
 
-            # Tvrdé detailní cíle (svíčky, stěny, 38cm nájezdy) počítané 100% přímo na ESP32:
-            if self.detect_details_enabled and self.esp_targets:
-                loc = self.localizer
-                th_rad = math.radians(loc.robot_deg) if loc.locked else 0.0
-                rx = loc.robot_x if loc.locked else 0.0
-                ry = loc.robot_y if loc.locked else 0.0
-                self.current_box_details = [
-                    transform_esp_target_to_world(t, rx, ry, th_rad)
-                    for t in self.esp_targets
-                ]
 
     def handle_click(self, pos):
         if pos[1] >= PANEL_H:
@@ -1853,25 +1843,83 @@ class DualLidarVisualizer:
             self.screen.blit(lbl1, (scx + 10, scy - 18))
             self.screen.blit(lbl2, (scx + 10, scy - 4))
 
-        # 5b. JEMNÁ DETEKCE STĚN, SVÍČEK A NÁJEZDOVÝCH ŠIPEK UVNITŘ BOUNDING BOXŮ (KLÁVESA [O])
-        if self.detect_details_enabled:
-            # Pokud nemáme hotová data z ESP32, provedeme záložní lokální výpočet
-            if not self.esp_targets and not self.current_box_details:
-                cloud_data = self.last_frame.get("cloud", [])
-                raw_details = []
-                for tb in transformed_boxes:
-                    cl = tb['box']
+        # 5b. JEMNÁ DETEKCE STĚN, SVÍČEK A NÁJEZDOVÝCH ŠIPEK STRIKTNĚ UVNITŘ BOUNDING BOXŮ (KLÁVESA [O])
+        self.current_box_details = []
+        if self.detect_details_enabled and transformed_boxes:
+            cloud_data = self.last_frame.get("cloud", [])
+            f_xmin, f_xmax, f_ymin, f_ymax = self.field_map.get_auto_field_bounds()
+
+            # Převedeme cíle z ESP32 do světových souřadnic (pokud existují)
+            esp_world_targets = []
+            if self.esp_targets:
+                th_rad = math.radians(loc.robot_deg)
+                for et in self.esp_targets:
+                    esp_world_targets.append(transform_esp_target_to_world(et, loc.robot_x, loc.robot_y, th_rad))
+
+            matched_esp_indices = set()
+            raw_details = []
+
+            for tb in transformed_boxes:
+                cl = tb['box']
+                wx, wy = tb['wx'], tb['wy']
+                hw = max(20.0, cl['width'] * 0.5)
+                hh = max(20.0, cl['height'] * 0.5)
+
+                # 1. Kontrola hranic hřiště: Box musí ležet uvnitř hřiště (nikdy za startovní stěnou)
+                if wy < (f_ymin - 80.0) or wy > (f_ymax + 80.0) or wx < (f_xmin - 100.0) or wx > (f_xmax + 100.0):
+                    continue
+
+                # 2. Hledáme odpovídající cíl z ESP32, který leží UVNITŘ TOHOTO KONKRÉTNÍHO BOXU
+                matched_esp = None
+                best_esp_dist = max(180.0, math.hypot(hw, hh) + 40.0)
+                best_esp_idx = -1
+
+                for e_idx, e_tgt in enumerate(esp_world_targets):
+                    if e_idx in matched_esp_indices:
+                        continue
+                    c_wx, c_wy = e_tgt['candle_world']
+                    d = math.hypot(c_wx - wx, c_wy - wy)
+                    if d < best_esp_dist:
+                        # Ověříme, že cíl z ESP32 leží v hřišti (Y >= 20 mm)
+                        if c_wy >= 20.0 and (f_xmin - 60.0) <= c_wx <= (f_xmax + 60.0):
+                            best_esp_dist = d
+                            best_esp_idx = e_idx
+                            matched_esp = dict(e_tgt)
+
+                if matched_esp is not None:
+                    matched_esp_indices.add(best_esp_idx)
+                    # Bezpečnostní pojistka: svíčka leží STRIKTNĚ uvnitř tohoto Bounding Boxu
+                    c_x = max(wx - hw, min(wx + hw, matched_esp['candle_world'][0]))
+                    c_y = max(wy - hh, min(wy + hh, matched_esp['candle_world'][1]))
+                    c_y = max(30.0, min(f_ymax - 30.0, c_y))
+                    c_x = max(f_xmin + 30.0, min(f_xmax - 30.0, c_x))
+                    matched_esp['candle_world'] = (c_x, c_y)
+                    matched_esp['box'] = cl
+                    raw_details.append(matched_esp)
+                else:
+                    # Pokud z ESP32 cíl chybí (např. zachráněná svíčka), spočítáme detail STRIKTNĚ uvnitř tohoto boxu
                     raw_d = self.compute_raw_box_details(
                         cl, cloud_data, loc.robot_x, loc.robot_y, math.radians(loc.robot_deg)
                     )
+                    # Pojistka: svíčka leží STRIKTNĚ uvnitř tohoto boxu a uvnitř pole
+                    c_x = max(wx - hw, min(wx + hw, raw_d['candle_world'][0]))
+                    c_y = max(wy - hh, min(wy + hh, raw_d['candle_world'][1]))
+                    c_y = max(30.0, min(f_ymax - 30.0, c_y))
+                    c_x = max(f_xmin + 30.0, min(f_xmax - 30.0, c_x))
+                    raw_d['candle_world'] = (c_x, c_y)
                     raw_details.append(raw_d)
 
-                # Časová stabilizace v Pythonu (pouze pro záložní režim bez ESP32)
-                self.current_box_details = self.detail_stabilizer.update_all(
-                    raw_details, loc.robot_x, loc.robot_y
-                )
-        else:
-            self.current_box_details = []
+            # Časová stabilizace pro stěny a svíčky v potvrzených boxech
+            self.current_box_details = self.detail_stabilizer.update_all(
+                raw_details, loc.robot_x, loc.robot_y
+            )
+
+            # Finální bezpečnostní filtr: NIKDY nepustit žádný cíl mimo mantinely hřiště!
+            self.current_box_details = [
+                d for d in self.current_box_details
+                if (d['candle_world'][1] >= 20.0 and d['candle_world'][1] <= (f_ymax + 50.0) and
+                    (f_xmin - 80.0) <= d['candle_world'][0] <= (f_xmax + 80.0))
+            ]
 
         if self.detect_details_enabled and self.current_box_details:
             r_pos_scr = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
@@ -2092,8 +2140,27 @@ class DualLidarVisualizer:
                         'is_visible': True,
                         'is_solo': det['is_solo']
                     })
+        # Doplníme zbývající potvrzené cíle z pole
+        if self.current_box_details and len(route) < len(self.current_box_details):
+            existing_ids = {r['id'] for r in route}
+            for det in self.current_box_details:
+                if det['id'] not in existing_ids:
+                    route.append({
+                        'id': det['id'],
+                        'type': det['type'],
+                        'x': det['candle_world'][0],
+                        'y': det['candle_world'][1],
+                        'waypoint_x': det['waypoint_world'][0],
+                        'waypoint_y': det['waypoint_world'][1],
+                        'dist_from_robot': det['travel_dist_mm'],
+                        'is_visible': True,
+                        'is_solo': det['is_solo']
+                    })
         if not route:
             route = fm.compute_extinguish_route()
+
+        # Bezpečnostní filtr: Trasa vede POUZE přes cíle uvnitř hřiště (Y >= 20 mm)
+        route = [t for t in route if t['y'] >= 20.0 and (ymin - 50.0) <= t['y'] <= (ymax + 50.0) and (xmin - 50.0) <= t['x'] <= (xmax + 50.0)]
 
         if len(route) >= 2:
             r_pts = [f_to_screen(rx, ry)] + [f_to_screen(t['x'], t['y']) for t in route]
