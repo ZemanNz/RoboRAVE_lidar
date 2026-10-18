@@ -26,7 +26,7 @@ Ovládání:
   Klik myší   - Detailní inspekce souřadnic vybraného bodu / cíle
 """
 
-import sys, os, time, json, math
+import sys, os, time, json, math, itertools
 import pygame
 import serial
 from serial.tools import list_ports
@@ -137,7 +137,7 @@ class RobotLocalizer:
         self.last_match_info  = None # Detailní informace o shodě pro vykreslení paprsků
 
     def lock_map(self, boxes):
-        """Uloží aktuální potvrzené Bounding Boxy jako referenční etalon světa a sestaví kotvy."""
+        """Uloží aktuální potvrzené Bounding Boxy jako referenční etalon světa a sestaví všech až 6 kotev."""
         self.ref_boxes = [dict(b) for b in boxes]
         self.ref_dists = []
         self.last_match_info = None
@@ -147,14 +147,7 @@ class RobotLocalizer:
             self.locked = False
             return False
 
-        # 1. Invariantní párové vzdálenosti mezi všemi středy boxů
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = math.hypot(self.ref_boxes[i]['cx'] - self.ref_boxes[j]['cx'],
-                               self.ref_boxes[i]['cy'] - self.ref_boxes[j]['cy'])
-                self.ref_dists.append((i, j, d))
-
-        # 2. Sestavení a seřazení geometrických kotev
+        # Invariantní párové vzdálenosti a kotvy pro všech n*(n-1)/2 dvojic (pro 4 svíčky = přesně 6 kotev)
         raw_anchors = []
         for i in range(n):
             for j in range(i + 1, n):
@@ -163,66 +156,32 @@ class RobotLocalizer:
                 dx = b2['cx'] - b1['cx']
                 dy = b2['cy'] - b1['cy']
                 dist = math.hypot(dx, dy)
-                if dist < 250.0:
-                    continue
-                # Skóre: větší rozvor = podstatně vyšší přesnost úhlu + bonus za body
-                score = dist + (b1.get('pts_count', 0) + b2.get('pts_count', 0)) * 5.0
                 raw_anchors.append({
                     'idx1': i, 'idx2': j,
                     'p1': (b1['cx'], b1['cy']),
                     'p2': (b2['cx'], b2['cy']),
-                    'dist': dist,
-                    'score': score
+                    'dist': dist
                 })
 
-        raw_anchors.sort(key=lambda a: a['score'], reverse=True)
+        # Seřadíme kotvy od nejdelší po nejkratší rozvor
+        raw_anchors.sort(key=lambda a: a['dist'], reverse=True)
+
+        ANCHOR_PALETTE = [
+            {"name": "KOTVA 1", "color": (255, 215, 0)},    # Zlatá (nejdelší)
+            {"name": "KOTVA 2", "color": (255, 140, 30)},   # Oranžová
+            {"name": "KOTVA 3", "color": (0, 230, 200)},    # Tyrkysová
+            {"name": "KOTVA 4", "color": (200, 110, 255)},  # Fialová
+            {"name": "KOTVA 5", "color": (60, 180, 255)},   # Modrá
+            {"name": "KOTVA 6", "color": (160, 240, 60)},   # Limetková
+        ]
+
         self.anchors = []
         for rank, a in enumerate(raw_anchors):
             a['rank'] = rank + 1
-            if rank == 0:
-                a['name'] = "KOTVA 1 (PRIMÁRNÍ)"
-                a['color'] = (255, 215, 0)   # Zlatá
-            elif rank == 1:
-                a['name'] = "KOTVA 2 (SEKUNDÁRNÍ)"
-                a['color'] = (255, 150, 40)  # Oranžová
-            else:
-                a['name'] = f"KOTVA {rank+1} (ZÁLOŽNÍ)"
-                a['color'] = (200, 140, 255) # Fialová
+            pal = ANCHOR_PALETTE[rank % len(ANCHOR_PALETTE)]
+            a['name'] = f"{pal['name']} ({int(a['dist'])} mm)"
+            a['color'] = pal['color']
             self.anchors.append(a)
-
-        # 3. Sestavení trojúhelníkového vzorce (pokud máme alespoň 3 boxy)
-        self.triangle_pattern = None
-        if len(self.anchors) >= 2 and n >= 3:
-            a1 = self.anchors[0]
-            a2 = self.anchors[1]
-            shared = set([a1['idx1'], a1['idx2']]).intersection([a2['idx1'], a2['idx2']])
-            if shared:
-                pivot_idx = list(shared)[0]
-                other1_idx = a1['idx2'] if a1['idx1'] == pivot_idx else a1['idx1']
-                other2_idx = a2['idx2'] if a2['idx1'] == pivot_idx else a2['idx1']
-                pivot_pt = (self.ref_boxes[pivot_idx]['cx'], self.ref_boxes[pivot_idx]['cy'])
-                p1_pt    = (self.ref_boxes[other1_idx]['cx'], self.ref_boxes[other1_idx]['cy'])
-                p2_pt    = (self.ref_boxes[other2_idx]['cx'], self.ref_boxes[other2_idx]['cy'])
-
-                v1_x = p1_pt[0] - pivot_pt[0]; v1_y = p1_pt[1] - pivot_pt[1]
-                v2_x = p2_pt[0] - pivot_pt[0]; v2_y = p2_pt[1] - pivot_pt[1]
-                az1 = math.atan2(v1_x, v1_y)
-                az2 = math.atan2(v2_x, v2_y)
-                ang_diff = abs(math.atan2(math.sin(az1 - az2), math.cos(az1 - az2)))
-                d3 = math.hypot(p1_pt[0] - p2_pt[0], p1_pt[1] - p2_pt[1])
-
-                self.triangle_pattern = {
-                    'pivot_idx': pivot_idx,
-                    'other1_idx': other1_idx,
-                    'other2_idx': other2_idx,
-                    'pivot_pt': pivot_pt,
-                    'p1_pt': p1_pt,
-                    'p2_pt': p2_pt,
-                    'dist1': a1['dist'],
-                    'dist2': a2['dist'],
-                    'dist3': d3,
-                    'angle_deg': math.degrees(ang_diff)
-                }
 
         self.locked = True
         self.robot_x = 0.0
@@ -239,7 +198,6 @@ class RobotLocalizer:
         self.ref_boxes = []
         self.ref_dists = []
         self.anchors = []
-        self.triangle_pattern = None
         self.last_match_info = None
         self.robot_x = 0.0
         self.robot_y = 0.0
@@ -282,150 +240,178 @@ class RobotLocalizer:
     def estimate_pose(self, current_boxes):
         """
         Určí pozici a orientaci robota (x, y, theta) porovnáním aktuálních Bounding Boxů
-        s referenčním etalonem ze startu pomocí odstupňovaných kotev.
+        s referenčním etalonem ze startu pomocí multi-anchor grafu a vzájemných vnitřních úhlů.
         """
         if not self.locked or len(self.ref_boxes) < 2 or len(current_boxes) < 2:
             return False
 
         cands = [(float(b['cx']), float(b['cy'])) for b in current_boxes]
-
-        def evaluate_transformation(tx, ty, th, active_anchors, pattern_name, base_score=0.0):
-            cos_t = math.cos(th); sin_t = math.sin(th)
-            inliers = 0
-            err_sum = 0.0
-            inlier_src = []
-            inlier_dst = []
-            inlier_pairs = []
-
-            for cp in cands:
-                # Navigační transformace: X doprava, Y dopředu, th doprava
-                wx = tx + cp[0] * cos_t + cp[1] * sin_t
-                wy = ty - cp[0] * sin_t + cp[1] * cos_t
-                min_d = 9999.0
-                best_rb = None
-                for rb in self.ref_boxes:
-                    d = math.hypot(wx - rb['cx'], wy - rb['cy'])
-                    if d < min_d:
-                        min_d = d
-                        best_rb = rb
-
-                if min_d < 160.0 and best_rb:
-                    inliers += 1
-                    err_sum += min_d
-                    inlier_src.append(cp)
-                    inlier_dst.append((best_rb['cx'], best_rb['cy']))
-                    inlier_pairs.append(((best_rb['cx'], best_rb['cy']), (wx, wy), min_d))
-
-            avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
-
-            # Zpřesnění metodou Procrustes přes inliers
-            if len(inlier_src) >= 2:
-                rtx, rty, rth = self._rigid_transform_2d(inlier_src, inlier_dst)
-            else:
-                rtx, rty, rth = tx, ty, th
-
-            total_score = base_score + inliers * 500.0 - avg_err * 2.0
-            return {
-                'inliers': inliers,
-                'avg_error': avg_err,
-                'tx': rtx, 'ty': rty, 'theta': rth,
-                'inlier_pairs': inlier_pairs,
-                'active_anchors': active_anchors,
-                'pattern_name': pattern_name,
-                'score': total_score
-            }
+        n_cands = len(cands)
+        n_refs = len(self.ref_boxes)
 
         best_match_info = None
         best_score = -999999.0
 
-        # ========================================================
-        # STUPEŇ 1: SHODA TROJÚHELNÍKOVÉHO VZORCE (Kotva 1 + Kotva 2)
-        # ========================================================
-        if self.triangle_pattern and len(cands) >= 3:
-            tp = self.triangle_pattern
-            for p in range(len(cands)):
-                for a in range(len(cands)):
-                    if a == p: continue
-                    d1_cur = math.hypot(cands[a][0] - cands[p][0], cands[a][1] - cands[p][1])
-                    if abs(d1_cur - tp['dist1']) > 130.0: continue
+        # Zkoumáme shody o velikosti K od min(4, n_refs, n_cands) dolů k 2
+        max_k = min(4, n_refs, n_cands)
 
-                    for b in range(len(cands)):
-                        if b == p or b == a: continue
-                        d2_cur = math.hypot(cands[b][0] - cands[p][0], cands[b][1] - cands[p][1])
-                        if abs(d2_cur - tp['dist2']) > 130.0: continue
+        for k in range(max_k, 1, -1):
+            # Pro každou podmnožinu k referenčních bodů
+            for ref_comb in itertools.combinations(range(n_refs), k):
+                # Pro každou uspořádanou k-tici kandidátů
+                for cand_perm in itertools.permutations(range(n_cands), k):
+                    # 1. KONTROLA DÉLEK VŠECH KOTEVA (párové vzdálenosti)
+                    edges_ok = True
+                    sum_dist_err = 0.0
+                    for i in range(k):
+                        for j in range(i + 1, k):
+                            ri = ref_comb[i]; rj = ref_comb[j]
+                            ci = cand_perm[i]; cj = cand_perm[j]
+                            d_ref = math.hypot(self.ref_boxes[ri]['cx'] - self.ref_boxes[rj]['cx'],
+                                               self.ref_boxes[ri]['cy'] - self.ref_boxes[rj]['cy'])
+                            d_cur = math.hypot(cands[ci][0] - cands[cj][0],
+                                               cands[ci][1] - cands[cj][1])
+                            err = abs(d_cur - d_ref)
+                            if err > 130.0:
+                                edges_ok = False
+                                break
+                            sum_dist_err += err
+                        if not edges_ok:
+                            break
+                    if not edges_ok:
+                        continue
 
-                        # Kontrola 3. strany trojúhelníku
-                        d3_cur = math.hypot(cands[a][0] - cands[b][0], cands[a][1] - cands[b][1])
-                        if abs(d3_cur - tp['dist3']) > 140.0: continue
+                    # 2. KONTROLA VNITŘNÍCH ORIENTOVANÝCH ÚHLŮ (pro k >= 3)
+                    # Zaručuje, že konstelace není zrcadlená a žádná kotva není otočená o 180°!
+                    angles_ok = True
+                    if k >= 3:
+                        for p in range(k):
+                            rp = ref_comb[p]; cp = cand_perm[p]
+                            for a in range(k):
+                                if a == p: continue
+                                ra = ref_comb[a]; ca = cand_perm[a]
+                                for b in range(a + 1, k):
+                                    if b == p: continue
+                                    rb = ref_comb[b]; cb = cand_perm[b]
 
-                        # Azimut Kotvy 1 v referenčním světě
-                        del_X = tp['p1_pt'][0] - tp['pivot_pt'][0]
-                        del_Y = tp['p1_pt'][1] - tp['pivot_pt'][1]
-                        az_ref = math.atan2(del_X, del_Y)
+                                    # Orientovaný úhel v etalonu
+                                    ur_x = self.ref_boxes[ra]['cx'] - self.ref_boxes[rp]['cx']
+                                    ur_y = self.ref_boxes[ra]['cy'] - self.ref_boxes[rp]['cy']
+                                    vr_x = self.ref_boxes[rb]['cx'] - self.ref_boxes[rp]['cx']
+                                    vr_y = self.ref_boxes[rb]['cy'] - self.ref_boxes[rp]['cy']
+                                    ang_ref = math.atan2(ur_x * vr_y - ur_y * vr_x, ur_x * vr_x + ur_y * vr_y)
 
-                        # Azimut v aktuálním měření senzoru
-                        d_x = cands[a][0] - cands[p][0]
-                        d_y = cands[a][1] - cands[p][1]
-                        az_cur = math.atan2(d_x, d_y)
+                                    # Orientovaný úhel v měření senzoru robota (+X doprava, +Y dopředu)
+                                    uc_x = cands[ca][0] - cands[cp][0]
+                                    uc_y = cands[ca][1] - cands[cp][1]
+                                    vc_x = cands[cb][0] - cands[cp][0]
+                                    vc_y = cands[cb][1] - cands[cp][1]
+                                    ang_cur = math.atan2(uc_x * vc_y - uc_y * vc_x, uc_x * vc_x + uc_y * vc_y)
 
-                        th = (az_ref - az_cur + math.pi) % (2 * math.pi) - math.pi
-                        cos_t = math.cos(th); sin_t = math.sin(th)
-                        tx = tp['pivot_pt'][0] - (cands[p][0] * cos_t + cands[p][1] * sin_t)
-                        ty = tp['pivot_pt'][1] - (-cands[p][0] * sin_t + cands[p][1] * cos_t)
+                                    # Rozdíl orientovaných úhlů
+                                    ang_diff = abs(math.atan2(math.sin(ang_cur - ang_ref), math.cos(ang_cur - ang_ref)))
+                                    if ang_diff > math.radians(14.0):
+                                        angles_ok = False
+                                        break
+                                if not angles_ok:
+                                    break
+                            if not angles_ok:
+                                break
+                    if not angles_ok:
+                        continue
 
-                        res = evaluate_transformation(
-                            tx, ty, th,
-                            active_anchors=self.anchors[:2],
-                            pattern_name="TROJÚHELNÍK (KOTVA 1 + 2)",
-                            base_score=5000.0
-                        )
+                    # 3. VÝPOČET RIGIDNÍ TRANSFORMACE (Kabsch / Procrustes)
+                    src = [cands[cand_perm[i]] for i in range(k)]
+                    dst = [(self.ref_boxes[ref_comb[i]]['cx'], self.ref_boxes[ref_comb[i]]['cy']) for i in range(k)]
+                    tx, ty, th = self._rigid_transform_2d(src, dst)
 
-                        if res['inliers'] >= 3 and res['score'] > best_score:
-                            best_score = res['score']
-                            best_match_info = res
+                    # 4. KONTROLA PRO k = 2 (výběr správné orientace, ochrana proti otočení o 180°)
+                    penalty = 0.0
+                    if k == 2:
+                        # Pokud je pozice robota mimo mantinely hřiště, silně penalizovat
+                        if not (-1400.0 <= tx <= 1400.0 and -400.0 <= ty <= 3800.0):
+                            penalty += 4000.0
 
-        # ========================================================
-        # STUPEŇ 2: SHODA JEDNOTLIVÝCH KOTEVA (Kotva 1 -> Kotva 2 -> Záložní)
-        # ========================================================
-        if best_match_info is None or best_match_info['inliers'] < 3:
-            for anchor in self.anchors:
-                d_ref = anchor['dist']
-                ref1 = anchor['p1']
-                ref2 = anchor['p2']
-                del_X = ref2[0] - ref1[0]
-                del_Y = ref2[1] - ref1[1]
-                az_ref = math.atan2(del_X, del_Y)
+                        # Kontinuita orientace a polohy (ochrana proti 180° skokům, pokud už robot byl lokalizován)
+                        if self.pose_confidence > 0.2:
+                            deg_cur = math.degrees(th)
+                            deg_diff = abs((deg_cur - self.robot_deg + 180.0) % 360.0 - 180.0)
+                            dist_jump = math.hypot(tx - self.robot_x, ty - self.robot_y)
+                            if deg_diff > 90.0:
+                                penalty += 3000.0 + deg_diff * 20.0
+                            if dist_jump > 600.0:
+                                penalty += dist_jump * 3.0
 
-                for a in range(len(cands)):
-                    for b in range(a + 1, len(cands)):
-                        d_cur = math.hypot(cands[a][0] - cands[b][0], cands[a][1] - cands[b][1])
-                        if abs(d_cur - d_ref) > 130.0: continue
+                    # 5. VYHODNOCENÍ VŠECH KANDIDÁTŮ S TOUTO TRANSFORMACÍ (Inliers)
+                    cos_t = math.cos(th); sin_t = math.sin(th)
+                    inliers = 0
+                    err_sum = 0.0
+                    inlier_pairs = []
 
-                        for (p1, p2) in [(cands[a], cands[b]), (cands[b], cands[a])]:
-                            d_x = p2[0] - p1[0]
-                            d_y = p2[1] - p1[1]
-                            az_cur = math.atan2(d_x, d_y)
+                    for cp in cands:
+                        wx = tx + cp[0] * cos_t + cp[1] * sin_t
+                        wy = ty - cp[0] * sin_t + cp[1] * cos_t
+                        min_d = 9999.0
+                        best_rb = None
+                        for rb in self.ref_boxes:
+                            d = math.hypot(wx - rb['cx'], wy - rb['cy'])
+                            if d < min_d:
+                                min_d = d
+                                best_rb = rb
 
-                            th = (az_ref - az_cur + math.pi) % (2 * math.pi) - math.pi
-                            cos_t = math.cos(th); sin_t = math.sin(th)
-                            tx = ref1[0] - (p1[0] * cos_t + p1[1] * sin_t)
-                            ty = ref1[1] - (-p1[0] * sin_t + p1[1] * cos_t)
+                        if min_d < 160.0 and best_rb:
+                            inliers += 1
+                            err_sum += min_d
+                            inlier_pairs.append(((best_rb['cx'], best_rb['cy']), (wx, wy), min_d))
 
-                            rank_bonus = max(0.0, 1500.0 - (anchor['rank'] - 1) * 350.0)
-                            res = evaluate_transformation(
-                                tx, ty, th,
-                                active_anchors=[anchor],
-                                pattern_name=anchor['name'],
-                                base_score=rank_bonus
-                            )
+                    avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
+                    base_bonus = 6000.0 if k >= 4 else (3500.0 if k == 3 else 1000.0)
+                    score = base_bonus + inliers * 500.0 - avg_err * 2.0 - penalty
 
-                            if res['inliers'] >= 2 and res['score'] > best_score:
-                                best_score = res['score']
-                                best_match_info = res
+                    if score > best_score and inliers >= 2:
+                        best_score = score
+                        # Sestavení spárovaných kotev ze všech referenčních kotev
+                        # Mapování z referenčního indexu na index kandidáta
+                        ref_to_cand = {ref_comb[i]: cand_perm[i] for i in range(k)}
+                        matched_anchors = []
+                        for anc in self.anchors:
+                            i1 = anc['idx1']; i2 = anc['idx2']
+                            if i1 in ref_to_cand and i2 in ref_to_cand:
+                                c1 = ref_to_cand[i1]; c2 = ref_to_cand[i2]
+                                p1_cur = cands[c1]; p2_cur = cands[c2]
+                                w1x = tx + p1_cur[0] * cos_t + p1_cur[1] * sin_t
+                                w1y = ty - p1_cur[0] * sin_t + p1_cur[1] * cos_t
+                                w2x = tx + p2_cur[0] * cos_t + p2_cur[1] * sin_t
+                                w2y = ty - p2_cur[0] * sin_t + p2_cur[1] * cos_t
+                                cur_d = math.hypot(p2_cur[0] - p1_cur[0], p2_cur[1] - p1_cur[1])
+                                matched_anchors.append({
+                                    'anchor': anc,
+                                    'p1_world': (w1x, w1y),
+                                    'p2_world': (w2x, w2y),
+                                    'cur_dist': cur_d,
+                                    'ref_dist': anc['dist']
+                                })
 
-        # ========================================================
-        # APLIKACE VÝSLEDKU LOKALIZACE
-        # ========================================================
+                        pat_name = f"PLNÁ SHODA ({k} CÍLE, {len(matched_anchors)} KOTEVA)" if k >= 4 else \
+                                  (f"TROJÚHELNÍK (3 CÍLE, {len(matched_anchors)} KOTVY)" if k == 3 else \
+                                   f"DVĚ SVÍČKY ({matched_anchors[0]['anchor']['name'] if matched_anchors else 'KOTVA'})")
+
+                        best_match_info = {
+                            'inliers': inliers,
+                            'k_matched': k,
+                            'avg_error': avg_err,
+                            'tx': tx, 'ty': ty, 'theta': th,
+                            'inlier_pairs': inlier_pairs,
+                            'matched_anchors': matched_anchors,
+                            'pattern_name': pat_name,
+                            'score': score
+                        }
+
+            # Pokud jsme našli platnou shodu s k >= 3, preferujeme ji
+            if best_match_info is not None and best_match_info['k_matched'] >= 3:
+                break
+
+        # Aplikace výsledku lokalizace
         if best_match_info is not None and best_match_info['inliers'] >= 2:
             self.last_match_info = best_match_info
             self.robot_x = best_match_info['tx']
@@ -941,34 +927,17 @@ class DualLidarVisualizer:
         loc = self.localizer
         ref_boxes = loc.ref_boxes if loc.locked else parse_box_list(self.last_frame.get("static_boxes", []))
 
-        # Kotvy a trojúhelník
+        # Kotvy (všech až 6 kotev seřazených a odlišených barvami)
         if loc.locked and loc.anchors:
-            # KOTVA 1 (Zlatá)
-            if len(loc.anchors) >= 1:
-                a1 = loc.anchors[0]
-                p1 = self.to_screen(a1['p1'][0], a1['p1'][1], offset_x)
-                p2 = self.to_screen(a1['p2'][0], a1['p2'][1], offset_x)
-                pygame.draw.line(self.screen, a1['color'], p1, p2, 4)
+            for a in loc.anchors:
+                p1 = self.to_screen(a['p1'][0], a['p1'][1], offset_x)
+                p2 = self.to_screen(a['p2'][0], a['p2'][1], offset_x)
+                thick = 4 if a['rank'] == 1 else (3 if a['rank'] <= 2 else 2)
+                pygame.draw.line(self.screen, a['color'], p1, p2, thick)
                 mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
-                self.screen.blit(self.font_bold.render(f"KOTVA 1: {int(a1['dist'])} mm", True, a1['color']), (mx + 8, my - 8))
-
-            # KOTVA 2 (Oranžová)
-            if len(loc.anchors) >= 2:
-                a2 = loc.anchors[1]
-                p1 = self.to_screen(a2['p1'][0], a2['p1'][1], offset_x)
-                p2 = self.to_screen(a2['p2'][0], a2['p2'][1], offset_x)
-                pygame.draw.line(self.screen, a2['color'], p1, p2, 3)
-                mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
-                self.screen.blit(self.font_bold.render(f"KOTVA 2: {int(a2['dist'])} mm", True, a2['color']), (mx + 8, my + 8))
-
-            # Trojúhelníkový vzorec (spojnice)
-            if loc.triangle_pattern:
-                tp = loc.triangle_pattern
-                p1 = self.to_screen(tp['p1_pt'][0], tp['p1_pt'][1], offset_x)
-                p2 = self.to_screen(tp['p2_pt'][0], tp['p2_pt'][1], offset_x)
-                pygame.draw.line(self.screen, (0, 220, 255), p1, p2, 2)
-                mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
-                self.screen.blit(self.font_main.render(f"{int(tp['dist3'])} mm ({tp['angle_deg']:.0f}°)", True, (0, 220, 255)), (mx - 20, my - 16))
+                off_y = -14 if (a['rank'] % 2 == 1) else 6
+                lbl = self.font_bold.render(f"K{a['rank']}: {int(a['dist'])} mm", True, a['color'])
+                self.screen.blit(lbl, (mx + 8, my + off_y))
 
         # Vykreslení referenčních Bounding Boxů
         for idx, cl in enumerate(ref_boxes):
@@ -1069,67 +1038,42 @@ class DualLidarVisualizer:
             # Střed boxu ve světě
             wx = loc.robot_x + cx_local * cos_t + cy_local * sin_t
             wy = loc.robot_y - cx_local * sin_t + cy_local * cos_t
-
-            # 4 rohy orientovaného Bounding Boxu
-            hw = cl['width'] * 0.5
-            hh = cl['height'] * 0.5
-            local_corners = [
-                (cx_local - hw, cy_local - hh),
-                (cx_local + hw, cy_local - hh),
-                (cx_local + hw, cy_local + hh),
-                (cx_local - hw, cy_local + hh)
-            ]
-            poly_scr = []
-            for lx, ly in local_corners:
-                g_cx = loc.robot_x + lx * cos_t + ly * sin_t
-                g_cy = loc.robot_y - lx * sin_t + ly * cos_t
-                poly_scr.append(self.to_screen(g_cx, g_cy, offset_x))
-
             transformed_boxes.append({
                 'box': cl,
-                'wx': wx, 'wy': wy,
-                'poly_scr': poly_scr
+                'wx': wx, 'wy': wy
             })
 
-        # 3. KOTVY A VZDÁLENOSTI MEZI NOVÝMI BOUNDING BOXY (PŘÍMKY V POLI)
-        n_tb = len(transformed_boxes)
-        for i in range(n_tb):
-            for j in range(i + 1, n_tb):
-                b1 = transformed_boxes[i]
-                b2 = transformed_boxes[j]
-                d_cur = math.hypot(b1['wx'] - b2['wx'], b1['wy'] - b2['wy'])
-                p1 = self.to_screen(b1['wx'], b1['wy'], offset_x)
-                p2 = self.to_screen(b2['wx'], b2['wy'], offset_x)
+        # 3. KOTVY MEZI NOVÝMI BOUNDING BOXY (VŠECHNY SPÁROVANÉ KOTVY Z ETALONU)
+        match = loc.last_match_info
+        matched_anchors = match.get('matched_anchors', []) if match else []
 
-                # Porovnání s referenčními kotvami
-                is_k1 = False
-                is_k2 = False
-                if len(loc.anchors) >= 1 and abs(d_cur - loc.anchors[0]['dist']) < 130.0:
-                    is_k1 = True
-                elif len(loc.anchors) >= 2 and abs(d_cur - loc.anchors[1]['dist']) < 130.0:
-                    is_k2 = True
+        # Vykreslení všech spárovaných kotev z grafu
+        for ma in matched_anchors:
+            anc = ma['anchor']
+            p1 = self.to_screen(ma['p1_world'][0], ma['p1_world'][1], offset_x)
+            p2 = self.to_screen(ma['p2_world'][0], ma['p2_world'][1], offset_x)
+            thick = 4 if anc['rank'] == 1 else (3 if anc['rank'] <= 2 else 2)
+            pygame.draw.line(self.screen, anc['color'], p1, p2, thick)
+            mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
+            off_y = -14 if (anc['rank'] % 2 == 1) else 6
+            lbl = self.font_bold.render(f"K{anc['rank']}: {int(ma['cur_dist'])} mm", True, anc['color'])
+            self.screen.blit(lbl, (mx + 8, my + off_y))
 
-                mx = (p1[0] + p2[0]) // 2
-                my = (p1[1] + p2[1]) // 2
-
-                if is_k1:
-                    # KOTVA 1 (Zlatá)
-                    pygame.draw.line(self.screen, (255, 215, 0), p1, p2, 4)
-                    lbl = self.font_bold.render(f"KOTVA 1: {int(d_cur)} mm", True, (255, 215, 0))
-                    self.screen.blit(lbl, (mx + 8, my - 16))
-                elif is_k2:
-                    # KOTVA 2 (Oranžová)
-                    pygame.draw.line(self.screen, (255, 150, 40), p1, p2, 3)
-                    lbl = self.font_bold.render(f"KOTVA 2: {int(d_cur)} mm", True, (255, 150, 40))
-                    self.screen.blit(lbl, (mx + 8, my + 6))
-                else:
-                    # Další spojnice
+        # Pokud ještě nemáme spárované kotvy, zobrazíme surové vzdálenosti mezi detekovanými boxy
+        if not matched_anchors:
+            n_tb = len(transformed_boxes)
+            for i in range(n_tb):
+                for j in range(i + 1, n_tb):
+                    b1 = transformed_boxes[i]
+                    b2 = transformed_boxes[j]
+                    d_cur = math.hypot(b1['wx'] - b2['wx'], b1['wy'] - b2['wy'])
+                    p1 = self.to_screen(b1['wx'], b1['wy'], offset_x)
+                    p2 = self.to_screen(b2['wx'], b2['wy'], offset_x)
                     pygame.draw.line(self.screen, (0, 180, 220), p1, p2, 1)
-                    lbl = self.font_main.render(f"{int(d_cur)} mm", True, (0, 200, 240))
-                    self.screen.blit(lbl, (mx + 6, my - 8))
+                    mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
+                    self.screen.blit(self.font_main.render(f"{int(d_cur)} mm", True, (0, 200, 240)), (mx + 6, my - 8))
 
         # 4. ROZHODOVACÍ PAPRSKY SHOD MEZI INLIERY A REFERENČNÍMI BODY
-        match = loc.last_match_info
         if match and match.get('inlier_pairs'):
             for ref_pt, cur_trans_pt, err in match['inlier_pairs']:
                 rp = self.to_screen(ref_pt[0], ref_pt[1], offset_x)
@@ -1140,22 +1084,29 @@ class DualLidarVisualizer:
                 mid_y = (rp[1] + cp[1]) // 2
                 self.screen.blit(self.font_main.render(f"Δ{err:.0f}mm", True, (255, 130, 220)), (mid_x + 4, mid_y - 6))
 
-        # 5. VYKRESLENÍ PLNÝCH ORIENTOVANÝCH BOUNDING BOXŮ Z NOVÉHO MÍSTA
+        # 5. VYKRESLENÍ PLNÝCH NENATOČENÝCH BOUNDING BOXŮ Z NOVÉHO MÍSTA (AABB)
         for idx, tb in enumerate(transformed_boxes):
             cl = tb['box']
             wx = tb['wx']
             wy = tb['wy']
-            poly_scr = tb['poly_scr']
+            hw = cl['width'] * 0.5
+            hh = cl['height'] * 0.5
+
+            p_min = self.to_screen(wx - hw, wy + hh, offset_x)
+            p_max = self.to_screen(wx + hw, wy - hh, offset_x)
+            rx = min(p_min[0], p_max[0])
+            ry = min(p_min[1], p_max[1])
+            rw = max(10, abs(p_max[0] - p_min[0]))
+            rh = max(10, abs(p_max[1] - p_min[1]))
 
             box_col = (0, 240, 160) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 180, 40)
 
-            # Poloprůhledná výplň orientovaného boxu
-            s_poly = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
-            fill_col = (0, 200, 140, 35) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 160, 30, 35)
-            local_poly = [(pt[0] - offset_x, pt[1]) for pt in poly_scr]
-            pygame.draw.polygon(s_poly, fill_col, local_poly)
-            pygame.draw.polygon(s_poly, box_col, local_poly, 2)
-            self.screen.blit(s_poly, (offset_x, 0))
+            # Poloprůhledná výplň nenatočeného pravoúhlého boxu
+            s_fill = pygame.Surface((rw, rh), pygame.SRCALPHA)
+            fill_col = (0, 200, 140, 30) if cl['type'] == 'SVÍČKA+STĚNA' else (255, 160, 30, 30)
+            s_fill.fill(fill_col)
+            self.screen.blit(s_fill, (rx, ry))
+            pygame.draw.rect(self.screen, box_col, (rx, ry, rw, rh), 2)
 
             # Středový křížek
             scx, scy = self.to_screen(wx, wy, offset_x)
@@ -1232,7 +1183,7 @@ class DualLidarVisualizer:
         fov_tag = "360° V POLI" if not self.fov_limited else "180° START"
 
         self.screen.blit(self.font_big.render(f"3. SHODA [{fov_tag}]: {pat_name}", True, (80, 255, 160)), (offset_x + 25, 17))
-        sub_str = f"Inliery: {inliers} | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
+        sub_str = f"Inliery: {inliers} | Kotvy: {len(matched_anchors)}/6 | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
         self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 38))
 
         # 9. SPODNÍ TIP PANEL
@@ -1242,8 +1193,8 @@ class DualLidarVisualizer:
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
         self.screen.blit(self.font_bold.render("DRUHÁ STATICKÁ MAPA & KOTVY Z NOVÉHO MÍSTA:", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Zlatá: KOTVA 1 (nejdelší rozvor) | Oranžová: KOTVA 2 | Růžová: paprsky shod", True, (240, 220, 80)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• Šedé obdélníky = etalon ze STARTu | Barevné obdélníky = boxy z nového místa", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_main.render("• Barevné spojnice K1..K6 = spárované kotvy z etalonu (ověřené vnitřní úhly)", True, (240, 220, 80)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Nenatočené pravoúhlé boxy AABB [wx, wy] odpovídající etalonu ze STARTu", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
 
     # ========================================================
     #  PANEL 4: OBDÉLNÍKOVÁ MAPA CELÉHO HŘIŠTĚ (KUMULATIVNÍ CÍLE)
