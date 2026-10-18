@@ -23,10 +23,12 @@ private:
 public:
     CommProtocol(Stream& port = Serial) : _port(port) {}
 
-    // Odeslání kompletního rámce v kompaktním JSONu
+    // Odeslání kompletního rámce v kompaktním JSONu (včetně cílů a trasy počítaných na ESP32)
     void sendFrame(const LidarPoint* points, int pointCount,
                    const BoundingBox* boxes, int boxCount,
                    const BoundingBox* staticBoxes, int staticBoxCount,
+                   const TargetDetail* targets, int targetCount,
+                   const int* route, int routeCount,
                    const LidarDiagnostics& diag,
                    int subsampleStep = 2) // Odesíláme každý 2. bod pro plynulost
     {
@@ -80,6 +82,57 @@ public:
             _port.print(staticBoxes[i].point_count); _port.print(',');
             _port.print(staticBoxes[i].is_solo_candle ? 1 : 0);
             _port.print(']');
+        }
+        _port.print(']');
+
+        // 3. Kompletní detailní cíle (počítáno 100% na ESP32: Svíčky, Stěny, Waypointy a Nájezdy)
+        _port.print(F(",\"targets\":["));
+        for (int i = 0; i < targetCount; i++) {
+            if (i > 0) _port.print(',');
+            const TargetDetail& td = targets[i];
+            _port.print(F("{\"id\":")); _port.print(td.id);
+            _port.print(F(",\"type\":"));
+            if (td.type == TARGET_CORNER) _port.print(F("\"ROH\""));
+            else if (td.type == TARGET_WALL) _port.print(F("\"STĚNA\""));
+            else _port.print(F("\"VOLNÁ\""));
+            _port.print(F(",\"candle\":["));
+            _port.print((int)roundf(td.candle_x)); _port.print(',');
+            _port.print((int)roundf(td.candle_y)); _port.print(']');
+            _port.print(F(",\"box\":["));
+            _port.print((int)roundf(td.box.min_x)); _port.print(',');
+            _port.print((int)roundf(td.box.max_x)); _port.print(',');
+            _port.print((int)roundf(td.box.min_y)); _port.print(',');
+            _port.print((int)roundf(td.box.max_y)); _port.print(',');
+            _port.print((int)roundf(td.box.cx)); _port.print(',');
+            _port.print((int)roundf(td.box.cy)); _port.print(',');
+            _port.print((int)roundf(td.box.width)); _port.print(',');
+            _port.print((int)roundf(td.box.height)); _port.print(']');
+            _port.print(F(",\"waypoint\":["));
+            _port.print((int)roundf(td.waypoint_x)); _port.print(',');
+            _port.print((int)roundf(td.waypoint_y)); _port.print(']');
+            _port.print(F(",\"approach\":["));
+            _port.print(td.approach_dx, 3); _port.print(',');
+            _port.print(td.approach_dy, 3); _port.print(']');
+            _port.print(F(",\"travel_mm\":")); _port.print((int)roundf(td.travel_dist_mm));
+            _port.print(F(",\"walls\":["));
+            for (int w = 0; w < td.wall_count; w++) {
+                if (w > 0) _port.print(',');
+                _port.print(F("[["));
+                _port.print((int)roundf(td.walls[w].x1)); _port.print(',');
+                _port.print((int)roundf(td.walls[w].y1)); _port.print(F("],["));
+                _port.print((int)roundf(td.walls[w].x2)); _port.print(',');
+                _port.print((int)roundf(td.walls[w].y2)); _port.print(F("]]"));
+            }
+            _port.print(']');
+            _port.print('}');
+        }
+        _port.print(']');
+
+        // 4. Optimální trasa hašení (pořadí ID cílů ze startu robota)
+        _port.print(F(",\"route\":["));
+        for (int i = 0; i < routeCount; i++) {
+            if (i > 0) _port.print(',');
+            _port.print(route[i]);
         }
         _port.print(']');
 

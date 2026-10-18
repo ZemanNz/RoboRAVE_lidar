@@ -56,6 +56,27 @@ struct TrackedBox {
     int missed;    // Počet po sobě jdoucích skenů, kdy nebyl vidět
 };
 
+enum TargetType {
+    TARGET_SOLO = 0,    // Volná svíčka bez stěn
+    TARGET_WALL = 1,    // Svíčka chráněná 1 deskou (300 mm)
+    TARGET_CORNER = 2   // Svíčka v rohu mezi 2 deskami (L-box)
+};
+
+// Kompletní cíl detekovaný a spočítaný přímo na ESP32 (Svíčka, Stěny, Waypoint 38cm, Nájezd)
+struct TargetDetail {
+    int id;                        // 1 .. 4
+    TargetType type;               // SOLO, WALL, CORNER
+    BoundingBox box;               // Ohraničující box
+    float candle_x, candle_y;      // Přesný střed plamene svíčky v mm
+    int wall_count;                // 0, 1 nebo 2 stěny
+    WallSegment walls[2];          // Úsečky stěn v mm
+    float waypoint_x, waypoint_y;  // Cílový nájezdový bod (38 cm před svíčkou v mm)
+    float approach_dx, approach_dy;// Směrový vektor nájezdu (od waypointu do svíčky)
+    float travel_dist_mm;          // Vzdálenost od středu robota k waypointu v mm
+    bool is_visible;               // Přímo viditelný v tomto skenu
+    int hits;                      // Počet potvrzení v čase
+};
+
 #define MAX_DETECTED_BOXES 4
 #define MAX_TRACKED_BOXES 8
 

@@ -1270,28 +1270,377 @@ public:
 };
 
 // ============================================================
+//  TargetExtractor - Detailní geometrie cíle na ESP32 (Svíčka, Stěny, Nájezdy)
+// ============================================================
+class TargetExtractor {
+public:
+    static TargetDetail extract(const LidarPoint* points, int count, const BoundingBox& box) {
+        TargetDetail target;
+        memset(&target, 0, sizeof(target));
+        target.box = box;
+        target.is_visible = true;
+
+        float margin = 35.0f;
+        float bMinX = box.min_x - margin;
+        float bMaxX = box.max_x + margin;
+        float bMinY = box.min_y - margin;
+        float bMaxY = box.max_y + margin;
+
+        int boxIndices[120];
+        int boxPtCount = 0;
+        float sumX = 0.0f, sumY = 0.0f;
+        for (int i = 0; i < count && boxPtCount < 120; i++) {
+            if (!points[i].valid) continue;
+            float px = points[i].x;
+            float py = points[i].y;
+            if (px >= bMinX && px <= bMaxX && py >= bMinY && py <= bMaxY) {
+                boxIndices[boxPtCount++] = i;
+                sumX += px;
+                sumY += py;
+            }
+        }
+
+        // Malý shluk nebo samostatná svíčka
+        if (boxPtCount < 5 || box.span_mm < 160.0f || box.is_solo_candle) {
+            target.type = TARGET_SOLO;
+            target.candle_x = (boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx;
+            target.candle_y = (boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy;
+            target.wall_count = 0;
+
+            float dLen = hypotf(target.candle_x, target.candle_y);
+            float ux = (dLen > 10.0f) ? (target.candle_x / dLen) : 0.0f;
+            float uy = (dLen > 10.0f) ? (target.candle_y / dLen) : 1.0f;
+
+            target.waypoint_x = target.candle_x - ux * 380.0f;
+            target.waypoint_y = target.candle_y - uy * 380.0f;
+            target.approach_dx = ux;
+            target.approach_dy = uy;
+            target.travel_dist_mm = hypotf(target.waypoint_x, target.waypoint_y);
+            return target;
+        }
+
+        // Hledání stěny 1 pomocí RANSAC s překlenutím stínu svíčky
+        int bestW1Inliers[120];
+        int bestW1Count = 0;
+        int p1_idx = -1, p2_idx = -1;
+
+        for (int i = 0; i < boxPtCount && i < 30; i++) {
+            int idx1 = boxIndices[i];
+            float x1 = points[idx1].x;
+            float y1 = points[idx1].y;
+            for (int j = i + 1; j < boxPtCount && j < 30; j++) {
+                int idx2 = boxIndices[j];
+                float x2 = points[idx2].x;
+                float y2 = points[idx2].y;
+                float d = hypotf(x2 - x1, y2 - y1);
+                if (d < 75.0f) continue;
+
+                float nx = -(y2 - y1) / d;
+                float ny = (x2 - x1) / d;
+
+                int inlCount = 0;
+                int tempInl[120];
+                for (int k = 0; k < boxPtCount; k++) {
+                    int pIdx = boxIndices[k];
+                    float dist = fabsf((points[pIdx].x - x1) * nx + (points[pIdx].y - y1) * ny);
+                    if (dist <= 22.0f) {
+                        tempInl[inlCount++] = pIdx;
+                    }
+                }
+                if (inlCount > bestW1Count) {
+                    bestW1Count = inlCount;
+                    p1_idx = idx1;
+                    p2_idx = idx2;
+                    for (int k = 0; k < inlCount; k++) bestW1Inliers[k] = tempInl[k];
+                }
+            }
+        }
+
+        if (bestW1Count < 4) {
+            target.type = TARGET_SOLO;
+            target.candle_x = sumX / (float)boxPtCount;
+            target.candle_y = sumY / (float)boxPtCount;
+            target.wall_count = 0;
+            float dLen = hypotf(target.candle_x, target.candle_y);
+            float ux = (dLen > 10.0f) ? (target.candle_x / dLen) : 0.0f;
+            float uy = (dLen > 10.0f) ? (target.candle_y / dLen) : 1.0f;
+            target.waypoint_x = target.candle_x - ux * 380.0f;
+            target.waypoint_y = target.candle_y - uy * 380.0f;
+            target.approach_dx = ux;
+            target.approach_dy = uy;
+            target.travel_dist_mm = hypotf(target.waypoint_x, target.waypoint_y);
+            return target;
+        }
+
+        float dx1 = points[p2_idx].x - points[p1_idx].x;
+        float dy1 = points[p2_idx].y - points[p1_idx].y;
+        float L1 = hypotf(dx1, dy1);
+        float u1x = dx1 / L1;
+        float u1y = dy1 / L1;
+
+        float minT1 = 99999.0f, maxT1 = -99999.0f;
+        for (int k = 0; k < bestW1Count; k++) {
+            int pIdx = bestW1Inliers[k];
+            float proj = (points[pIdx].x - points[p1_idx].x) * u1x + (points[pIdx].y - points[p1_idx].y) * u1y;
+            if (proj < minT1) minT1 = proj;
+            if (proj > maxT1) maxT1 = proj;
+        }
+
+        float w1_sx = points[p1_idx].x + u1x * minT1;
+        float w1_sy = points[p1_idx].y + u1y * minT1;
+        float w1_ex = points[p1_idx].x + u1x * maxT1;
+        float w1_ey = points[p1_idx].y + u1y * maxT1;
+        float w1_len = maxT1 - minT1;
+
+        int outlierIndices[120];
+        int outCount = 0;
+        for (int i = 0; i < boxPtCount; i++) {
+            int idx = boxIndices[i];
+            bool isInl = false;
+            for (int k = 0; k < bestW1Count; k++) {
+                if (bestW1Inliers[k] == idx) { isInl = true; break; }
+            }
+            if (!isInl) outlierIndices[outCount++] = idx;
+        }
+
+        // Hledání druhé stěny v outlierech kolmé na stěnu 1
+        int bestW2Inliers[120];
+        int bestW2Count = 0;
+        int q1_idx = -1, q2_idx = -1;
+
+        if (outCount >= 4) {
+            for (int i = 0; i < outCount && i < 25; i++) {
+                int qidx1 = outlierIndices[i];
+                float qx1 = points[qidx1].x;
+                float qy1 = points[qidx1].y;
+                for (int j = i + 1; j < outCount && j < 25; j++) {
+                    int qidx2 = outlierIndices[j];
+                    float qx2 = points[qidx2].x;
+                    float qy2 = points[qidx2].y;
+                    float qd = hypotf(qx2 - qx1, qy2 - qy1);
+                    if (qd < 65.0f) continue;
+
+                    float qux = (qx2 - qx1) / qd;
+                    float quy = (qy2 - qy1) / qd;
+                    float dot = fabsf(u1x * qux + u1y * quy);
+                    if (dot > 0.50f) continue; // kolmost (60° až 120°)
+
+                    float qnx = -quy;
+                    float qny = qux;
+                    int inl2 = 0;
+                    int tempInl2[120];
+                    for (int k = 0; k < outCount; k++) {
+                        int pIdx = outlierIndices[k];
+                        float dist = fabsf((points[pIdx].x - qx1) * qnx + (points[pIdx].y - qy1) * qny);
+                        if (dist <= 22.0f) tempInl2[inl2++] = pIdx;
+                    }
+                    if (inl2 > bestW2Count) {
+                        bestW2Count = inl2;
+                        q1_idx = qidx1;
+                        q2_idx = qidx2;
+                        for (int k = 0; k < inl2; k++) bestW2Inliers[k] = tempInl2[k];
+                    }
+                }
+            }
+        }
+
+        // A. ROH (2 STĚNY)
+        if (bestW2Count >= 3) {
+            target.type = TARGET_CORNER;
+            target.wall_count = 2;
+
+            float qdx = points[q2_idx].x - points[q1_idx].x;
+            float qdy = points[q2_idx].y - points[q1_idx].y;
+            float L2 = hypotf(qdx, qdy);
+            float u2x = qdx / L2;
+            float u2y = qdy / L2;
+
+            float cross = u1x * u2y - u1y * u2x;
+            float Vx = 0.0f, Vy = 0.0f;
+            if (fabsf(cross) > 1e-4f) {
+                float s = ((points[q1_idx].x - points[p1_idx].x) * u2y - (points[q1_idx].y - points[p1_idx].y) * u2x) / cross;
+                Vx = points[p1_idx].x + s * u1x;
+                Vy = points[p1_idx].y + s * u1y;
+            } else {
+                Vx = (w1_sx + w1_ex) * 0.5f;
+                Vy = (w1_sy + w1_ey) * 0.5f;
+            }
+
+            float d_s1 = hypotf(w1_sx - Vx, w1_sy - Vy);
+            float d_e1 = hypotf(w1_ex - Vx, w1_ey - Vy);
+            float far1x = (d_e1 > d_s1) ? w1_ex : w1_sx;
+            float far1y = (d_e1 > d_s1) ? w1_ey : w1_sy;
+            float arm1_len = fmaxf(240.0f, fmaxf(d_s1, d_e1));
+            float norm1 = fmaxf(1.0f, hypotf(far1x - Vx, far1y - Vy));
+            float arm1_ux = (far1x - Vx) / norm1;
+            float arm1_uy = (far1y - Vy) / norm1;
+
+            target.walls[0].x1 = Vx; target.walls[0].y1 = Vy;
+            target.walls[0].x2 = Vx + arm1_ux * arm1_len; target.walls[0].y2 = Vy + arm1_uy * arm1_len;
+            target.walls[0].length_mm = arm1_len;
+            target.walls[0].point_count = bestW1Count;
+
+            float minT2 = 99999.0f, maxT2 = -99999.0f;
+            for (int k = 0; k < bestW2Count; k++) {
+                int pIdx = bestW2Inliers[k];
+                float proj = (points[pIdx].x - points[q1_idx].x) * u2x + (points[pIdx].y - points[q1_idx].y) * u2y;
+                if (proj < minT2) minT2 = proj;
+                if (proj > maxT2) maxT2 = proj;
+            }
+            float w2_sx = points[q1_idx].x + u2x * minT2;
+            float w2_sy = points[q1_idx].y + u2y * minT2;
+            float w2_ex = points[q1_idx].x + u2x * maxT2;
+            float w2_ey = points[q1_idx].y + u2y * maxT2;
+            float d_s2 = hypotf(w2_sx - Vx, w2_sy - Vy);
+            float d_e2 = hypotf(w2_ex - Vx, w2_ey - Vy);
+            float far2x = (d_e2 > d_s2) ? w2_ex : w2_sx;
+            float far2y = (d_e2 > d_s2) ? w2_ey : w2_sy;
+            float arm2_len = fmaxf(240.0f, fmaxf(d_s2, d_e2));
+            float norm2 = fmaxf(1.0f, hypotf(far2x - Vx, far2y - Vy));
+            float arm2_ux = (far2x - Vx) / norm2;
+            float arm2_uy = (far2y - Vy) / norm2;
+
+            target.walls[1].x1 = Vx; target.walls[1].y1 = Vy;
+            target.walls[1].x2 = Vx + arm2_ux * arm2_len; target.walls[1].y2 = Vy + arm2_uy * arm2_len;
+            target.walls[1].length_mm = arm2_len;
+            target.walls[1].point_count = bestW2Count;
+
+            float candSumX = 0.0f, candSumY = 0.0f;
+            int candPts = 0;
+            for (int i = 0; i < outCount; i++) {
+                int idx = outlierIndices[i];
+                bool isW2 = false;
+                for (int k = 0; k < bestW2Count; k++) {
+                    if (bestW2Inliers[k] == idx) { isW2 = true; break; }
+                }
+                if (!isW2) {
+                    candSumX += points[idx].x;
+                    candSumY += points[idx].y;
+                    candPts++;
+                }
+            }
+            if (candPts > 0) {
+                target.candle_x = candSumX / (float)candPts;
+                target.candle_y = candSumY / (float)candPts;
+            } else {
+                target.candle_x = Vx + 85.0f * arm1_ux + 85.0f * arm2_ux;
+                target.candle_y = Vy + 85.0f * arm1_uy + 85.0f * arm2_uy;
+            }
+
+            float bisect_x = arm1_ux + arm2_ux;
+            float bisect_y = arm1_uy + arm2_uy;
+            float blen = hypotf(bisect_x, bisect_y);
+            float u_open_x = (blen > 0.01f) ? (bisect_x / blen) : 0.0f;
+            float u_open_y = (blen > 0.01f) ? (bisect_y / blen) : 1.0f;
+
+            target.waypoint_x = target.candle_x + u_open_x * 380.0f;
+            target.waypoint_y = target.candle_y + u_open_y * 380.0f;
+            target.approach_dx = -u_open_x;
+            target.approach_dy = -u_open_y;
+            target.travel_dist_mm = hypotf(target.waypoint_x, target.waypoint_y);
+            return target;
+        }
+
+        // B. 1 STĚNA
+        target.type = TARGET_WALL;
+        target.wall_count = 1;
+
+        float pad1 = (300.0f - w1_len) * 0.5f;
+        if (pad1 > 0.0f) {
+            w1_sx -= pad1 * u1x; w1_sy -= pad1 * u1y;
+            w1_ex += pad1 * u1x; w1_ey += pad1 * u1y;
+            w1_len = 300.0f;
+        }
+        target.walls[0].x1 = w1_sx; target.walls[0].y1 = w1_sy;
+        target.walls[0].x2 = w1_ex; target.walls[0].y2 = w1_ey;
+        target.walls[0].length_mm = w1_len;
+        target.walls[0].point_count = bestW1Count;
+
+        if (outCount > 0) {
+            float oSumX = 0.0f, oSumY = 0.0f;
+            for (int i = 0; i < outCount; i++) {
+                oSumX += points[outlierIndices[i]].x;
+                oSumY += points[outlierIndices[i]].y;
+            }
+            target.candle_x = oSumX / (float)outCount;
+            target.candle_y = oSumY / (float)outCount;
+        } else {
+            target.candle_x = (w1_sx + w1_ex) * 0.5f;
+            target.candle_y = (w1_sy + w1_ey) * 0.5f;
+        }
+
+        float t_proj = (target.candle_x - w1_sx) * u1x + (target.candle_y - w1_sy) * u1y;
+        float t_clamp = fmaxf(0.0f, fminf(w1_len, t_proj));
+        float p_proj_x = w1_sx + t_clamp * u1x;
+        float p_proj_y = w1_sy + t_clamp * u1y;
+
+        float perp_dx = target.candle_x - p_proj_x;
+        float perp_dy = target.candle_y - p_proj_y;
+        float perp_dist = hypotf(perp_dx, perp_dy);
+        float norm_x = 0.0f, norm_y = 0.0f;
+
+        if (perp_dist > 15.0f) {
+            norm_x = perp_dx / perp_dist;
+            norm_y = perp_dy / perp_dist;
+        } else {
+            float nx = -u1y, ny = u1x;
+            if (nx * (-p_proj_x) + ny * (-p_proj_y) < 0) {
+                nx = -nx; ny = -ny;
+            }
+            norm_x = nx; norm_y = ny;
+            target.candle_x = p_proj_x + norm_x * 80.0f;
+            target.candle_y = p_proj_y + norm_y * 80.0f;
+        }
+
+        target.waypoint_x = target.candle_x + norm_x * 380.0f;
+        target.waypoint_y = target.candle_y + norm_y * 380.0f;
+        target.approach_dx = -norm_x;
+        target.approach_dy = -norm_y;
+        target.travel_dist_mm = hypotf(target.waypoint_x, target.waypoint_y);
+        return target;
+    }
+};
+
+struct TrackedTarget {
+    TargetDetail target;
+    int type_votes[3]; // [0]=SOLO, [1]=WALL, [2]=CORNER
+    int hits;
+    int missed;
+    bool active;
+};
+
+// ============================================================
 //  StaticMapTracker - Dlouhodobá statická mapa na ESP32
-//  Agreguje snímky v čase a udržuje nejstabilnější/nejčastější boxy.
+//  Agreguje snímky v čase a udržuje nejstabilnější/nejčastější boxy a cíle.
 // ============================================================
 class StaticMapTracker {
 private:
     TrackedBox _tracked[MAX_TRACKED_BOXES];
     int _trackedCount = 0;
+    TrackedTarget _trackedTargets[MAX_TRACKED_BOXES];
     uint32_t _totalScans = 0;
 
 public:
+    StaticMapTracker() {
+        reset();
+    }
+
     void reset() {
         _trackedCount = 0;
         _totalScans = 0;
+        for (int i = 0; i < MAX_TRACKED_BOXES; i++) {
+            _trackedTargets[i].active = false;
+            _trackedTargets[i].hits = 0;
+            _trackedTargets[i].missed = 0;
+        }
     }
 
+    // Původní metoda pro aktualizaci boxů
     void update(const BoundingBox* liveBoxes, int liveCount, float matchDistMm = 160.0f) {
-        _totalScans++;
         float matchDistSq = matchDistMm * matchDistMm;
         bool matchedTracked[MAX_TRACKED_BOXES];
         for (int i = 0; i < _trackedCount; i++) matchedTracked[i] = false;
 
-        // Pro každý živý box hledáme odpovídající sledovaný box
         for (int i = 0; i < liveCount; i++) {
             const BoundingBox& lb = liveBoxes[i];
             int bestIdx = -1;
@@ -1309,7 +1658,6 @@ public:
             }
 
             if (bestIdx >= 0) {
-                // Nalezen odpovídající záznam -> EMA vyhlazení polohy a rozměrů
                 TrackedBox& tb = _tracked[bestIdx];
                 const float alpha = 0.20f;
                 tb.box.cx = (1.0f - alpha) * tb.box.cx + alpha * lb.cx;
@@ -1329,7 +1677,6 @@ public:
                 tb.missed = 0;
                 matchedTracked[bestIdx] = true;
             } else {
-                // Nový kandidát
                 if (_trackedCount < MAX_TRACKED_BOXES) {
                     TrackedBox& tb = _tracked[_trackedCount++];
                     tb.box = lb;
@@ -1339,14 +1686,12 @@ public:
             }
         }
 
-        // Inkremetace missed pro ty, které nebyly viděny v tomto snímku
         for (int j = 0; j < _trackedCount; j++) {
             if (!matchedTracked[j]) {
                 _tracked[j].missed++;
             }
         }
 
-        // Čištění: pokud chybí příliš dlouho, zahodit (šum rychle zanikne)
         int writeIdx = 0;
         for (int r = 0; r < _trackedCount; r++) {
             bool keep = (_tracked[r].hits >= 10) ? (_tracked[r].missed < 18) : (_tracked[r].missed < 8);
@@ -1360,7 +1705,118 @@ public:
         _trackedCount = writeIdx;
     }
 
-    // Získá potvrzené boxy (které se zobrazují nejčastěji v čase)
+    // Nová metoda pro kompletní aktualizaci (včetně svíček, stěn a nájezdových waypointů na ESP32)
+    void update(const LidarPoint* points, int pointCount,
+                const BoundingBox* liveBoxes, int liveCount,
+                float matchDistMm = 250.0f)
+    {
+        _totalScans++;
+        // 1. Aktualizace bounding boxů
+        update(liveBoxes, liveCount, 160.0f);
+
+        // 2. Aktualizace detailních cílů
+        float matchDistSq = matchDistMm * matchDistMm;
+        bool matchedTracked[MAX_TRACKED_BOXES];
+        for (int i = 0; i < MAX_TRACKED_BOXES; i++) matchedTracked[i] = false;
+
+        for (int i = 0; i < liveCount; i++) {
+            TargetDetail liveT = TargetExtractor::extract(points, pointCount, liveBoxes[i]);
+
+            int bestIdx = -1;
+            float bestDistSq = matchDistSq;
+
+            for (int j = 0; j < MAX_TRACKED_BOXES; j++) {
+                if (!_trackedTargets[j].active || matchedTracked[j]) continue;
+                float dx = _trackedTargets[j].target.candle_x - liveT.candle_x;
+                float dy = _trackedTargets[j].target.candle_y - liveT.candle_y;
+                float dsq = dx * dx + dy * dy;
+                if (dsq < bestDistSq) {
+                    bestDistSq = dsq;
+                    bestIdx = j;
+                }
+            }
+
+            if (bestIdx >= 0) {
+                TrackedTarget& tt = _trackedTargets[bestIdx];
+                tt.hits++;
+                tt.missed = 0;
+                matchedTracked[bestIdx] = true;
+
+                tt.type_votes[liveT.type]++;
+                if (tt.hits <= 2) {
+                    tt.target.type = liveT.type;
+                } else if (tt.type_votes[TARGET_CORNER] >= 3) {
+                    tt.target.type = TARGET_CORNER;
+                } else if (tt.type_votes[TARGET_WALL] >= 4) {
+                    tt.target.type = TARGET_WALL;
+                } else {
+                    tt.target.type = TARGET_SOLO;
+                }
+
+                const float alpha = 0.20f;
+                tt.target.box = liveT.box;
+                tt.target.candle_x = (1.0f - alpha) * tt.target.candle_x + alpha * liveT.candle_x;
+                tt.target.candle_y = (1.0f - alpha) * tt.target.candle_y + alpha * liveT.candle_y;
+                tt.target.waypoint_x = (1.0f - alpha) * tt.target.waypoint_x + alpha * liveT.waypoint_x;
+                tt.target.waypoint_y = (1.0f - alpha) * tt.target.waypoint_y + alpha * liveT.waypoint_y;
+                tt.target.approach_dx = (1.0f - alpha) * tt.target.approach_dx + alpha * liveT.approach_dx;
+                tt.target.approach_dy = (1.0f - alpha) * tt.target.approach_dy + alpha * liveT.approach_dy;
+                float aLen = hypotf(tt.target.approach_dx, tt.target.approach_dy);
+                if (aLen > 0.01f) {
+                    tt.target.approach_dx /= aLen;
+                    tt.target.approach_dy /= aLen;
+                }
+                tt.target.travel_dist_mm = hypotf(tt.target.waypoint_x, tt.target.waypoint_y);
+                tt.target.is_visible = true;
+                tt.target.hits = tt.hits;
+
+                // Stěny: vyhlazení nebo zachování stabilních stěn (žádné přeblikávání!)
+                if (liveT.wall_count > 0) {
+                    if (tt.target.wall_count == liveT.wall_count) {
+                        for (int w = 0; w < liveT.wall_count; w++) {
+                            tt.target.walls[w].x1 = (1.0f - alpha) * tt.target.walls[w].x1 + alpha * liveT.walls[w].x1;
+                            tt.target.walls[w].y1 = (1.0f - alpha) * tt.target.walls[w].y1 + alpha * liveT.walls[w].y1;
+                            tt.target.walls[w].x2 = (1.0f - alpha) * tt.target.walls[w].x2 + alpha * liveT.walls[w].x2;
+                            tt.target.walls[w].y2 = (1.0f - alpha) * tt.target.walls[w].y2 + alpha * liveT.walls[w].y2;
+                            tt.target.walls[w].length_mm = hypotf(tt.target.walls[w].x2 - tt.target.walls[w].x1,
+                                                                 tt.target.walls[w].y2 - tt.target.walls[w].y1);
+                        }
+                    } else {
+                        tt.target.wall_count = liveT.wall_count;
+                        tt.target.walls[0] = liveT.walls[0];
+                        tt.target.walls[1] = liveT.walls[1];
+                    }
+                }
+            } else {
+                int emptyIdx = -1;
+                for (int j = 0; j < MAX_TRACKED_BOXES; j++) {
+                    if (!_trackedTargets[j].active) { emptyIdx = j; break; }
+                }
+                if (emptyIdx >= 0) {
+                    TrackedTarget& tt = _trackedTargets[emptyIdx];
+                    tt.target = liveT;
+                    tt.hits = 1;
+                    tt.missed = 0;
+                    tt.active = true;
+                    tt.type_votes[0] = 0; tt.type_votes[1] = 0; tt.type_votes[2] = 0;
+                    tt.type_votes[liveT.type] = 1;
+                    matchedTracked[emptyIdx] = true;
+                }
+            }
+        }
+
+        for (int j = 0; j < MAX_TRACKED_BOXES; j++) {
+            if (_trackedTargets[j].active && !matchedTracked[j]) {
+                _trackedTargets[j].missed++;
+                _trackedTargets[j].target.is_visible = false;
+                if (_trackedTargets[j].missed > 20) {
+                    _trackedTargets[j].active = false;
+                }
+            }
+        }
+    }
+
+    // Získá potvrzené boxy
     void getStaticBoxes(BoundingBox* outBoxes, int& outCount, int minHits = 4) const {
         outCount = 0;
         TrackedBox pool[MAX_TRACKED_BOXES];
@@ -1372,7 +1828,6 @@ public:
             }
         }
 
-        // Seřadit podle stability / počtu zásahů (nejčastější mají přednost)
         for (int a = 0; a < poolCount - 1; a++) {
             for (int b = a + 1; b < poolCount; b++) {
                 if (pool[b].hits > pool[a].hits) {
@@ -1383,10 +1838,72 @@ public:
             }
         }
 
-        // Omezení na max 4 potvrzené boxy pro statickou mapu
         int limit = (poolCount < MAX_DETECTED_BOXES) ? poolCount : MAX_DETECTED_BOXES;
         for (int i = 0; i < limit; i++) {
             outBoxes[outCount++] = pool[i].box;
+        }
+    }
+
+    // Získá potvrzené detailní cíle a optimální trasu hašení (počítáno 100% na ESP32)
+    void getStaticTargets(TargetDetail* outTargets, int& outCount,
+                          int* outRoute, int& routeCount,
+                          int minHits = 3) const
+    {
+        outCount = 0;
+        routeCount = 0;
+
+        TargetDetail pool[MAX_TRACKED_BOXES];
+        int poolHits[MAX_TRACKED_BOXES];
+        int poolCount = 0;
+
+        for (int i = 0; i < MAX_TRACKED_BOXES; i++) {
+            if (_trackedTargets[i].active && _trackedTargets[i].hits >= minHits) {
+                pool[poolCount] = _trackedTargets[i].target;
+                poolHits[poolCount] = _trackedTargets[i].hits;
+                poolCount++;
+            }
+        }
+
+        for (int a = 0; a < poolCount - 1; a++) {
+            for (int b = a + 1; b < poolCount; b++) {
+                if (poolHits[b] > poolHits[a]) {
+                    TargetDetail tmpT = pool[a]; pool[a] = pool[b]; pool[b] = tmpT;
+                    int tmpH = poolHits[a]; poolHits[a] = poolHits[b]; poolHits[b] = tmpH;
+                }
+            }
+        }
+
+        outCount = (poolCount < MAX_DETECTED_BOXES) ? poolCount : MAX_DETECTED_BOXES;
+        for (int i = 0; i < outCount; i++) {
+            outTargets[i] = pool[i];
+            outTargets[i].id = i + 1;
+        }
+
+        // Výpočet optimální trasy hašení (Nearest Neighbor ze startu (0,0))
+        if (outCount > 0) {
+            bool visited[MAX_DETECTED_BOXES];
+            for (int i = 0; i < outCount; i++) visited[i] = false;
+
+            float curX = 0.0f, curY = 0.0f;
+            for (int step = 0; step < outCount; step++) {
+                int bestNext = -1;
+                float bestDist = 999999.0f;
+                for (int i = 0; i < outCount; i++) {
+                    if (!visited[i]) {
+                        float d = hypotf(outTargets[i].waypoint_x - curX, outTargets[i].waypoint_y - curY);
+                        if (d < bestDist) {
+                            bestDist = d;
+                            bestNext = i;
+                        }
+                    }
+                }
+                if (bestNext >= 0) {
+                    visited[bestNext] = true;
+                    outRoute[routeCount++] = outTargets[bestNext].id;
+                    curX = outTargets[bestNext].waypoint_x;
+                    curY = outTargets[bestNext].waypoint_y;
+                }
+            }
         }
     }
 

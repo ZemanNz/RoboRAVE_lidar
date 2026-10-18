@@ -103,6 +103,97 @@ def parse_box_list(raw_boxes):
     return boxes
 
 
+def parse_target_list(raw_targets):
+    """Převede cíle s detekovanými stěnami a nájezdy (počítané 100% na ESP32) na strukturované slovníky."""
+    targets = []
+    for t in raw_targets:
+        box_arr = t.get("box", [])
+        box_dict = {}
+        if len(box_arr) >= 8:
+            box_dict = {
+                'min_x': float(box_arr[0]), 'max_x': float(box_arr[1]),
+                'min_y': float(box_arr[2]), 'max_y': float(box_arr[3]),
+                'cx': float(box_arr[4]), 'cy': float(box_arr[5]),
+                'width': float(box_arr[6]), 'height': float(box_arr[7]),
+                'span_mm': math.hypot(float(box_arr[6]), float(box_arr[7])),
+                'dist_mm': math.hypot(float(box_arr[4]), float(box_arr[5])),
+                'type': t.get("type", "VOLNÁ")
+            }
+
+        c = t.get("candle", [0, 0])
+        wp = t.get("waypoint", [0, 0])
+        app = t.get("approach", [0, 0])
+        walls_raw = t.get("walls", [])
+        walls = []
+        for w in walls_raw:
+            if len(w) == 2:
+                walls.append(((float(w[0][0]), float(w[0][1])), (float(w[1][0]), float(w[1][1]))))
+
+        t_type = t.get("type", "VOLNÁ")
+        targets.append({
+            'id': int(t.get("id", len(targets) + 1)),
+            'type': t_type,
+            'is_corner': (t_type == "ROH"),
+            'is_solo': (t_type == "VOLNÁ"),
+            'candle': (float(c[0]), float(c[1])),
+            'box': box_dict,
+            'waypoint': (float(wp[0]), float(wp[1])),
+            'approach': (float(app[0]), float(app[1])),
+            'travel_mm': float(t.get("travel_mm", 0.0)),
+            'walls': walls
+        })
+    return targets
+
+
+def transform_esp_target_to_world(target, rx, ry, th_rad):
+    """Transformuje tvrdá data cíle z ESP32 do souřadnic hřiště podle aktuální polohy robota."""
+    cos_t = math.cos(th_rad)
+    sin_t = math.sin(th_rad)
+    def to_w(lx, ly):
+        wx = rx + lx * cos_t + ly * sin_t
+        wy = ry - lx * sin_t + ly * cos_t
+        return wx, wy
+
+    # Svíčka
+    cw = to_w(target['candle'][0], target['candle'][1])
+    # Nájezdový waypoint (38 cm před svíčkou)
+    wpw = to_w(target['waypoint'][0], target['waypoint'][1])
+    # Směr nájezdu ve světě
+    adx = target['approach'][0] * cos_t + target['approach'][1] * sin_t
+    ady = -target['approach'][0] * sin_t + target['approach'][1] * cos_t
+
+    # Stěny ve světě
+    walls_w = []
+    for w1, w2 in target['walls']:
+        ww1 = to_w(w1[0], w1[1])
+        ww2 = to_w(w2[0], w2[1])
+        walls_w.append((ww1, ww2))
+
+    # Box ve světě (střed)
+    b = dict(target['box'])
+    if b:
+        b_cx_w, b_cy_w = to_w(b['cx'], b['cy'])
+        b['world_cx'] = b_cx_w
+        b['world_cy'] = b_cy_w
+
+    travel_dist = math.hypot(wpw[0] - rx, wpw[1] - ry)
+
+    return {
+        'id': target['id'],
+        'type': target['type'],
+        'is_corner': target['is_corner'],
+        'is_solo': target['is_solo'],
+        'box': b,
+        'candle_world': cw,
+        'waypoint_world': wpw,
+        'approach_dir': (adx, ady),
+        'travel_dist_mm': travel_dist,
+        'walls_world': walls_w,
+        'from_esp32': True
+    }
+
+
+
 # ============================================================
 #  Map-to-Map Lokalizátor robota (Porovnání Bounding Boxů)
 # ============================================================
@@ -833,13 +924,15 @@ class DualLidarVisualizer:
 
         self.last_frame = {
             "fps": 0.0, "pts": 0, "calc_us": 0, "heap": 0, "crc_err": 0,
-            "boxes": [], "static_boxes": [], "cloud": []
+            "boxes": [], "static_boxes": [], "targets": [], "route": [], "cloud": []
         }
 
         self.localizer = RobotLocalizer()
         self.field_map = GlobalFieldMap()
         self.processed_boxes = []
-        self.detect_details_enabled = False  # Klávesa [O] aktivuje jemnou detekci stěn a nájezdových cest
+        self.esp_targets = []  # Tvrdá data detailních cílů přímo z ESP32 (svíčky, stěny, 38cm nájezdy)
+        self.esp_route = []    # Tvrdé optimální pořadí hašení přímo z ESP32
+        self.detect_details_enabled = True  # Klávesa [O] zapíná/vypíná zobrazení stěn a nájezdových cest
         self.current_box_details = []
         self.detail_stabilizer = BoxDetailStabilizer()
 
@@ -885,6 +978,8 @@ class DualLidarVisualizer:
         self.localizer.unlock_map()
         self.field_map.reset()
         self.processed_boxes = []
+        self.esp_targets = []
+        self.esp_route = []
         self.current_box_details = []
         self.detail_stabilizer.reset()
         self.send_cmd("RESET_MAP")
@@ -1330,6 +1425,8 @@ class DualLidarVisualizer:
             live_boxes = parse_box_list(newest.get("boxes", []))
             static_boxes = parse_box_list(newest.get("static_boxes", []))
             cloud_data = newest.get("cloud", [])
+            self.esp_targets = parse_target_list(newest.get("targets", []))
+            self.esp_route = newest.get("route", [])
 
             # Zpracování a zvýhodnění očekávaných svíček v hřišti
             raw_active = static_boxes if len(static_boxes) >= 2 else live_boxes
@@ -1354,6 +1451,17 @@ class DualLidarVisualizer:
                     # Kumulativní plnění hřiště a zachování/doplnění cílů
                     self.field_map.ingest_boxes(active_b, loc.robot_x, loc.robot_y, loc.robot_deg)
                     self.field_map.update_robot_pose(loc.robot_x, loc.robot_y, loc.robot_deg)
+
+            # Tvrdé detailní cíle (svíčky, stěny, 38cm nájezdy) počítané 100% přímo na ESP32:
+            if self.detect_details_enabled and self.esp_targets:
+                loc = self.localizer
+                th_rad = math.radians(loc.robot_deg) if loc.locked else 0.0
+                rx = loc.robot_x if loc.locked else 0.0
+                ry = loc.robot_y if loc.locked else 0.0
+                self.current_box_details = [
+                    transform_esp_target_to_world(t, rx, ry, th_rad)
+                    for t in self.esp_targets
+                ]
 
     def handle_click(self, pos):
         if pos[1] >= PANEL_H:
@@ -1746,22 +1854,26 @@ class DualLidarVisualizer:
             self.screen.blit(lbl2, (scx + 10, scy - 4))
 
         # 5b. JEMNÁ DETEKCE STĚN, SVÍČEK A NÁJEZDOVÝCH ŠIPEK UVNITŘ BOUNDING BOXŮ (KLÁVESA [O])
-        self.current_box_details = []
         if self.detect_details_enabled:
-            cloud_data = self.last_frame.get("cloud", [])
-            raw_details = []
-            for tb in transformed_boxes:
-                cl = tb['box']
-                raw_d = self.compute_raw_box_details(
-                    cl, cloud_data, loc.robot_x, loc.robot_y, math.radians(loc.robot_deg)
+            # Pokud nemáme hotová data z ESP32, provedeme záložní lokální výpočet
+            if not self.esp_targets and not self.current_box_details:
+                cloud_data = self.last_frame.get("cloud", [])
+                raw_details = []
+                for tb in transformed_boxes:
+                    cl = tb['box']
+                    raw_d = self.compute_raw_box_details(
+                        cl, cloud_data, loc.robot_x, loc.robot_y, math.radians(loc.robot_deg)
+                    )
+                    raw_details.append(raw_d)
+
+                # Časová stabilizace v Pythonu (pouze pro záložní režim bez ESP32)
+                self.current_box_details = self.detail_stabilizer.update_all(
+                    raw_details, loc.robot_x, loc.robot_y
                 )
-                raw_details.append(raw_d)
+        else:
+            self.current_box_details = []
 
-            # Časová stabilizace: filtrace záchvěvů, stálé typy cílů a plynulé nájezdové trasy
-            self.current_box_details = self.detail_stabilizer.update_all(
-                raw_details, loc.robot_x, loc.robot_y
-            )
-
+        if self.detect_details_enabled and self.current_box_details:
             r_pos_scr = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
 
             for idx, details in enumerate(self.current_box_details):
@@ -1800,7 +1912,8 @@ class DualLidarVisualizer:
                 pygame.draw.circle(self.screen, (255, 220, 0), cand_scr, 5)
                 pygame.draw.circle(self.screen, (255, 255, 255), cand_scr, 2)
                 type_tag = "ROH (2 STĚNY)" if details['is_corner'] else ("1 STĚNA" if not details['is_solo'] else "VOLNÁ")
-                self.screen.blit(self.font_bold.render(f"🔥 SVÍČKA [{type_tag}] #{idx+1}", True, (255, 215, 60)), (cand_scr[0] + 10, cand_scr[1] + 8))
+                src_tag = " [ESP32]" if details.get('from_esp32') else ""
+                self.screen.blit(self.font_bold.render(f"🔥 SVÍČKA [{type_tag}] #{idx+1}{src_tag}", True, (255, 215, 60)), (cand_scr[0] + 10, cand_scr[1] + 8))
 
         # 6. TRAJEKTORIE ROBOTA
         if len(loc.trajectory) >= 2:
@@ -1862,7 +1975,7 @@ class DualLidarVisualizer:
         err = match.get('avg_error', 0.0) if match else 0.0
         dist_from_start = math.hypot(loc.robot_x, loc.robot_y)
         fov_tag = "360° V POLI" if not self.fov_limited else "180° START"
-        opt_tag = " [O: NÁJEZDY ZAPNUTY]" if self.detect_details_enabled else " [O: NÁJEZDY Vypnuty]"
+        opt_tag = " [O: 100% ESP32 NÁJEZDY ZAPNUTY]" if self.detect_details_enabled else " [O: NÁJEZDY Vypnuty]"
 
         self.screen.blit(self.font_big.render(f"3. SHODA [{fov_tag}]{opt_tag}: {pat_name}", True, (255, 200, 60) if self.detect_details_enabled else (80, 255, 160)), (offset_x + 25, 17))
         sub_str = f"Inliery: {inliers} | Kotvy: {len(matched_anchors)}/6 | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
@@ -1874,9 +1987,9 @@ class DualLidarVisualizer:
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (60, 30, 50), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
-        self.screen.blit(self.font_bold.render("DRUHÁ STATICKÁ MAPA & NÁJEZDOVÉ ŠIPKY (KLÁVESA [O]):", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Červené šipky = nájezd 38 cm (středem otevřeného úhlu u rohu / po kolmici u stěny)", True, (255, 120, 80)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• Časová stabilizace: stěny, svíčky a trasy drží pevně a nepřeblikávají!", True, (0, 240, 255)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_bold.render("DRUHÁ STATICKÁ MAPA & NÁJEZDOVÉ ŠIPKY (100% Z ESP32):", True, (255, 150, 215)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Výpočet 100% na ESP32: stěny, svíčky, 38 cm nájezdy i trasa počítány přímo ve firmware!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• Geometrie: bisektor u rohu, kolmice u 1 stěny. Žádné křížení stěn!", True, (0, 240, 255)), (offset_x + 25, PANEL_H - 43))
 
     # ========================================================
     #  PANEL 4: OBDÉLNÍKOVÁ MAPA CELÉHO HŘIŠTĚ (KUMULATIVNÍ CÍLE)
@@ -1962,7 +2075,26 @@ class DualLidarVisualizer:
             pygame.draw.line(self.screen, (255, 120, 220), (rob_sx, rob_sy), (tip_x, tip_y), 2)
 
         # Trasa hašení svíček (optimalizované pořadí)
-        route = fm.compute_extinguish_route()
+        route = []
+        if self.esp_route and self.current_box_details:
+            id_map = {det['id']: det for det in self.current_box_details}
+            for rid in self.esp_route:
+                if rid in id_map:
+                    det = id_map[rid]
+                    route.append({
+                        'id': det['id'],
+                        'type': det['type'],
+                        'x': det['candle_world'][0],
+                        'y': det['candle_world'][1],
+                        'waypoint_x': det['waypoint_world'][0],
+                        'waypoint_y': det['waypoint_world'][1],
+                        'dist_from_robot': det['travel_dist_mm'],
+                        'is_visible': True,
+                        'is_solo': det['is_solo']
+                    })
+        if not route:
+            route = fm.compute_extinguish_route()
+
         if len(route) >= 2:
             r_pts = [f_to_screen(rx, ry)] + [f_to_screen(t['x'], t['y']) for t in route]
             pygame.draw.lines(self.screen, (255, 215, 0), False, r_pts, 2)
@@ -2101,25 +2233,41 @@ class DualLidarVisualizer:
         pygame.draw.line(self.screen, (40, 48, 60), (right_x - 12, y_offset), (right_x - 12, y_offset + FIELD_H), 1)
 
         r_y = y_offset + 10
-        self.screen.blit(self.font_big.render("SEZNAM CÍLŮ V POLI & OPTIMÁLNÍ TRASA", True, (0, 220, 255)), (right_x, r_y))
+        hw_tag = " [100% ESP32 FIRMWARE]" if (self.esp_route and self.current_box_details) else ""
+        self.screen.blit(self.font_big.render(f"SEZNAM CÍLŮ V POLI & OPTIMÁLNÍ TRASA{hw_tag}", True, (0, 220, 255)), (right_x, r_y))
         r_y += 24
 
-        if not field_targets:
+        display_targets = route if route else field_targets
+        if not display_targets:
             self.screen.blit(self.font_main.render("Zatím nebyly detekovány žádné cíle uvnitř hřiště.", True, (150, 160, 175)), (right_x, r_y))
         else:
-            for idx, t in enumerate(route):
+            for idx, t in enumerate(display_targets):
                 is_vis = t.get('is_visible', True)
-                status_txt = "VIDITELNÝ" if is_vis else "ZASTÍNĚNÝ (ZNÁMÝ)"
+                t_type = t.get('type', "SVÍČKA" if t.get('is_solo') else "ROH/STĚNA")
+                status_txt = f"[{t_type}]" if 'type' in t else ("VIDITELNÝ" if is_vis else "ZASTÍNĚNÝ")
                 col_st = (100, 255, 120) if is_vis else (240, 180, 50)
 
-                t_name = f"CÍL #{idx+1} [POŘADÍ {idx+1}]"
+                t_id = t.get('id', idx + 1)
+                t_name = f"#{idx+1} CÍL ID {t_id} [POŘADÍ HAŠENÍ {idx+1}]"
                 self.screen.blit(self.font_bold.render(t_name, True, (255, 215, 0)), (right_x, r_y))
-                self.screen.blit(self.font_bold.render(f"[{status_txt}]", True, col_st), (right_x + 160, r_y))
+                self.screen.blit(self.font_bold.render(status_txt, True, col_st), (right_x + 220, r_y))
                 r_y += 17
 
-                pos_str = f"Pozice: X={t['x']:+.0f} mm, Y={t['y']:+.0f} mm | R od robota: {t.get('dist_from_robot', 0):.0f} mm"
+                d_rob = t.get('dist_from_robot', math.hypot(t['x'] - rx, t['y'] - ry))
+                pos_str = f"Svíčka: X={t['x']:+.0f}, Y={t['y']:+.0f} mm | R dojezdu: {d_rob:.0f} mm"
                 self.screen.blit(self.font_main.render(pos_str, True, (210, 215, 225)), (right_x + 10, r_y))
                 r_y += 18
+
+            # Stavový blok výpočtu pod seznamem
+            r_y += 6
+            self.screen.blit(self.font_bold.render("ARCHITEKTURA VÝPOČTU:", True, (200, 210, 225)), (right_x, r_y))
+            r_y += 18
+            if self.esp_targets:
+                self.screen.blit(self.font_main.render("✓ 100% ESP32: Geometrie, stěny, svíčky, 38cm nájezdy i trasa", True, (100, 255, 140)), (right_x, r_y))
+                r_y += 16
+                self.screen.blit(self.font_main.render("✓ Robot může po odpojení PC hasit zcela autonomně!", True, (0, 240, 255)), (right_x, r_y))
+            else:
+                self.screen.blit(self.font_main.render("• Python emulace (připojte ESP32 s novým firmwarem)", True, (240, 180, 50)), (right_x, r_y))
 
     # ========================================================
     #  Hlavní smyčka

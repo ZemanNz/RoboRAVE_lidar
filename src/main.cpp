@@ -36,6 +36,8 @@ FilterConfig config = {
 static LidarPoint scanPoints[MAX_LIDAR_POINTS];
 static BoundingBox detectedBoxes[MAX_DETECTED_BOXES];
 static BoundingBox staticBoxes[MAX_DETECTED_BOXES];
+static TargetDetail staticTargets[MAX_DETECTED_BOXES];
+static int staticRoute[MAX_DETECTED_BOXES];
 static StaticMapTracker staticMap;
 
 void setup() {
@@ -60,7 +62,7 @@ void loop() {
         staticMap.reset();
     }
 
-    // 3. Jakmile je dokončena celá 360° otáčka, spustíme výpočet
+    // 3. Jakmile je dokončena celá 360° otáčka, spustíme výpočet na ESP32
     if (lidar.hasNewScan()) {
         uint32_t tStart = micros();
 
@@ -75,10 +77,15 @@ void loop() {
         int boxCount = 0;
         BoxDetector::process(scanPoints, rawCount, detectedBoxes, boxCount);
 
-        // 2. Dlouhodobá statická mapa: akumulace snímků a vyhodnocení nejstabilnějších cílů
-        staticMap.update(detectedBoxes, boxCount);
+        // 2. Dlouhodobá statická mapa a výpočet cílů (Svíčky, Stěny, Waypointy 38cm a Nájezdy)
+        staticMap.update(scanPoints, rawCount, detectedBoxes, boxCount);
         int staticCount = 0;
-        staticMap.getStaticBoxes(staticBoxes, staticCount, 4); // min 4 potvrzení
+        staticMap.getStaticBoxes(staticBoxes, staticCount, 3); // min 3 potvrzení
+
+        // 3. Kompletní detailní cíle a optimální trasa hašení (vše spočítáno na ESP32)
+        int targetCount = 0;
+        int routeCount = 0;
+        staticMap.getStaticTargets(staticTargets, targetCount, staticRoute, routeCount, 3);
 
         uint32_t calcTimeUs = micros() - tStart;
 
@@ -91,10 +98,12 @@ void loop() {
         diag.free_heap = ESP.getFreeHeap();
         diag.crc_errors = lidar.getCrcErrors();
 
-        // Odeslání výsledků do Pythonu (živé boxy i dlouhodobá statická mapa)
+        // Odeslání kompletních výsledků do Pythonu (tvrdá data: boxy, cíle, stěny, nájezdy, trasa)
         comm.sendFrame(scanPoints, rawCount,
                        detectedBoxes, boxCount,
                        staticBoxes, staticCount,
+                       staticTargets, targetCount,
+                       staticRoute, routeCount,
                        diag, 2);
     }
 }
