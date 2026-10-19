@@ -790,11 +790,11 @@ class TrackedBoxDetail:
 
         if self.hits <= 2:
             self.confirmed_type = meas['type']
-        elif c_corner >= 4 and c_corner >= c_wall and c_corner >= c_solo:
+        elif c_corner >= 3 and c_corner >= c_wall:
             self.confirmed_type = 'CORNER'
-        elif c_wall >= 4 and c_wall >= c_solo:
-            self.confirmed_type = 'WALL'
-        elif c_solo >= c_wall and c_solo >= c_corner:
+        elif (c_wall + c_corner) >= 3 and (c_wall + c_corner) > c_solo:
+            self.confirmed_type = 'CORNER' if c_corner >= 2 else 'WALL'
+        elif c_solo >= (c_wall + c_corner):
             self.confirmed_type = 'SOLO'
 
         # Pokud box nemá rozměr pro stěny (< 160 mm), stěny mít NESMÍ
@@ -1255,15 +1255,15 @@ class DualLidarVisualizer:
             for j in range(i + 1, min(n_p, 30), step):
                 p2 = world_pts[j]
                 d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-                if d < 85.0: continue
+                if d < 65.0: continue # zmírněno z 85 mm na 65 mm
                 nx = -(p2[1] - p1[1]) / d
                 ny = (p2[0] - p1[0]) / d
-                inliers = [p for p in world_pts if abs((p[0] - p1[0]) * nx + (p[1] - p1[1]) * ny) <= 18.0]
-                if len(inliers) >= 5 and len(inliers) > len(best_w1_inliers):
+                inliers = [p for p in world_pts if abs((p[0] - p1[0]) * nx + (p[1] - p1[1]) * ny) <= 20.0] # zmírněno z 18 mm na 20 mm
+                if len(inliers) >= 4 and len(inliers) > len(best_w1_inliers): # zmírněno z 5 na 4 inliery
                     best_w1_inliers = inliers
                     best_w1_line = (p1, p2)
 
-        if not best_w1_line or len(best_w1_inliers) < 5:
+        if not best_w1_line or len(best_w1_inliers) < 4:
             cand_x = sum(p[0] for p in world_pts) / len(world_pts) if world_pts else w_box_cx
             cand_y = sum(p[1] for p in world_pts) / len(world_pts) if world_pts else w_box_cy
             d_vec_x = cand_x - rx; d_vec_y = cand_y - ry
@@ -1290,7 +1290,7 @@ class DualLidarVisualizer:
         w1_e = (p1[0] + u1x * max_t1, p1[1] + u1y * max_t1)
         w1_len = max_t1 - min_t1
 
-        if w1_len < 100.0:
+        if w1_len < 75.0: # zmírněno ze 100 mm na 75 mm
             cand_x = sum(p[0] for p in world_pts) / len(world_pts) if world_pts else w_box_cx
             cand_y = sum(p[1] for p in world_pts) / len(world_pts) if world_pts else w_box_cy
             d_vec_x = cand_x - rx; d_vec_y = cand_y - ry
@@ -1311,21 +1311,21 @@ class DualLidarVisualizer:
         # 3. Hledáme druhou stěnu (Wall 2) kolmou k Wall 1
         best_w2_inliers = []
         best_w2_line = None
-        if len(outliers_for_w2) >= 4:
+        if len(outliers_for_w2) >= 3: # zmírněno z 4 na 3
             n_out = len(outliers_for_w2)
             for i in range(min(n_out, 25)):
                 q1 = outliers_for_w2[i]
                 for j in range(i + 1, min(n_out, 25)):
                     q2 = outliers_for_w2[j]
                     qd = math.hypot(q2[0] - q1[0], q2[1] - q1[1])
-                    if qd < 70.0: continue
+                    if qd < 55.0: continue # zmírněno ze 70 mm na 55 mm
                     qux = (q2[0] - q1[0]) / qd
                     quy = (q2[1] - q1[1]) / qd
                     dot = abs(u1x * qux + u1y * quy)
-                    if dot > 0.50: continue # kolmost (cca 60° až 120°)
+                    if dot > 0.58: continue # kolmost (cca 54° až 126°)
                     q_nx = -quy; q_ny = qux
-                    in2 = [p for p in outliers_for_w2 if abs((p[0] - q1[0]) * q_nx + (p[1] - q1[1]) * q_ny) <= 18.0]
-                    if len(in2) >= 4 and len(in2) > len(best_w2_inliers):
+                    in2 = [p for p in outliers_for_w2 if abs((p[0] - q1[0]) * q_nx + (p[1] - q1[1]) * q_ny) <= 20.0]
+                    if len(in2) >= 3 and len(in2) > len(best_w2_inliers): # zmírněno z 4 na 3
                         best_w2_inliers = in2
                         best_w2_line = (q1, q2)
 

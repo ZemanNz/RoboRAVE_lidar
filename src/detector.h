@@ -1335,7 +1335,7 @@ public:
                 float x2 = points[idx2].x;
                 float y2 = points[idx2].y;
                 float d = hypotf(x2 - x1, y2 - y1);
-                if (d < 85.0f) continue; // stěna musí mít reálné rozpětí
+                if (d < 65.0f) continue; // zmírněno z 85 mm na 65 mm
 
                 float nx = -(y2 - y1) / d;
                 float ny = (x2 - x1) / d;
@@ -1345,11 +1345,11 @@ public:
                 for (int k = 0; k < boxPtCount; k++) {
                     int pIdx = boxIndices[k];
                     float dist = fabsf((points[pIdx].x - x1) * nx + (points[pIdx].y - y1) * ny);
-                    if (dist <= 18.0f) {
+                    if (dist <= 20.0f) { // zmírněno z 18 mm na 20 mm
                         tempInl[inlCount++] = pIdx;
                     }
                 }
-                if (inlCount >= 5 && inlCount > bestW1Count) {
+                if (inlCount >= 4 && inlCount > bestW1Count) { // zmírněno z 5 na 4 inliery
                     bestW1Count = inlCount;
                     p1_idx = idx1;
                     p2_idx = idx2;
@@ -1359,8 +1359,8 @@ public:
             }
         }
 
-        // Pokud v boxu není žádná rovná stěna (alespoň 5 inlierů a rozpětí) -> je to čistě SOLO SVÍČKA!
-        if (bestW1Count < 5 || p1_idx < 0) {
+        // Pokud v boxu není žádná rovná stěna (alespoň 4 inliery a rozpětí) -> je to SOLO SVÍČKA!
+        if (bestW1Count < 4 || p1_idx < 0) {
             target.type = TARGET_SOLO;
             target.candle_x = (boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx;
             target.candle_y = (boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy;
@@ -1398,8 +1398,8 @@ public:
         float w1_ey = points[p1_idx].y + u1y * maxT1;
         float w1_len = maxT1 - minT1;
 
-        // Pokud je délka stěny příliš krátká (< 100 mm), není to stěna
-        if (w1_len < 100.0f) {
+        // Pokud je délka stěny příliš krátká (< 75 mm), není to stěna
+        if (w1_len < 75.0f) { // zmírněno ze 100 mm na 75 mm
             target.type = TARGET_SOLO;
             target.candle_x = (boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx;
             target.candle_y = (boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy;
@@ -1433,7 +1433,7 @@ public:
         int bestW2Count = 0;
         int q1_idx = -1, q2_idx = -1;
 
-        if (outCount >= 4) {
+        if (outCount >= 3) { // zmírněno z 4 na 3
             for (int i = 0; i < outCount && i < 25; i++) {
                 int qidx1 = outlierIndices[i];
                 float qx1 = points[qidx1].x;
@@ -1443,12 +1443,12 @@ public:
                     float qx2 = points[qidx2].x;
                     float qy2 = points[qidx2].y;
                     float qd = hypotf(qx2 - qx1, qy2 - qy1);
-                    if (qd < 70.0f) continue;
+                    if (qd < 55.0f) continue; // zmírněno ze 70 mm na 55 mm
 
                     float qux = (qx2 - qx1) / qd;
                     float quy = (qy2 - qy1) / qd;
                     float dot = fabsf(u1x * qux + u1y * quy);
-                    if (dot > 0.50f) continue; // kolmost (cca 60° až 120°)
+                    if (dot > 0.58f) continue; // kolmost (cca 54° až 126°)
 
                     float qnx = -quy;
                     float qny = qux;
@@ -1457,9 +1457,9 @@ public:
                     for (int k = 0; k < outCount; k++) {
                         int pIdx = outlierIndices[k];
                         float dist = fabsf((points[pIdx].x - qx1) * qnx + (points[pIdx].y - qy1) * qny);
-                        if (dist <= 18.0f) tempInl2[inl2++] = pIdx;
+                        if (dist <= 20.0f) tempInl2[inl2++] = pIdx;
                     }
-                    if (inl2 >= 4 && inl2 > bestW2Count) {
+                    if (inl2 >= 3 && inl2 > bestW2Count) { // zmírněno z 4 na 3
                         bestW2Count = inl2;
                         q1_idx = qidx1;
                         q2_idx = qidx2;
@@ -1891,11 +1891,11 @@ public:
 
                 if (tt.hits <= 2) {
                     tt.target.type = liveT.type;
-                } else if (vCorner >= 4 && vCorner >= vWall && vCorner >= vSolo) {
+                } else if (vCorner >= 3 && vCorner >= vWall) {
                     tt.target.type = TARGET_CORNER;
-                } else if (vWall >= 4 && vWall >= vSolo) {
-                    tt.target.type = TARGET_WALL;
-                } else if (vSolo >= vWall && vSolo >= vCorner) {
+                } else if ((vWall + vCorner) >= 3 && (vWall + vCorner) > vSolo) {
+                    tt.target.type = (vCorner >= 2) ? TARGET_CORNER : TARGET_WALL;
+                } else if (vSolo >= (vWall + vCorner)) {
                     tt.target.type = TARGET_SOLO;
                 }
 
