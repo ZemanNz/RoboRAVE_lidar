@@ -1239,46 +1239,27 @@ class DualLidarVisualizer:
                 'approach_dir': (ux, uy)
             }
 
-        # 2. SEPARACE BODŮ SVÍČKY OD STĚN (v12 princip + pravidlo: svíčka je vždy blíže k LiDARu než stěny)
-        # Svíčka tvoří kompaktní shluk (průměr 20-45 mm). Preferujeme shluk nejblíže k LiDARu (rx, ry).
-        n_p = len(world_pts)
-        best_cand_cluster = []
-        best_cand_center = None
-        best_cand_dist = 99999.0
-
-        for p in world_pts:
-            cluster = [q for q in world_pts if math.hypot(q[0] - p[0], q[1] - p[1]) <= 42.0]
-            if 2 <= len(cluster) <= 9:
-                if not best_cand_cluster or len(cluster) > len(best_cand_cluster):
-                    best_cand_cluster = cluster
-                    best_cand_center = (sum(q[0] for q in cluster) / len(cluster), sum(q[1] for q in cluster) / len(cluster))
-
-        candle_pts_set = set(best_cand_cluster)
-        wall_pts = [p for p in world_pts if p not in candle_pts_set]
-        if len(wall_pts) < 4:
-            wall_pts = list(world_pts)
-
-        # 3. Hledáme první stěnu (Wall 1) pomocí RANSAC pouze z bodů určených pro stěny
+        # 2. Hledáme první stěnu (Wall 1) pomocí RANSAC ze všech bodů v boxu
         best_w1_inliers = []
         best_w1_line = None
-        n_wp = len(wall_pts)
-        step = 1 if n_wp < 40 else 2
-        for i in range(0, min(n_wp, 30), step):
-            p1 = wall_pts[i]
-            for j in range(i + 1, min(n_wp, 30), step):
-                p2 = wall_pts[j]
+        n_p = len(world_pts)
+        step = 1 if n_p < 40 else 2
+        for i in range(0, min(n_p, 30), step):
+            p1 = world_pts[i]
+            for j in range(i + 1, min(n_p, 30), step):
+                p2 = world_pts[j]
                 d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-                if d < 75.0: continue
+                if d < 85.0: continue
                 nx = -(p2[1] - p1[1]) / d
                 ny = (p2[0] - p1[0]) / d
-                inliers = [p for p in wall_pts if abs((p[0] - p1[0]) * nx + (p[1] - p1[1]) * ny) <= 20.0]
-                if len(inliers) > len(best_w1_inliers):
+                inliers = [p for p in world_pts if abs((p[0] - p1[0]) * nx + (p[1] - p1[1]) * ny) <= 18.0]
+                if len(inliers) >= 5 and len(inliers) > len(best_w1_inliers):
                     best_w1_inliers = inliers
                     best_w1_line = (p1, p2)
 
-        if not best_w1_line or len(best_w1_inliers) < 4:
-            cand_x = best_cand_center[0] if best_cand_center else (sum(p[0] for p in world_pts) / len(world_pts))
-            cand_y = best_cand_center[1] if best_cand_center else (sum(p[1] for p in world_pts) / len(world_pts))
+        if not best_w1_line or len(best_w1_inliers) < 5:
+            cand_x = sum(p[0] for p in world_pts) / len(world_pts) if world_pts else w_box_cx
+            cand_y = sum(p[1] for p in world_pts) / len(world_pts) if world_pts else w_box_cy
             d_vec_x = cand_x - rx; d_vec_y = cand_y - ry
             d_len = max(1.0, math.hypot(d_vec_x, d_vec_y))
             ux = d_vec_x / d_len; uy = d_vec_y / d_len
@@ -1303,40 +1284,75 @@ class DualLidarVisualizer:
         w1_e = (p1[0] + u1x * max_t1, p1[1] + u1y * max_t1)
         w1_len = max_t1 - min_t1
 
-        # Body pro druhou stěnu: z bodů pro stěny vyloučíme inliery stěny 1
-        outliers_for_w2 = [p for p in wall_pts if p not in best_w1_inliers]
+        if w1_len < 100.0:
+            cand_x = sum(p[0] for p in world_pts) / len(world_pts) if world_pts else w_box_cx
+            cand_y = sum(p[1] for p in world_pts) / len(world_pts) if world_pts else w_box_cy
+            d_vec_x = cand_x - rx; d_vec_y = cand_y - ry
+            d_len = max(1.0, math.hypot(d_vec_x, d_vec_y))
+            ux = d_vec_x / d_len; uy = d_vec_y / d_len
+            return {
+                'box': box,
+                'type': 'SOLO',
+                'candle_world': (cand_x, cand_y),
+                'walls_world': [],
+                'waypoint_world': (cand_x - ux * 380.0, cand_y - uy * 380.0),
+                'approach_dir': (ux, uy)
+            }
 
-        # 4. Hledáme druhou stěnu (Wall 2) kolmou k Wall 1
+        # Body pro druhou stěnu: z bodů vyloučíme inliery stěny 1
+        outliers_for_w2 = [p for p in world_pts if p not in best_w1_inliers]
+
+        # 3. Hledáme druhou stěnu (Wall 2) kolmou k Wall 1
         best_w2_inliers = []
         best_w2_line = None
-        if len(outliers_for_w2) >= 3:
+        if len(outliers_for_w2) >= 4:
             n_out = len(outliers_for_w2)
             for i in range(min(n_out, 25)):
                 q1 = outliers_for_w2[i]
                 for j in range(i + 1, min(n_out, 25)):
                     q2 = outliers_for_w2[j]
                     qd = math.hypot(q2[0] - q1[0], q2[1] - q1[1])
-                    if qd < 60.0: continue
+                    if qd < 70.0: continue
                     qux = (q2[0] - q1[0]) / qd
                     quy = (q2[1] - q1[1]) / qd
                     dot = abs(u1x * qux + u1y * quy)
-                    if dot > 0.60: continue # kolmost (53° až 127°)
+                    if dot > 0.50: continue # kolmost (cca 60° až 120°)
                     q_nx = -quy; q_ny = qux
-                    in2 = [p for p in outliers_for_w2 if abs((p[0] - q1[0]) * q_nx + (p[1] - q1[1]) * q_ny) <= 20.0]
-                    if len(in2) > len(best_w2_inliers):
+                    in2 = [p for p in outliers_for_w2 if abs((p[0] - q1[0]) * q_nx + (p[1] - q1[1]) * q_ny) <= 18.0]
+                    if len(in2) >= 4 and len(in2) > len(best_w2_inliers):
                         best_w2_inliers = in2
                         best_w2_line = (q1, q2)
+
+        def pt_seg_dist(px, py, seg):
+            (x1, y1), (x2, y2) = seg
+            dx = x2 - x1; dy = y2 - y1
+            l2 = dx * dx + dy * dy
+            if l2 < 1e-4: return math.hypot(px - x1, py - y1)
+            t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / l2))
+            return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+        def find_best_cluster(pts, max_d=45.0):
+            if not pts: return None
+            best_c = []
+            for p in pts:
+                clust = [q for q in pts if math.hypot(q[0] - p[0], q[1] - p[1]) <= max_d]
+                if len(clust) > len(best_c):
+                    best_c = clust
+            if len(best_c) >= 2:
+                return (sum(q[0] for q in best_c) / len(best_c), sum(q[1] for q in best_c) / len(best_c))
+            return (sum(q[0] for q in pts) / len(pts), sum(q[1] for q in pts) / len(pts))
+
+        wall_exclusion_dist = 28.0
 
         # ========================================================
         # VĚTEV A: ROH (2 STĚNY KOLEM SVÍČKY)
         # ========================================================
-        if best_w2_line and len(best_w2_inliers) >= 3:
+        if best_w2_line and len(best_w2_inliers) >= 4:
             q1, q2 = best_w2_line
             qdx = q2[0] - q1[0]; qdy = q2[1] - q1[1]
             L2 = math.hypot(qdx, qdy)
             u2x = qdx / L2; u2y = qdy / L2
 
-            # Průsečík obou ramen stěn = Vrchol rohu V
             cross = u1x * u2y - u1y * u2x
             if abs(cross) > 1e-4:
                 s_param = ((q1[0] - p1[0]) * u2y - (q1[1] - p1[1]) * u2x) / cross
@@ -1347,36 +1363,32 @@ class DualLidarVisualizer:
                 Vy = (w1_s[1] + w1_e[1]) * 0.5
             V = (Vx, Vy)
 
-            # Orientujeme rameno 1 směrem OD vrcholu V podél stěny
             d_s1 = math.hypot(w1_s[0] - Vx, w1_s[1] - Vy)
             d_e1 = math.hypot(w1_e[0] - Vx, w1_e[1] - Vy)
             far1 = w1_e if d_e1 > d_s1 else w1_s
-            len1 = max(180.0, max(d_s1, d_e1))
+            len1 = max(220.0, max(d_s1, d_e1))
             norm_arm1 = max(1.0, math.hypot(far1[0] - Vx, far1[1] - Vy))
             arm1_x = (far1[0] - Vx) / norm_arm1
             arm1_y = (far1[1] - Vy) / norm_arm1
             wall1_seg = (V, (Vx + arm1_x * len1, Vy + arm1_y * len1))
 
-            # Orientujeme rameno 2 směrem OD vrcholu V podél stěny
             projs2 = [((p[0] - q1[0]) * u2x + (p[1] - q1[1]) * u2y) for p in best_w2_inliers]
             w2_s = (q1[0] + u2x * min(projs2), q1[1] + u2y * min(projs2))
             w2_e = (q1[0] + u2x * max(projs2), q1[1] + u2y * max(projs2))
             d_s2 = math.hypot(w2_s[0] - Vx, w2_s[1] - Vy)
             d_e2 = math.hypot(w2_e[0] - Vx, w2_e[1] - Vy)
             far2 = w2_e if d_e2 > d_s2 else w2_s
-            len2 = max(180.0, max(d_s2, d_e2))
+            len2 = max(220.0, max(d_s2, d_e2))
             norm_arm2 = max(1.0, math.hypot(far2[0] - Vx, far2[1] - Vy))
             arm2_x = (far2[0] - Vx) / norm_arm2
             arm2_y = (far2[1] - Vy) / norm_arm2
             wall2_seg = (V, (Vx + arm2_x * len2, Vy + arm2_y * len2))
 
-            # Kanonické uspořádání ramen podle orientace (Wall 1 vždy po směru hodinových ručiček od Wall 2)
             if arm1_x * arm2_y - arm1_y * arm2_x < 0:
                 wall1_seg, wall2_seg = wall2_seg, wall1_seg
                 arm1_x, arm2_x = arm2_x, arm1_x
                 arm1_y, arm2_y = arm2_y, arm1_y
 
-            # Otevřený prostor: osa rohu (bisektor) mířící ven z rohu do volného hřiště
             bisect_x = arm1_x + arm2_x
             bisect_y = arm1_y + arm2_y
             blen = math.hypot(bisect_x, bisect_y)
@@ -1386,24 +1398,18 @@ class DualLidarVisualizer:
             else:
                 u_open_x = 0.0; u_open_y = 1.0
 
-            # Svíčka C: preferujeme kompaktní shluk (best_cand_center) - to je ta svíčka!
-            # Outlier body mimo obě stěny jsou jen fallback.
-            if best_cand_center is not None:
-                cand_x, cand_y = best_cand_center
-            else:
-                cand_pts = [p for p in world_pts if p not in best_w1_inliers and p not in best_w2_inliers]
-                if cand_pts:
-                    cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
-                    cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
-                else:
-                    cand_x = Vx + u_open_x * 85.0
-                    cand_y = Vy + u_open_y * 85.0
+            # Vyloučíme všechny body v ochranné zóně obou stěn
+            non_wall_pts = [p for p in world_pts if pt_seg_dist(p[0], p[1], wall1_seg) > wall_exclusion_dist and pt_seg_dist(p[0], p[1], wall2_seg) > wall_exclusion_dist]
+            cand_center = find_best_cluster(non_wall_pts)
 
-            # Waypoint je 380 mm v otevřeném prostoru před svíčkou
+            if cand_center is not None:
+                cand_x, cand_y = cand_center
+            else:
+                cand_x = Vx + u_open_x * 85.0
+                cand_y = Vy + u_open_y * 85.0
+
             wp_x = cand_x + u_open_x * 380.0
             wp_y = cand_y + u_open_y * 380.0
-
-            # Šipka míří Z otevřeného prostoru (od Waypointu) DO svíčky
             app_dir = (-u_open_x, -u_open_y)
 
             return {
@@ -1418,25 +1424,25 @@ class DualLidarVisualizer:
         # ========================================================
         # VĚTEV B: 1 STĚNA (SVÍČKA CHRÁNĚNÁ JEDNOU DESKOU)
         # ========================================================
+        pad1 = max(0.0, (300.0 - w1_len) * 0.5)
+        w1_s = (w1_s[0] - pad1 * u1x, w1_s[1] - pad1 * u1y)
+        w1_e = (w1_e[0] + pad1 * u1x, w1_e[1] + pad1 * u1y)
         wall1_seg = (w1_s, w1_e)
 
-        # Svíčka C: preferujeme kompaktní shluk (best_cand_center) - to je ta svíčka!
-        # Outlier body mimo stěnu 1 jsou jen fallback.
-        if best_cand_center is not None:
-            cand_x, cand_y = best_cand_center
+        # Vyloučíme body v ochranné zóně stěny 1
+        non_wall_pts = [p for p in world_pts if pt_seg_dist(p[0], p[1], wall1_seg) > wall_exclusion_dist]
+        cand_center = find_best_cluster(non_wall_pts)
+
+        if cand_center is not None:
+            cand_x, cand_y = cand_center
         else:
-            cand_pts = [p for p in world_pts if p not in best_w1_inliers]
-            if cand_pts:
-                cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
-                cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
-            else:
-                mid_x = (w1_s[0] + w1_e[0]) * 0.5
-                mid_y = (w1_s[1] + w1_e[1]) * 0.5
-                nx = -u1y; ny = u1x
-                if nx * (w_box_cx - mid_x) + ny * (w_box_cy - mid_y) < 0.0:
-                    nx = -nx; ny = -ny
-                cand_x = mid_x + nx * 80.0
-                cand_y = mid_y + ny * 80.0
+            mid_x = (w1_s[0] + w1_e[0]) * 0.5
+            mid_y = (w1_s[1] + w1_e[1]) * 0.5
+            nx = -u1y; ny = u1x
+            if nx * (w_box_cx - mid_x) + ny * (w_box_cy - mid_y) < 0.0:
+                nx = -nx; ny = -ny
+            cand_x = mid_x + nx * 80.0
+            cand_y = mid_y + ny * 80.0
 
         # Pata kolmice P_proj na přímce stěny 1
         t_proj = (cand_x - w1_s[0]) * u1x + (cand_y - w1_s[1]) * u1y
