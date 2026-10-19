@@ -1573,30 +1573,34 @@ public:
             float u_open_x = (blen > 0.01f) ? (bisect_x / blen) : 0.0f;
             float u_open_y = (blen > 0.01f) ? (bisect_y / blen) : 1.0f;
 
-            // Svíčka C: body ležící uvnitř rohu mimo obě stěny
-            float candSumX = 0.0f, candSumY = 0.0f;
-            int candPts = 0;
-            for (int i = 0; i < outCount; i++) {
-                int idx = outlierIndices[i];
-                bool isW2 = false;
-                for (int k = 0; k < bestW2Count; k++) {
-                    if (bestW2Inliers[k] == idx) { isW2 = true; break; }
-                }
-                if (!isW2) {
-                    candSumX += points[idx].x;
-                    candSumY += points[idx].y;
-                    candPts++;
-                }
-            }
-            if (candPts > 0) {
-                target.candle_x = candSumX / (float)candPts;
-                target.candle_y = candSumY / (float)candPts;
-            } else if (bestCandCount > 0) {
+            // Svíčka C: preferujeme kompaktní shluk (bestCandCluster) - to je ta svíčka!
+            // Outlier body mimo obě stěny jsou jen fallback, pokud shluk nebyl nalezen.
+            if (bestCandCount > 0) {
                 target.candle_x = bestCandX;
                 target.candle_y = bestCandY;
             } else {
-                target.candle_x = Vx + u_open_x * 85.0f;
-                target.candle_y = Vy + u_open_y * 85.0f;
+                // Fallback: body uvnitř rohu mimo obě stěny
+                float candSumX = 0.0f, candSumY = 0.0f;
+                int candPts = 0;
+                for (int i = 0; i < outCount; i++) {
+                    int idx = outlierIndices[i];
+                    bool isW2 = false;
+                    for (int k = 0; k < bestW2Count; k++) {
+                        if (bestW2Inliers[k] == idx) { isW2 = true; break; }
+                    }
+                    if (!isW2) {
+                        candSumX += points[idx].x;
+                        candSumY += points[idx].y;
+                        candPts++;
+                    }
+                }
+                if (candPts > 0) {
+                    target.candle_x = candSumX / (float)candPts;
+                    target.candle_y = candSumY / (float)candPts;
+                } else {
+                    target.candle_x = Vx + u_open_x * 85.0f;
+                    target.candle_y = Vy + u_open_y * 85.0f;
+                }
             }
 
             // Bezpečnostní pojistka: svíčka se NIKDY nesmí ocitnout mimo svůj Bounding Box!
@@ -1628,8 +1632,12 @@ public:
         target.walls[0].length_mm = w1_len;
         target.walls[0].point_count = bestW1Count;
 
-        // Svíčka C: body, které nepatří ke stěně 1
-        if (outCount > 0) {
+        // Svíčka C: preferujeme kompaktní shluk (bestCandCluster) - to je ta svíčka!
+        // Outlier body mimo stěnu 1 jsou jen fallback.
+        if (bestCandCount > 0) {
+            target.candle_x = bestCandX;
+            target.candle_y = bestCandY;
+        } else if (outCount > 0) {
             float oSumX = 0.0f, oSumY = 0.0f;
             for (int i = 0; i < outCount; i++) {
                 oSumX += points[outlierIndices[i]].x;
@@ -1637,9 +1645,6 @@ public:
             }
             target.candle_x = oSumX / (float)outCount;
             target.candle_y = oSumY / (float)outCount;
-        } else if (bestCandCount > 0) {
-            target.candle_x = bestCandX;
-            target.candle_y = bestCandY;
         } else {
             // Svíčka směrem ke středu boxu
             float nx = -u1y, ny = u1x;

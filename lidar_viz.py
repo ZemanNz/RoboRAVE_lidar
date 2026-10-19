@@ -1386,16 +1386,18 @@ class DualLidarVisualizer:
             else:
                 u_open_x = 0.0; u_open_y = 1.0
 
-            # Svíčka C: body uvnitř rohu mimo obě stěny
-            cand_pts = [p for p in world_pts if p not in best_w1_inliers and p not in best_w2_inliers]
-            if cand_pts:
-                cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
-                cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
-            elif best_cand_center is not None:
+            # Svíčka C: preferujeme kompaktní shluk (best_cand_center) - to je ta svíčka!
+            # Outlier body mimo obě stěny jsou jen fallback.
+            if best_cand_center is not None:
                 cand_x, cand_y = best_cand_center
             else:
-                cand_x = Vx + u_open_x * 85.0
-                cand_y = Vy + u_open_y * 85.0
+                cand_pts = [p for p in world_pts if p not in best_w1_inliers and p not in best_w2_inliers]
+                if cand_pts:
+                    cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
+                    cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
+                else:
+                    cand_x = Vx + u_open_x * 85.0
+                    cand_y = Vy + u_open_y * 85.0
 
             # Waypoint je 380 mm v otevřeném prostoru před svíčkou
             wp_x = cand_x + u_open_x * 380.0
@@ -1418,21 +1420,23 @@ class DualLidarVisualizer:
         # ========================================================
         wall1_seg = (w1_s, w1_e)
 
-        # Svíčka C z bodů mimo stěnu 1
-        cand_pts = [p for p in world_pts if p not in best_w1_inliers]
-        if cand_pts:
-            cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
-            cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
-        elif best_cand_center is not None:
+        # Svíčka C: preferujeme kompaktní shluk (best_cand_center) - to je ta svíčka!
+        # Outlier body mimo stěnu 1 jsou jen fallback.
+        if best_cand_center is not None:
             cand_x, cand_y = best_cand_center
         else:
-            mid_x = (w1_s[0] + w1_e[0]) * 0.5
-            mid_y = (w1_s[1] + w1_e[1]) * 0.5
-            nx = -u1y; ny = u1x
-            if nx * (w_box_cx - mid_x) + ny * (w_box_cy - mid_y) < 0.0:
-                nx = -nx; ny = -ny
-            cand_x = mid_x + nx * 80.0
-            cand_y = mid_y + ny * 80.0
+            cand_pts = [p for p in world_pts if p not in best_w1_inliers]
+            if cand_pts:
+                cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
+                cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
+            else:
+                mid_x = (w1_s[0] + w1_e[0]) * 0.5
+                mid_y = (w1_s[1] + w1_e[1]) * 0.5
+                nx = -u1y; ny = u1x
+                if nx * (w_box_cx - mid_x) + ny * (w_box_cy - mid_y) < 0.0:
+                    nx = -nx; ny = -ny
+                cand_x = mid_x + nx * 80.0
+                cand_y = mid_y + ny * 80.0
 
         # Pata kolmice P_proj na přímce stěny 1
         t_proj = (cand_x - w1_s[0]) * u1x + (cand_y - w1_s[1]) * u1y
