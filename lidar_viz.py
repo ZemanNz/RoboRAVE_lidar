@@ -873,6 +873,7 @@ class BoxDetailStabilizer:
             is_cor = (tr.confirmed_type == 'CORNER')
             is_sol = (tr.confirmed_type == 'SOLO')
             res = {
+                'id': tid,
                 'box': rd.get('box', {}),
                 'type': tr.confirmed_type,
                 'is_corner': is_cor,
@@ -2165,36 +2166,37 @@ class DualLidarVisualizer:
         # Trasa hašení svíček (optimalizované pořadí)
         route = []
         if self.esp_route and self.current_box_details:
-            id_map = {det['id']: det for det in self.current_box_details}
+            id_map = {det.get('id', idx + 1): det for idx, det in enumerate(self.current_box_details)}
             for rid in self.esp_route:
                 if rid in id_map:
                     det = id_map[rid]
                     route.append({
-                        'id': det['id'],
-                        'type': det['type'],
+                        'id': det.get('id', rid),
+                        'type': det.get('type', 'CÍL'),
                         'x': det['candle_world'][0],
                         'y': det['candle_world'][1],
                         'waypoint_x': det['waypoint_world'][0],
                         'waypoint_y': det['waypoint_world'][1],
-                        'dist_from_robot': det['travel_dist_mm'],
+                        'dist_from_robot': det.get('travel_dist_mm', 0.0),
                         'is_visible': True,
-                        'is_solo': det['is_solo']
+                        'is_solo': det.get('is_solo', False)
                     })
         # Doplníme zbývající potvrzené cíle z pole
         if self.current_box_details and len(route) < len(self.current_box_details):
-            existing_ids = {r['id'] for r in route}
-            for det in self.current_box_details:
-                if det['id'] not in existing_ids:
+            existing_ids = {r.get('id') for r in route}
+            for idx, det in enumerate(self.current_box_details):
+                did = det.get('id', idx + 1)
+                if did not in existing_ids:
                     route.append({
-                        'id': det['id'],
-                        'type': det['type'],
+                        'id': did,
+                        'type': det.get('type', 'CÍL'),
                         'x': det['candle_world'][0],
                         'y': det['candle_world'][1],
                         'waypoint_x': det['waypoint_world'][0],
                         'waypoint_y': det['waypoint_world'][1],
-                        'dist_from_robot': det['travel_dist_mm'],
+                        'dist_from_robot': det.get('travel_dist_mm', 0.0),
                         'is_visible': True,
-                        'is_solo': det['is_solo']
+                        'is_solo': det.get('is_solo', False)
                     })
         if not route:
             route = fm.compute_extinguish_route()
