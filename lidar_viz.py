@@ -783,20 +783,24 @@ class TrackedBoxDetail:
         self.missed = 0
         self.type_history.append(meas['type'])
 
-        # Zvýšená hystereze typu: zabraňuje přeblikávání typu cíle (CORNER / WALL / SOLO)
+        # Většinové hlasování o typu cíle (pokud je SOLO většinové, je to SOLO)
+        c_corner = self.type_history.count('CORNER')
+        c_wall   = self.type_history.count('WALL')
+        c_solo   = self.type_history.count('SOLO')
+
         if self.hits <= 2:
             self.confirmed_type = meas['type']
-        else:
-            c_corner = self.type_history.count('CORNER')
-            c_wall   = self.type_history.count('WALL')
-            c_solo   = self.type_history.count('SOLO')
-            # Jednou potvrzený roh nebo stěna se nemění při náhodném výpadku 1-2 snímků
-            if c_corner >= 4:
-                self.confirmed_type = 'CORNER'
-            elif c_wall >= 4 and self.confirmed_type != 'CORNER':
-                self.confirmed_type = 'WALL'
-            elif c_solo >= 7 and c_corner < 2 and c_wall < 2:
-                self.confirmed_type = 'SOLO'
+        elif c_corner >= 4 and c_corner >= c_wall and c_corner >= c_solo:
+            self.confirmed_type = 'CORNER'
+        elif c_wall >= 4 and c_wall >= c_solo:
+            self.confirmed_type = 'WALL'
+        elif c_solo >= c_wall and c_solo >= c_corner:
+            self.confirmed_type = 'SOLO'
+
+        # Pokud box nemá rozměr pro stěny (< 160 mm), stěny mít NESMÍ
+        meas_box = meas.get('box', {})
+        if meas_box.get('span_mm', 999.0) < 160.0 or meas_box.get('is_solo', False):
+            self.confirmed_type = 'SOLO'
 
         # Klidný filtr polohy (EMA alpha = 0.15 pro maximální stabilitu jako u bounding boxů)
         alpha = 0.15
@@ -807,39 +811,41 @@ class TrackedBoxDetail:
             (1.0 - alpha) * self.candle_world[1] + alpha * mc[1]
         )
 
-        # Vyhlazení stěn (pokud v tomto snímku byly detekovány, vyhladíme; pokud ne, zachováme předchozí!)
-        mw = list(meas['walls_world'])
-        if mw:
-            if len(mw) == len(self.walls_world):
-                # Pro 2 stěny zajistíme minimální součet vzdáleností středů (zabraňuje záměně ramen rohu)
-                if len(mw) == 2:
-                    (s1_0, e1_0), (s1_1, e1_1) = self.walls_world
-                    (s2_a, e2_a), (s2_b, e2_b) = mw
-                    m1_0 = ((s1_0[0] + e1_0[0]) * 0.5, (s1_0[1] + e1_0[1]) * 0.5)
-                    m1_1 = ((s1_1[0] + e1_1[0]) * 0.5, (s1_1[1] + e1_1[1]) * 0.5)
-                    m2_a = ((s2_a[0] + e2_a[0]) * 0.5, (s2_a[1] + e2_a[1]) * 0.5)
-                    m2_b = ((s2_b[0] + e2_b[0]) * 0.5, (s2_b[1] + e2_b[1]) * 0.5)
+        # Vyhlazení stěn
+        if self.confirmed_type == 'SOLO':
+            self.walls_world = []
+        else:
+            mw = list(meas['walls_world'])
+            if mw:
+                if len(mw) == len(self.walls_world):
+                    # Pro 2 stěny zajistíme minimální součet vzdáleností středů (zabraňuje záměně ramen rohu)
+                    if len(mw) == 2:
+                        (s1_0, e1_0), (s1_1, e1_1) = self.walls_world
+                        (s2_a, e2_a), (s2_b, e2_b) = mw
+                        m1_0 = ((s1_0[0] + e1_0[0]) * 0.5, (s1_0[1] + e1_0[1]) * 0.5)
+                        m1_1 = ((s1_1[0] + e1_1[0]) * 0.5, (s1_1[1] + e1_1[1]) * 0.5)
+                        m2_a = ((s2_a[0] + e2_a[0]) * 0.5, (s2_a[1] + e2_a[1]) * 0.5)
+                        m2_b = ((s2_b[0] + e2_b[0]) * 0.5, (s2_b[1] + e2_b[1]) * 0.5)
 
-                    c_dir = math.hypot(m1_0[0] - m2_a[0], m1_0[1] - m2_a[1]) + math.hypot(m1_1[0] - m2_b[0], m1_1[1] - m2_b[1])
-                    c_swp = math.hypot(m1_0[0] - m2_b[0], m1_0[1] - m2_b[1]) + math.hypot(m1_1[0] - m2_a[0], m1_1[1] - m2_a[1])
-                    if c_swp < c_dir:
-                        mw = [mw[1], mw[0]]
+                        c_dir = math.hypot(m1_0[0] - m2_a[0], m1_0[1] - m2_a[1]) + math.hypot(m1_1[0] - m2_b[0], m1_1[1] - m2_b[1])
+                        c_swp = math.hypot(m1_0[0] - m2_b[0], m1_0[1] - m2_b[1]) + math.hypot(m1_1[0] - m2_a[0], m1_1[1] - m2_a[1])
+                        if c_swp < c_dir:
+                            mw = [mw[1], mw[0]]
 
-                new_w = []
-                for (s1, e1), (s2, e2) in zip(self.walls_world, mw):
-                    # Zajištění stejné orientace začátku a konce úsečky před vyhlazením
-                    d_same = math.hypot(s1[0] - s2[0], s1[1] - s2[1]) + math.hypot(e1[0] - e2[0], e1[1] - e2[1])
-                    d_flip = math.hypot(s1[0] - e2[0], s1[1] - e2[1]) + math.hypot(e1[0] - s2[0], e1[1] - s2[1])
-                    if d_flip < d_same:
-                        s2, e2 = e2, s2
-                    ns = ((1.0 - alpha) * s1[0] + alpha * s2[0], (1.0 - alpha) * s1[1] + alpha * s2[1])
-                    ne = ((1.0 - alpha) * e1[0] + alpha * e2[0], (1.0 - alpha) * e1[1] + alpha * e2[1])
-                    new_w.append((ns, ne))
-                self.walls_world = new_w
-            else:
-                # Pokud nový snímek přinesl jiný počet stěn, ale už máme stabilizovaný cíl s více stěnami, podržíme ho
-                if not (self.hits > 5 and len(self.walls_world) > len(mw)):
+                    new_w = []
+                    for (s1, e1), (s2, e2) in zip(self.walls_world, mw):
+                        d_same = math.hypot(s1[0] - s2[0], s1[1] - s2[1]) + math.hypot(e1[0] - e2[0], e1[1] - e2[1])
+                        d_flip = math.hypot(s1[0] - e2[0], s1[1] - e2[1]) + math.hypot(e1[0] - s2[0], e1[1] - s2[1])
+                        if d_flip < d_same:
+                            s2, e2 = e2, s2
+                        ns = ((1.0 - alpha) * s1[0] + alpha * s2[0], (1.0 - alpha) * s1[1] + alpha * s2[1])
+                        ne = ((1.0 - alpha) * e1[0] + alpha * e2[0], (1.0 - alpha) * e1[1] + alpha * e2[1])
+                        new_w.append((ns, ne))
+                    self.walls_world = new_w
+                else:
                     self.walls_world = list(mw)
+            else:
+                self.walls_world = []
 
         # Vyhlazení směru nájezdu a cílového waypointu
         mdir = meas['approach_dir']

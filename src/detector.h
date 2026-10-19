@@ -1245,7 +1245,7 @@ public:
                 b.dist_mm = sqrtf(b.cx * b.cx + b.cy * b.cy);
                 b.aspect_ratio = aspect;
                 b.point_count = k;
-                b.is_solo_candle = (span < 140.0f);
+                b.is_solo_candle = (span < 160.0f);
                 candidates[candCount++] = b;
             }
         }
@@ -1884,13 +1884,23 @@ public:
                 matchedTracked[bestIdx] = true;
 
                 tt.type_votes[liveT.type]++;
+                // Typ určíme podle většinového hlasování (pokud má SOLO většinu, cíl je SOLO!)
+                int vSolo = tt.type_votes[TARGET_SOLO];
+                int vWall = tt.type_votes[TARGET_WALL];
+                int vCorner = tt.type_votes[TARGET_CORNER];
+
                 if (tt.hits <= 2) {
                     tt.target.type = liveT.type;
-                } else if (tt.type_votes[TARGET_CORNER] >= 4) {
+                } else if (vCorner >= 4 && vCorner >= vWall && vCorner >= vSolo) {
                     tt.target.type = TARGET_CORNER;
-                } else if (tt.type_votes[TARGET_WALL] >= 4 && tt.target.type != TARGET_CORNER) {
+                } else if (vWall >= 4 && vWall >= vSolo) {
                     tt.target.type = TARGET_WALL;
-                } else if (tt.type_votes[TARGET_SOLO] >= 7 && tt.type_votes[TARGET_CORNER] < 2 && tt.type_votes[TARGET_WALL] < 2) {
+                } else if (vSolo >= vWall && vSolo >= vCorner) {
+                    tt.target.type = TARGET_SOLO;
+                }
+
+                // Pokud je box malý (< 160 mm), NESMÍ mít stěny
+                if (tt.target.box.span_mm < 160.0f || tt.target.box.is_solo_candle) {
                     tt.target.type = TARGET_SOLO;
                 }
 
@@ -1911,8 +1921,10 @@ public:
                 tt.target.is_visible = true;
                 tt.target.hits = tt.hits;
 
-                // Stěny: vyhlazení se zachováním stejné orientace úsečky a eliminace přeblikávání
-                if (liveT.wall_count > 0) {
+                // Stěny: vyhlazení se zachováním stejné orientace úsečky
+                if (tt.target.type == TARGET_SOLO) {
+                    tt.target.wall_count = 0;
+                } else if (liveT.wall_count > 0) {
                     if (tt.target.wall_count == liveT.wall_count) {
                         TargetDetail liveOrdered = liveT;
                         if (liveT.wall_count == 2) {
@@ -1955,12 +1967,12 @@ public:
                                                                  tt.target.walls[w].y2 - tt.target.walls[w].y1);
                         }
                     } else {
-                        if (!(tt.hits > 5 && tt.target.wall_count > liveT.wall_count)) {
-                            tt.target.wall_count = liveT.wall_count;
-                            tt.target.walls[0] = liveT.walls[0];
-                            tt.target.walls[1] = liveT.walls[1];
-                        }
+                        tt.target.wall_count = liveT.wall_count;
+                        tt.target.walls[0] = liveT.walls[0];
+                        tt.target.walls[1] = liveT.walls[1];
                     }
+                } else {
+                    tt.target.wall_count = 0;
                 }
             } else {
                 int emptyIdx = -1;
