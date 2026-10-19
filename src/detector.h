@@ -1320,13 +1320,11 @@ public:
             return target;
         }
 
-        // 1. SEPARACE BODŮ SVÍČKY OD STĚN (v12 princip + fyzikální pravidlo: svíčka je vždy blíže k LiDARu než stěny)
-        // Hledáme kompaktní shluk bodů svíčky (průměr <= 45 mm, 2 až 8 bodů).
-        // Pokud je kandidátů více, preferujeme shluk nejblíže k LiDARu (menší dist), protože svíčka stojí PŘED stěnami.
+        // 1. SEPARACE BODŮ SVÍČKY OD STĚN (v12 princip)
+        // Hledáme kompaktní shluk bodů svíčky (průměr <= 42 mm, 2 až 8 bodů)
         int bestCandCluster[20];
         int bestCandCount = 0;
         float bestCandX = 0.0f, bestCandY = 0.0f;
-        float bestCandDist = 99999.0f;
 
         for (int i = 0; i < boxPtCount; i++) {
             int pIdx1 = boxIndices[i];
@@ -1346,28 +1344,11 @@ public:
                 }
             }
 
-            if (tempCount >= 2 && tempCount <= 8) {
-                float avgX = cSumX / (float)tempCount;
-                float avgY = cSumY / (float)tempCount;
-                float dToLidar = hypotf(avgX, avgY);
-
-                // Preferujeme shluk, který je blíže k robotovi (nebo výrazně kompaktnější)
-                bool isBetter = false;
-                if (bestCandCount == 0) {
-                    isBetter = true;
-                } else if (dToLidar < bestCandDist - 30.0f) {
-                    isBetter = true; // znatelně blíže k LiDARu -> svíčka před stěnou!
-                } else if (fabsf(dToLidar - bestCandDist) <= 30.0f && tempCount > bestCandCount) {
-                    isBetter = true;
-                }
-
-                if (isBetter) {
-                    bestCandCount = tempCount;
-                    bestCandDist = dToLidar;
-                    for (int k = 0; k < tempCount; k++) bestCandCluster[k] = tempCluster[k];
-                    bestCandX = avgX;
-                    bestCandY = avgY;
-                }
+            if (tempCount >= 2 && tempCount <= 8 && tempCount > bestCandCount) {
+                bestCandCount = tempCount;
+                for (int k = 0; k < tempCount; k++) bestCandCluster[k] = tempCluster[k];
+                bestCandX = cSumX / (float)tempCount;
+                bestCandY = cSumY / (float)tempCount;
             }
         }
 
@@ -1578,55 +1559,54 @@ public:
             target.walls[1].length_mm = arm2_len;
             target.walls[1].point_count = bestW2Count;
 
-            // Osa rohu (bisektor) ze součtu ramen
+            // Kanonické pořadí ramen rohu podle orientace (zabraňuje prohazování stěn mezi snímky)
+            if (arm1_ux * arm2_uy - arm1_uy * arm2_ux < 0.0f) {
+                WallSegment tmpW = target.walls[0]; target.walls[0] = target.walls[1]; target.walls[1] = tmpW;
+                float tx = arm1_ux; arm1_ux = arm2_ux; arm2_ux = tx;
+                float ty = arm1_uy; arm1_uy = arm2_uy; arm2_uy = ty;
+            }
+
+            // Osa rohu (bisektor) ze součtu ramen směřující do otevřeného prostoru
             float bisect_x = arm1_ux + arm2_ux;
             float bisect_y = arm1_uy + arm2_uy;
             float blen = hypotf(bisect_x, bisect_y);
             float u_open_x = (blen > 0.01f) ? (bisect_x / blen) : 0.0f;
             float u_open_y = (blen > 0.01f) ? (bisect_y / blen) : 1.0f;
 
-            // Fyzikální ověření orientace otevřeného prostoru:
-            // Svíčka i otevřený prostor musí směřovat k robotovi (ne za roh odvrácený od robota)!
-            // Vektor z vrcholu rohu V k robotovi [0,0] je (-Vx, -Vy)
-            if (u_open_x * (-Vx) + u_open_y * (-Vy) < 0.0f) {
-                u_open_x = -u_open_x;
-                u_open_y = -u_open_y;
+            // Svíčka C: body ležící uvnitř rohu mimo obě stěny
+            float candSumX = 0.0f, candSumY = 0.0f;
+            int candPts = 0;
+            for (int i = 0; i < outCount; i++) {
+                int idx = outlierIndices[i];
+                bool isW2 = false;
+                for (int k = 0; k < bestW2Count; k++) {
+                    if (bestW2Inliers[k] == idx) { isW2 = true; break; }
+                }
+                if (!isW2) {
+                    candSumX += points[idx].x;
+                    candSumY += points[idx].y;
+                    candPts++;
+                }
             }
-
-            // Svíčka C: leží UVNITŘ rohu (před stěnami směrem do otevřeného prostoru)
-            if (bestCandCount > 0) {
+            if (candPts > 0) {
+                target.candle_x = candSumX / (float)candPts;
+                target.candle_y = candSumY / (float)candPts;
+            } else if (bestCandCount > 0) {
                 target.candle_x = bestCandX;
                 target.candle_y = bestCandY;
             } else {
-                float candSumX = 0.0f, candSumY = 0.0f;
-                int candPts = 0;
-                for (int i = 0; i < outCount; i++) {
-                    int idx = outlierIndices[i];
-                    bool isW2 = false;
-                    for (int k = 0; k < bestW2Count; k++) {
-                        if (bestW2Inliers[k] == idx) { isW2 = true; break; }
-                    }
-                    if (!isW2) {
-                        candSumX += points[idx].x;
-                        candSumY += points[idx].y;
-                        candPts++;
-                    }
-                }
-                if (candPts > 0) {
-                    target.candle_x = candSumX / (float)candPts;
-                    target.candle_y = candSumY / (float)candPts;
-                } else {
-                    target.candle_x = Vx + u_open_x * 85.0f;
-                    target.candle_y = Vy + u_open_y * 85.0f;
-                }
+                target.candle_x = Vx + u_open_x * 85.0f;
+                target.candle_y = Vy + u_open_y * 85.0f;
             }
 
             // Bezpečnostní pojistka: svíčka se NIKDY nesmí ocitnout mimo svůj Bounding Box!
             target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
             target.candle_y = fmaxf(box.min_y, fminf(box.max_y, target.candle_y));
 
+            // Waypoint 380 mm v otevřeném prostoru před svíčkou
             target.waypoint_x = target.candle_x + u_open_x * 380.0f;
             target.waypoint_y = target.candle_y + u_open_y * 380.0f;
+            // Šipka míří z otevřeného prostoru do svíčky
             target.approach_dx = -u_open_x;
             target.approach_dy = -u_open_y;
             target.travel_dist_mm = hypotf(target.waypoint_x, target.waypoint_y);
@@ -1648,10 +1628,8 @@ public:
         target.walls[0].length_mm = w1_len;
         target.walls[0].point_count = bestW1Count;
 
-        if (bestCandCount > 0) {
-            target.candle_x = bestCandX;
-            target.candle_y = bestCandY;
-        } else if (outCount > 0) {
+        // Svíčka C: body, které nepatří ke stěně 1
+        if (outCount > 0) {
             float oSumX = 0.0f, oSumY = 0.0f;
             for (int i = 0; i < outCount; i++) {
                 oSumX += points[outlierIndices[i]].x;
@@ -1659,12 +1637,15 @@ public:
             }
             target.candle_x = oSumX / (float)outCount;
             target.candle_y = oSumY / (float)outCount;
+        } else if (bestCandCount > 0) {
+            target.candle_x = bestCandX;
+            target.candle_y = bestCandY;
         } else {
-            // Svíčka stojí PŘED stěnou směrem k robotovi [0,0]
+            // Svíčka směrem ke středu boxu
             float nx = -u1y, ny = u1x;
             float mid_x = (w1_sx + w1_ex) * 0.5f;
             float mid_y = (w1_sy + w1_ey) * 0.5f;
-            if (nx * (-mid_x) + ny * (-mid_y) < 0.0f) {
+            if (nx * (box.cx - mid_x) + ny * (box.cy - mid_y) < 0.0f) {
                 nx = -nx; ny = -ny;
             }
             target.candle_x = mid_x + nx * 80.0f;
@@ -1686,7 +1667,7 @@ public:
             norm_y = perp_dy / perp_dist;
         } else {
             float nx = -u1y, ny = u1x;
-            if (nx * (-p_proj_x) + ny * (-p_proj_y) < 0.0f) {
+            if (nx * (box.cx - p_proj_x) + ny * (box.cy - p_proj_y) < 0.0f) {
                 nx = -nx; ny = -ny;
             }
             norm_x = nx; norm_y = ny;
@@ -1694,19 +1675,14 @@ public:
             target.candle_y = p_proj_y + norm_y * 80.0f;
         }
 
-        // Fyzikální pojistka: vektor od stěny přes svíčku do otevřeného prostoru
-        // musí směřovat k robotovi [0,0] (před stěnu)
-        if (norm_x * (-p_proj_x) + norm_y * (-p_proj_y) < 0.0f) {
-            norm_x = -norm_x;
-            norm_y = -norm_y;
-        }
-
         // Bezpečnostní pojistka: svíčka se NIKDY nesmí ocitnout mimo svůj Bounding Box!
         target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
         target.candle_y = fmaxf(box.min_y, fminf(box.max_y, target.candle_y));
 
+        // Waypoint leží na kolmici od stěny přes svíčku a od svíčky dál o 380 mm
         target.waypoint_x = target.candle_x + norm_x * 380.0f;
         target.waypoint_y = target.candle_y + norm_y * 380.0f;
+        // Šipka míří od waypointu do svíčky
         target.approach_dx = -norm_x;
         target.approach_dy = -norm_y;
         target.travel_dist_mm = hypotf(target.waypoint_x, target.waypoint_y);
@@ -1886,11 +1862,31 @@ public:
                 // Stěny: vyhlazení se zachováním stejné orientace úsečky a eliminace přeblikávání
                 if (liveT.wall_count > 0) {
                     if (tt.target.wall_count == liveT.wall_count) {
+                        TargetDetail liveOrdered = liveT;
+                        if (liveT.wall_count == 2) {
+                            float m1_0x = (tt.target.walls[0].x1 + tt.target.walls[0].x2) * 0.5f;
+                            float m1_0y = (tt.target.walls[0].y1 + tt.target.walls[0].y2) * 0.5f;
+                            float m1_1x = (tt.target.walls[1].x1 + tt.target.walls[1].x2) * 0.5f;
+                            float m1_1y = (tt.target.walls[1].y1 + tt.target.walls[1].y2) * 0.5f;
+
+                            float m2_ax = (liveT.walls[0].x1 + liveT.walls[0].x2) * 0.5f;
+                            float m2_ay = (liveT.walls[0].y1 + liveT.walls[0].y2) * 0.5f;
+                            float m2_bx = (liveT.walls[1].x1 + liveT.walls[1].x2) * 0.5f;
+                            float m2_by = (liveT.walls[1].y1 + liveT.walls[1].y2) * 0.5f;
+
+                            float dDirect = hypotf(m1_0x - m2_ax, m1_0y - m2_ay) + hypotf(m1_1x - m2_bx, m1_1y - m2_by);
+                            float dSwap   = hypotf(m1_0x - m2_bx, m1_0y - m2_by) + hypotf(m1_1x - m2_ax, m1_1y - m2_ay);
+                            if (dSwap < dDirect) {
+                                liveOrdered.walls[0] = liveT.walls[1];
+                                liveOrdered.walls[1] = liveT.walls[0];
+                            }
+                        }
+
                         for (int w = 0; w < liveT.wall_count; w++) {
                             float s1x = tt.target.walls[w].x1, s1y = tt.target.walls[w].y1;
                             float e1x = tt.target.walls[w].x2, e1y = tt.target.walls[w].y2;
-                            float s2x = liveT.walls[w].x1, s2y = liveT.walls[w].y1;
-                            float e2x = liveT.walls[w].x2, e2y = liveT.walls[w].y2;
+                            float s2x = liveOrdered.walls[w].x1, s2y = liveOrdered.walls[w].y1;
+                            float e2x = liveOrdered.walls[w].x2, e2y = liveOrdered.walls[w].y2;
 
                             float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
                             float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
