@@ -1320,11 +1320,13 @@ public:
             return target;
         }
 
-        // 1. SEPARACE BODŮ SVÍČKY OD STĚN (v12 princip)
-        // Hledáme kompaktní shluk bodů svíčky (průměr <= 40 mm, 2 až 8 bodů)
+        // 1. SEPARACE BODŮ SVÍČKY OD STĚN (v12 princip + fyzikální pravidlo: svíčka je vždy blíže k LiDARu než stěny)
+        // Hledáme kompaktní shluk bodů svíčky (průměr <= 45 mm, 2 až 8 bodů).
+        // Pokud je kandidátů více, preferujeme shluk nejblíže k LiDARu (menší dist), protože svíčka stojí PŘED stěnami.
         int bestCandCluster[20];
         int bestCandCount = 0;
         float bestCandX = 0.0f, bestCandY = 0.0f;
+        float bestCandDist = 99999.0f;
 
         for (int i = 0; i < boxPtCount; i++) {
             int pIdx1 = boxIndices[i];
@@ -1337,18 +1339,35 @@ public:
             for (int j = 0; j < boxPtCount && tempCount < 20; j++) {
                 int pIdx2 = boxIndices[j];
                 float d = hypotf(points[pIdx2].x - px, points[pIdx2].y - py);
-                if (d <= 40.0f) {
+                if (d <= 42.0f) {
                     tempCluster[tempCount++] = pIdx2;
                     cSumX += points[pIdx2].x;
                     cSumY += points[pIdx2].y;
                 }
             }
 
-            if (tempCount >= 2 && tempCount <= 8 && tempCount > bestCandCount) {
-                bestCandCount = tempCount;
-                for (int k = 0; k < tempCount; k++) bestCandCluster[k] = tempCluster[k];
-                bestCandX = cSumX / (float)tempCount;
-                bestCandY = cSumY / (float)tempCount;
+            if (tempCount >= 2 && tempCount <= 8) {
+                float avgX = cSumX / (float)tempCount;
+                float avgY = cSumY / (float)tempCount;
+                float dToLidar = hypotf(avgX, avgY);
+
+                // Preferujeme shluk, který je blíže k robotovi (nebo výrazně kompaktnější)
+                bool isBetter = false;
+                if (bestCandCount == 0) {
+                    isBetter = true;
+                } else if (dToLidar < bestCandDist - 30.0f) {
+                    isBetter = true; // znatelně blíže k LiDARu -> svíčka před stěnou!
+                } else if (fabsf(dToLidar - bestCandDist) <= 30.0f && tempCount > bestCandCount) {
+                    isBetter = true;
+                }
+
+                if (isBetter) {
+                    bestCandCount = tempCount;
+                    bestCandDist = dToLidar;
+                    for (int k = 0; k < tempCount; k++) bestCandCluster[k] = tempCluster[k];
+                    bestCandX = avgX;
+                    bestCandY = avgY;
+                }
             }
         }
 
@@ -1364,7 +1383,6 @@ public:
             if (!isCandle) wallIndices[wallPtCount++] = idx;
         }
         if (wallPtCount < 4) {
-            // Pokud by nezbylo dost bodů pro stěny, použijeme všechny
             wallPtCount = boxPtCount;
             for (int i = 0; i < boxPtCount; i++) wallIndices[i] = boxIndices[i];
         }
@@ -1554,13 +1572,28 @@ public:
             float arm2_ux = (far2x - Vx) / norm2;
             float arm2_uy = (far2y - Vy) / norm2;
 
-            // Rameno 2: druhá samostatná úsečka z vrcholu V podél stěny 2 (NIKDY se nespojuje konec 1 a 2!)
+            // Rameno 2: druhá samostatná úsečka z vrcholu V podél stěny 2
             target.walls[1].x1 = Vx; target.walls[1].y1 = Vy;
             target.walls[1].x2 = Vx + arm2_ux * arm2_len; target.walls[1].y2 = Vy + arm2_uy * arm2_len;
             target.walls[1].length_mm = arm2_len;
             target.walls[1].point_count = bestW2Count;
 
-            // Svíčka: buď předem separovaný shluk svíčky, nebo zbylé body
+            // Osa rohu (bisektor) ze součtu ramen
+            float bisect_x = arm1_ux + arm2_ux;
+            float bisect_y = arm1_uy + arm2_uy;
+            float blen = hypotf(bisect_x, bisect_y);
+            float u_open_x = (blen > 0.01f) ? (bisect_x / blen) : 0.0f;
+            float u_open_y = (blen > 0.01f) ? (bisect_y / blen) : 1.0f;
+
+            // Fyzikální ověření orientace otevřeného prostoru:
+            // Svíčka i otevřený prostor musí směřovat k robotovi (ne za roh odvrácený od robota)!
+            // Vektor z vrcholu rohu V k robotovi [0,0] je (-Vx, -Vy)
+            if (u_open_x * (-Vx) + u_open_y * (-Vy) < 0.0f) {
+                u_open_x = -u_open_x;
+                u_open_y = -u_open_y;
+            }
+
+            // Svíčka C: leží UVNITŘ rohu (před stěnami směrem do otevřeného prostoru)
             if (bestCandCount > 0) {
                 target.candle_x = bestCandX;
                 target.candle_y = bestCandY;
@@ -1583,16 +1616,10 @@ public:
                     target.candle_x = candSumX / (float)candPts;
                     target.candle_y = candSumY / (float)candPts;
                 } else {
-                    target.candle_x = Vx + 85.0f * arm1_ux + 85.0f * arm2_ux;
-                    target.candle_y = Vy + 85.0f * arm1_uy + 85.0f * arm2_uy;
+                    target.candle_x = Vx + u_open_x * 85.0f;
+                    target.candle_y = Vy + u_open_y * 85.0f;
                 }
             }
-
-            float bisect_x = arm1_ux + arm2_ux;
-            float bisect_y = arm1_uy + arm2_uy;
-            float blen = hypotf(bisect_x, bisect_y);
-            float u_open_x = (blen > 0.01f) ? (bisect_x / blen) : 0.0f;
-            float u_open_y = (blen > 0.01f) ? (bisect_y / blen) : 1.0f;
 
             // Bezpečnostní pojistka: svíčka se NIKDY nesmí ocitnout mimo svůj Bounding Box!
             target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
@@ -1633,8 +1660,15 @@ public:
             target.candle_x = oSumX / (float)outCount;
             target.candle_y = oSumY / (float)outCount;
         } else {
-            target.candle_x = (w1_sx + w1_ex) * 0.5f;
-            target.candle_y = (w1_sy + w1_ey) * 0.5f;
+            // Svíčka stojí PŘED stěnou směrem k robotovi [0,0]
+            float nx = -u1y, ny = u1x;
+            float mid_x = (w1_sx + w1_ex) * 0.5f;
+            float mid_y = (w1_sy + w1_ey) * 0.5f;
+            if (nx * (-mid_x) + ny * (-mid_y) < 0.0f) {
+                nx = -nx; ny = -ny;
+            }
+            target.candle_x = mid_x + nx * 80.0f;
+            target.candle_y = mid_y + ny * 80.0f;
         }
 
         float t_proj = (target.candle_x - w1_sx) * u1x + (target.candle_y - w1_sy) * u1y;
@@ -1652,12 +1686,19 @@ public:
             norm_y = perp_dy / perp_dist;
         } else {
             float nx = -u1y, ny = u1x;
-            if (nx * (-p_proj_x) + ny * (-p_proj_y) < 0) {
+            if (nx * (-p_proj_x) + ny * (-p_proj_y) < 0.0f) {
                 nx = -nx; ny = -ny;
             }
             norm_x = nx; norm_y = ny;
             target.candle_x = p_proj_x + norm_x * 80.0f;
             target.candle_y = p_proj_y + norm_y * 80.0f;
+        }
+
+        // Fyzikální pojistka: vektor od stěny přes svíčku do otevřeného prostoru
+        // musí směřovat k robotovi [0,0] (před stěnu)
+        if (norm_x * (-p_proj_x) + norm_y * (-p_proj_y) < 0.0f) {
+            norm_x = -norm_x;
+            norm_y = -norm_y;
         }
 
         // Bezpečnostní pojistka: svíčka se NIKDY nesmí ocitnout mimo svůj Bounding Box!

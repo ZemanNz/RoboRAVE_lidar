@@ -1220,21 +1220,32 @@ class DualLidarVisualizer:
                 'approach_dir': (ux, uy)
             }
 
-        # 2. SEPARACE BODŮ SVÍČKY OD STĚN (Inspirace osvědčenou v12)
-        # Svíčka tvoří kompaktní shluk (průměr 20-55 mm). Najdeme těžiště nejhustšího shluku.
+        # 2. SEPARACE BODŮ SVÍČKY OD STĚN (v12 princip + pravidlo: svíčka je vždy blíže k LiDARu než stěny)
+        # Svíčka tvoří kompaktní shluk (průměr 20-45 mm). Preferujeme shluk nejblíže k LiDARu (rx, ry).
         n_p = len(world_pts)
         best_cand_cluster = []
         best_cand_center = None
+        best_cand_dist = 99999.0
 
         for p in world_pts:
-            cluster = [q for q in world_pts if math.hypot(q[0] - p[0], q[1] - p[1]) <= 40.0]
+            cluster = [q for q in world_pts if math.hypot(q[0] - p[0], q[1] - p[1]) <= 42.0]
             if 2 <= len(cluster) <= 9:
-                if len(cluster) > len(best_cand_cluster):
+                avg_x = sum(q[0] for q in cluster) / len(cluster)
+                avg_y = sum(q[1] for q in cluster) / len(cluster)
+                d_to_robot = math.hypot(avg_x - rx, avg_y - ry)
+
+                is_better = False
+                if not best_cand_cluster:
+                    is_better = True
+                elif d_to_robot < best_cand_dist - 30.0:
+                    is_better = True  # znatelně blíže k robotovi -> svíčka před stěnou!
+                elif abs(d_to_robot - best_cand_dist) <= 30.0 and len(cluster) > len(best_cand_cluster):
+                    is_better = True
+
+                if is_better:
                     best_cand_cluster = cluster
-                    best_cand_center = (
-                        sum(q[0] for q in cluster) / len(cluster),
-                        sum(q[1] for q in cluster) / len(cluster)
-                    )
+                    best_cand_center = (avg_x, avg_y)
+                    best_cand_dist = d_to_robot
 
         candle_pts_set = set(best_cand_cluster)
         wall_pts = [p for p in world_pts if p not in candle_pts_set]
@@ -1352,19 +1363,8 @@ class DualLidarVisualizer:
             norm_arm2 = max(1.0, math.hypot(far2[0] - Vx, far2[1] - Vy))
             arm2_x = (far2[0] - Vx) / norm_arm2
             arm2_y = (far2[1] - Vy) / norm_arm2
-            # Rameno 2 je POUZE druhá samostatná úsečka z vrcholu V podél stěny 2 (NIKDY se nespojuje konec 1 s koncem 2!)
+            # Rameno 2 je POUZE druhá samostatná úsečka z vrcholu V podél stěny 2
             wall2_seg = (V, (Vx + arm2_x * len2, Vy + arm2_y * len2))
-
-            # Svíčka C: buď předem separovaný shluk svíčky, nebo zbylé body uvnitř rohu
-            cand_pts = [p for p in world_pts if p not in best_w1_inliers and p not in best_w2_inliers]
-            if best_cand_center is not None:
-                cand_x, cand_y = best_cand_center
-            elif cand_pts:
-                cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
-                cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
-            else:
-                cand_x = Vx + 85.0 * arm1_x + 85.0 * arm2_x
-                cand_y = Vy + 85.0 * arm1_y + 85.0 * arm2_y
 
             # Otevřený prostor: osa rohu (bisektor) mířící ven z rohu do volného hřiště
             bisect_x = arm1_x + arm2_x
@@ -1375,6 +1375,22 @@ class DualLidarVisualizer:
                 u_open_y = bisect_y / blen
             else:
                 u_open_x = 0.0; u_open_y = 1.0
+
+            # Fyzikální orientace: osa otevřeného prostoru musí směřovat k robotovi (rx, ry)
+            if u_open_x * (rx - Vx) + u_open_y * (ry - Vy) < 0.0:
+                u_open_x = -u_open_x
+                u_open_y = -u_open_y
+
+            # Svíčka C: buď předem separovaný shluk svíčky, nebo leží uvnitř rohu směrem k robotovi
+            cand_pts = [p for p in world_pts if p not in best_w1_inliers and p not in best_w2_inliers]
+            if best_cand_center is not None:
+                cand_x, cand_y = best_cand_center
+            elif cand_pts:
+                cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
+                cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
+            else:
+                cand_x = Vx + u_open_x * 85.0
+                cand_y = Vy + u_open_y * 85.0
 
             # Waypoint je 380 mm v otevřeném prostoru před svíčkou
             wp_x = cand_x + u_open_x * 380.0
@@ -1407,8 +1423,11 @@ class DualLidarVisualizer:
         else:
             mid_x = (w1_s[0] + w1_e[0]) * 0.5
             mid_y = (w1_s[1] + w1_e[1]) * 0.5
-            cand_x = mid_x
-            cand_y = mid_y
+            nx = -u1y; ny = u1x
+            if nx * (rx - mid_x) + ny * (ry - mid_y) < 0.0:
+                nx = -nx; ny = -ny
+            cand_x = mid_x + nx * 80.0
+            cand_y = mid_y + ny * 80.0
 
         # Pata kolmice P_proj na přímce stěny 1
         t_proj = (cand_x - w1_s[0]) * u1x + (cand_y - w1_s[1]) * u1y
@@ -1429,11 +1448,16 @@ class DualLidarVisualizer:
             nx = -u1y; ny = u1x
             mid_x = (w1_s[0] + w1_e[0]) * 0.5
             mid_y = (w1_s[1] + w1_e[1]) * 0.5
-            if nx * (rx - mid_x) + ny * (ry - mid_y) < 0:
+            if nx * (rx - mid_x) + ny * (ry - mid_y) < 0.0:
                 nx = -nx; ny = -ny
             norm_x = nx; norm_y = ny
             cand_x = p_proj_x + norm_x * 80.0
             cand_y = p_proj_y + norm_y * 80.0
+
+        # Fyzikální pojistka: normála ze stěny přes svíčku musí mířit k robotovi (před stěnu)
+        if norm_x * (rx - p_proj_x) + norm_y * (ry - p_proj_y) < 0.0:
+            norm_x = -norm_x
+            norm_y = -norm_y
 
         # Waypoint leží na kolmici od stěny přes svíčku a od svíčky dál o 380 mm
         wp_x = cand_x + norm_x * 380.0
