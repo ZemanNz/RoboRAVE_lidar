@@ -1280,11 +1280,12 @@ public:
         target.box = box;
         target.is_visible = true;
 
-        float margin = 35.0f;
-        float bMinX = box.min_x - margin;
-        float bMaxX = box.max_x + margin;
-        float bMinY = box.min_y - margin;
-        float bMaxY = box.max_y + margin;
+        // Rezerva boxu výhradně pro hledání detailů uvnitř tohoto boxu (margin 25 mm)
+        float search_margin = 25.0f;
+        float bMinX = box.min_x - search_margin;
+        float bMaxX = box.max_x + search_margin;
+        float bMinY = box.min_y - search_margin;
+        float bMaxY = box.max_y + search_margin;
 
         int boxIndices[120];
         int boxPtCount = 0;
@@ -1319,17 +1320,66 @@ public:
             return target;
         }
 
-        // Hledání stěny 1 pomocí RANSAC s překlenutím stínu svíčky
+        // 1. SEPARACE BODŮ SVÍČKY OD STĚN (v12 princip)
+        // Hledáme kompaktní shluk bodů svíčky (průměr <= 40 mm, 2 až 8 bodů)
+        int bestCandCluster[20];
+        int bestCandCount = 0;
+        float bestCandX = 0.0f, bestCandY = 0.0f;
+
+        for (int i = 0; i < boxPtCount; i++) {
+            int pIdx1 = boxIndices[i];
+            float px = points[pIdx1].x;
+            float py = points[pIdx1].y;
+            int tempCluster[20];
+            int tempCount = 0;
+            float cSumX = 0.0f, cSumY = 0.0f;
+
+            for (int j = 0; j < boxPtCount && tempCount < 20; j++) {
+                int pIdx2 = boxIndices[j];
+                float d = hypotf(points[pIdx2].x - px, points[pIdx2].y - py);
+                if (d <= 40.0f) {
+                    tempCluster[tempCount++] = pIdx2;
+                    cSumX += points[pIdx2].x;
+                    cSumY += points[pIdx2].y;
+                }
+            }
+
+            if (tempCount >= 2 && tempCount <= 8 && tempCount > bestCandCount) {
+                bestCandCount = tempCount;
+                for (int k = 0; k < tempCount; k++) bestCandCluster[k] = tempCluster[k];
+                bestCandX = cSumX / (float)tempCount;
+                bestCandY = cSumY / (float)tempCount;
+            }
+        }
+
+        // Vyloučíme body svíčky z bodů pro hledání stěn!
+        int wallIndices[120];
+        int wallPtCount = 0;
+        for (int i = 0; i < boxPtCount; i++) {
+            int idx = boxIndices[i];
+            bool isCandle = false;
+            for (int k = 0; k < bestCandCount; k++) {
+                if (bestCandCluster[k] == idx) { isCandle = true; break; }
+            }
+            if (!isCandle) wallIndices[wallPtCount++] = idx;
+        }
+        if (wallPtCount < 4) {
+            // Pokud by nezbylo dost bodů pro stěny, použijeme všechny
+            wallPtCount = boxPtCount;
+            for (int i = 0; i < boxPtCount; i++) wallIndices[i] = boxIndices[i];
+        }
+
+        // 2. Hledání stěny 1 pomocí RANSAC POUZE ze stěnových bodů
         int bestW1Inliers[120];
         int bestW1Count = 0;
         int p1_idx = -1, p2_idx = -1;
 
-        for (int i = 0; i < boxPtCount && i < 30; i++) {
-            int idx1 = boxIndices[i];
+        for (int i = 0; i < wallPtCount && i < 30; i++) {
+            int idx1 = wallIndices[i];
             float x1 = points[idx1].x;
             float y1 = points[idx1].y;
-            for (int j = i + 1; j < boxPtCount && j < 30; j++) {
-                int idx2 = boxIndices[j];
+            for (int j = i + 1; j < wallPtCount && j < 30; j++) {
+                int idx2 = wallIndices[j];
                 float x2 = points[idx2].x;
                 float y2 = points[idx2].y;
                 float d = hypotf(x2 - x1, y2 - y1);
@@ -1340,10 +1390,10 @@ public:
 
                 int inlCount = 0;
                 int tempInl[120];
-                for (int k = 0; k < boxPtCount; k++) {
-                    int pIdx = boxIndices[k];
+                for (int k = 0; k < wallPtCount; k++) {
+                    int pIdx = wallIndices[k];
                     float dist = fabsf((points[pIdx].x - x1) * nx + (points[pIdx].y - y1) * ny);
-                    if (dist <= 22.0f) {
+                    if (dist <= 20.0f) {
                         tempInl[inlCount++] = pIdx;
                     }
                 }
@@ -1358,8 +1408,8 @@ public:
 
         if (bestW1Count < 4) {
             target.type = TARGET_SOLO;
-            target.candle_x = (boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx;
-            target.candle_y = (boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy;
+            target.candle_x = (bestCandCount > 0) ? bestCandX : ((boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx);
+            target.candle_y = (bestCandCount > 0) ? bestCandY : ((boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy);
             target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
             target.candle_y = fmaxf(box.min_y, fminf(box.max_y, target.candle_y));
             target.wall_count = 0;
@@ -1394,10 +1444,11 @@ public:
         float w1_ey = points[p1_idx].y + u1y * maxT1;
         float w1_len = maxT1 - minT1;
 
+        // Body pro druhou stěnu: ze stěnových bodů vyloučíme inliery stěny 1
         int outlierIndices[120];
         int outCount = 0;
-        for (int i = 0; i < boxPtCount; i++) {
-            int idx = boxIndices[i];
+        for (int i = 0; i < wallPtCount; i++) {
+            int idx = wallIndices[i];
             bool isInl = false;
             for (int k = 0; k < bestW1Count; k++) {
                 if (bestW1Inliers[k] == idx) { isInl = true; break; }
@@ -1410,7 +1461,7 @@ public:
         int bestW2Count = 0;
         int q1_idx = -1, q2_idx = -1;
 
-        if (outCount >= 4) {
+        if (outCount >= 3) {
             for (int i = 0; i < outCount && i < 25; i++) {
                 int qidx1 = outlierIndices[i];
                 float qx1 = points[qidx1].x;
@@ -1420,12 +1471,12 @@ public:
                     float qx2 = points[qidx2].x;
                     float qy2 = points[qidx2].y;
                     float qd = hypotf(qx2 - qx1, qy2 - qy1);
-                    if (qd < 65.0f) continue;
+                    if (qd < 60.0f) continue;
 
                     float qux = (qx2 - qx1) / qd;
                     float quy = (qy2 - qy1) / qd;
                     float dot = fabsf(u1x * qux + u1y * quy);
-                    if (dot > 0.50f) continue; // kolmost (60° až 120°)
+                    if (dot > 0.60f) continue; // kolmost (53° až 127°)
 
                     float qnx = -quy;
                     float qny = qux;
@@ -1434,7 +1485,7 @@ public:
                     for (int k = 0; k < outCount; k++) {
                         int pIdx = outlierIndices[k];
                         float dist = fabsf((points[pIdx].x - qx1) * qnx + (points[pIdx].y - qy1) * qny);
-                        if (dist <= 22.0f) tempInl2[inl2++] = pIdx;
+                        if (dist <= 20.0f) tempInl2[inl2++] = pIdx;
                     }
                     if (inl2 > bestW2Count) {
                         bestW2Count = inl2;
@@ -1446,7 +1497,7 @@ public:
             }
         }
 
-        // A. ROH (2 STĚNY)
+        // A. ROH (2 STĚNY SBÍHAJÍCÍ SE VE VRCHOLU V - ŽÁDNÝ TROJÚHELNÍK!)
         if (bestW2Count >= 3) {
             target.type = TARGET_CORNER;
             target.wall_count = 2;
@@ -1469,14 +1520,15 @@ public:
             }
 
             float d_s1 = hypotf(w1_sx - Vx, w1_sy - Vy);
-            float d_e1 = hypotf(w1_ex - Vx, w1_ey - Vy);
+            float d_e1 = hypotf(w1_ex - Vx, w1_sy - Vy);
             float far1x = (d_e1 > d_s1) ? w1_ex : w1_sx;
             float far1y = (d_e1 > d_s1) ? w1_ey : w1_sy;
-            float arm1_len = fmaxf(240.0f, fmaxf(d_s1, d_e1));
+            float arm1_len = fmaxf(220.0f, fmaxf(d_s1, d_e1));
             float norm1 = fmaxf(1.0f, hypotf(far1x - Vx, far1y - Vy));
             float arm1_ux = (far1x - Vx) / norm1;
             float arm1_uy = (far1y - Vy) / norm1;
 
+            // Rameno 1: pouze úsečka z vrcholu V podél stěny 1
             target.walls[0].x1 = Vx; target.walls[0].y1 = Vy;
             target.walls[0].x2 = Vx + arm1_ux * arm1_len; target.walls[0].y2 = Vy + arm1_uy * arm1_len;
             target.walls[0].length_mm = arm1_len;
@@ -1497,36 +1549,43 @@ public:
             float d_e2 = hypotf(w2_ex - Vx, w2_ey - Vy);
             float far2x = (d_e2 > d_s2) ? w2_ex : w2_sx;
             float far2y = (d_e2 > d_s2) ? w2_ey : w2_sy;
-            float arm2_len = fmaxf(240.0f, fmaxf(d_s2, d_e2));
+            float arm2_len = fmaxf(220.0f, fmaxf(d_s2, d_e2));
             float norm2 = fmaxf(1.0f, hypotf(far2x - Vx, far2y - Vy));
             float arm2_ux = (far2x - Vx) / norm2;
             float arm2_uy = (far2y - Vy) / norm2;
 
+            // Rameno 2: druhá samostatná úsečka z vrcholu V podél stěny 2 (NIKDY se nespojuje konec 1 a 2!)
             target.walls[1].x1 = Vx; target.walls[1].y1 = Vy;
             target.walls[1].x2 = Vx + arm2_ux * arm2_len; target.walls[1].y2 = Vy + arm2_uy * arm2_len;
             target.walls[1].length_mm = arm2_len;
             target.walls[1].point_count = bestW2Count;
 
-            float candSumX = 0.0f, candSumY = 0.0f;
-            int candPts = 0;
-            for (int i = 0; i < outCount; i++) {
-                int idx = outlierIndices[i];
-                bool isW2 = false;
-                for (int k = 0; k < bestW2Count; k++) {
-                    if (bestW2Inliers[k] == idx) { isW2 = true; break; }
-                }
-                if (!isW2) {
-                    candSumX += points[idx].x;
-                    candSumY += points[idx].y;
-                    candPts++;
-                }
-            }
-            if (candPts > 0) {
-                target.candle_x = candSumX / (float)candPts;
-                target.candle_y = candSumY / (float)candPts;
+            // Svíčka: buď předem separovaný shluk svíčky, nebo zbylé body
+            if (bestCandCount > 0) {
+                target.candle_x = bestCandX;
+                target.candle_y = bestCandY;
             } else {
-                target.candle_x = Vx + 85.0f * arm1_ux + 85.0f * arm2_ux;
-                target.candle_y = Vy + 85.0f * arm1_uy + 85.0f * arm2_uy;
+                float candSumX = 0.0f, candSumY = 0.0f;
+                int candPts = 0;
+                for (int i = 0; i < outCount; i++) {
+                    int idx = outlierIndices[i];
+                    bool isW2 = false;
+                    for (int k = 0; k < bestW2Count; k++) {
+                        if (bestW2Inliers[k] == idx) { isW2 = true; break; }
+                    }
+                    if (!isW2) {
+                        candSumX += points[idx].x;
+                        candSumY += points[idx].y;
+                        candPts++;
+                    }
+                }
+                if (candPts > 0) {
+                    target.candle_x = candSumX / (float)candPts;
+                    target.candle_y = candSumY / (float)candPts;
+                } else {
+                    target.candle_x = Vx + 85.0f * arm1_ux + 85.0f * arm2_ux;
+                    target.candle_y = Vy + 85.0f * arm1_uy + 85.0f * arm2_uy;
+                }
             }
 
             float bisect_x = arm1_ux + arm2_ux;
@@ -1562,7 +1621,10 @@ public:
         target.walls[0].length_mm = w1_len;
         target.walls[0].point_count = bestW1Count;
 
-        if (outCount > 0) {
+        if (bestCandCount > 0) {
+            target.candle_x = bestCandX;
+            target.candle_y = bestCandY;
+        } else if (outCount > 0) {
             float oSumX = 0.0f, oSumY = 0.0f;
             for (int i = 0; i < outCount; i++) {
                 oSumX += points[outlierIndices[i]].x;
@@ -1755,15 +1817,15 @@ public:
                 tt.type_votes[liveT.type]++;
                 if (tt.hits <= 2) {
                     tt.target.type = liveT.type;
-                } else if (tt.type_votes[TARGET_CORNER] >= 3) {
+                } else if (tt.type_votes[TARGET_CORNER] >= 4) {
                     tt.target.type = TARGET_CORNER;
-                } else if (tt.type_votes[TARGET_WALL] >= 4) {
+                } else if (tt.type_votes[TARGET_WALL] >= 4 && tt.target.type != TARGET_CORNER) {
                     tt.target.type = TARGET_WALL;
-                } else {
+                } else if (tt.type_votes[TARGET_SOLO] >= 7 && tt.type_votes[TARGET_CORNER] < 2 && tt.type_votes[TARGET_WALL] < 2) {
                     tt.target.type = TARGET_SOLO;
                 }
 
-                const float alpha = 0.20f;
+                const float alpha = 0.15f;
                 tt.target.box = liveT.box;
                 tt.target.candle_x = (1.0f - alpha) * tt.target.candle_x + alpha * liveT.candle_x;
                 tt.target.candle_y = (1.0f - alpha) * tt.target.candle_y + alpha * liveT.candle_y;
@@ -1780,21 +1842,35 @@ public:
                 tt.target.is_visible = true;
                 tt.target.hits = tt.hits;
 
-                // Stěny: vyhlazení nebo zachování stabilních stěn (žádné přeblikávání!)
+                // Stěny: vyhlazení se zachováním stejné orientace úsečky a eliminace přeblikávání
                 if (liveT.wall_count > 0) {
                     if (tt.target.wall_count == liveT.wall_count) {
                         for (int w = 0; w < liveT.wall_count; w++) {
-                            tt.target.walls[w].x1 = (1.0f - alpha) * tt.target.walls[w].x1 + alpha * liveT.walls[w].x1;
-                            tt.target.walls[w].y1 = (1.0f - alpha) * tt.target.walls[w].y1 + alpha * liveT.walls[w].y1;
-                            tt.target.walls[w].x2 = (1.0f - alpha) * tt.target.walls[w].x2 + alpha * liveT.walls[w].x2;
-                            tt.target.walls[w].y2 = (1.0f - alpha) * tt.target.walls[w].y2 + alpha * liveT.walls[w].y2;
+                            float s1x = tt.target.walls[w].x1, s1y = tt.target.walls[w].y1;
+                            float e1x = tt.target.walls[w].x2, e1y = tt.target.walls[w].y2;
+                            float s2x = liveT.walls[w].x1, s2y = liveT.walls[w].y1;
+                            float e2x = liveT.walls[w].x2, e2y = liveT.walls[w].y2;
+
+                            float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
+                            float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
+                            if (d_flip < d_same) {
+                                float tx = s2x; s2x = e2x; e2x = tx;
+                                float ty = s2y; s2y = e2y; e2y = ty;
+                            }
+
+                            tt.target.walls[w].x1 = (1.0f - alpha) * s1x + alpha * s2x;
+                            tt.target.walls[w].y1 = (1.0f - alpha) * s1y + alpha * s2y;
+                            tt.target.walls[w].x2 = (1.0f - alpha) * e1x + alpha * e2x;
+                            tt.target.walls[w].y2 = (1.0f - alpha) * e1y + alpha * e2y;
                             tt.target.walls[w].length_mm = hypotf(tt.target.walls[w].x2 - tt.target.walls[w].x1,
                                                                  tt.target.walls[w].y2 - tt.target.walls[w].y1);
                         }
                     } else {
-                        tt.target.wall_count = liveT.wall_count;
-                        tt.target.walls[0] = liveT.walls[0];
-                        tt.target.walls[1] = liveT.walls[1];
+                        if (!(tt.hits > 5 && tt.target.wall_count > liveT.wall_count)) {
+                            tt.target.wall_count = liveT.wall_count;
+                            tt.target.walls[0] = liveT.walls[0];
+                            tt.target.walls[1] = liveT.walls[1];
+                        }
                     }
                 }
             } else {

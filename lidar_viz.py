@@ -783,20 +783,23 @@ class TrackedBoxDetail:
         self.missed = 0
         self.type_history.append(meas['type'])
 
-        # Stabilní typ podle historie (většinový konsensus):
+        # Zvýšená hystereze typu: zabraňuje přeblikávání typu cíle (CORNER / WALL / SOLO)
         if self.hits <= 2:
             self.confirmed_type = meas['type']
         else:
             c_corner = self.type_history.count('CORNER')
             c_wall   = self.type_history.count('WALL')
-            if c_corner >= 3:
+            c_solo   = self.type_history.count('SOLO')
+            # Jednou potvrzený roh nebo stěna se nemění při náhodném výpadku 1-2 snímků
+            if c_corner >= 4:
                 self.confirmed_type = 'CORNER'
-            elif c_wall >= 4:
+            elif c_wall >= 4 and self.confirmed_type != 'CORNER':
                 self.confirmed_type = 'WALL'
-            else:
+            elif c_solo >= 7 and c_corner < 2 and c_wall < 2:
                 self.confirmed_type = 'SOLO'
 
-        alpha = 0.22
+        # Klidný filtr polohy (EMA alpha = 0.15 pro maximální stabilitu jako u bounding boxů)
+        alpha = 0.15
         # Vyhlazení polohy svíčky (EMA)
         mc = meas['candle_world']
         self.candle_world = (
@@ -810,12 +813,19 @@ class TrackedBoxDetail:
             if len(mw) == len(self.walls_world):
                 new_w = []
                 for (s1, e1), (s2, e2) in zip(self.walls_world, mw):
+                    # Zajištění stejné orientace začátku a konce úsečky před vyhlazením
+                    d_same = math.hypot(s1[0] - s2[0], s1[1] - s2[1]) + math.hypot(e1[0] - e2[0], e1[1] - e2[1])
+                    d_flip = math.hypot(s1[0] - e2[0], s1[1] - e2[1]) + math.hypot(e1[0] - s2[0], e1[1] - s2[1])
+                    if d_flip < d_same:
+                        s2, e2 = e2, s2
                     ns = ((1.0 - alpha) * s1[0] + alpha * s2[0], (1.0 - alpha) * s1[1] + alpha * s2[1])
                     ne = ((1.0 - alpha) * e1[0] + alpha * e2[0], (1.0 - alpha) * e1[1] + alpha * e2[1])
                     new_w.append((ns, ne))
                 self.walls_world = new_w
             else:
-                self.walls_world = list(mw)
+                # Pokud nový snímek přinesl jiný počet stěn, ale už máme stabilizovaný cíl s více stěnami, podržíme ho
+                if not (self.hits > 5 and len(self.walls_world) > len(mw)):
+                    self.walls_world = list(mw)
 
         # Vyhlazení směru nájezdu a cílového waypointu
         mdir = meas['approach_dir']
@@ -1163,13 +1173,14 @@ class DualLidarVisualizer:
         cos_t = math.cos(th_rad)
         sin_t = math.sin(th_rad)
 
-        margin = 35.0
-        bx_min = box['min_x'] - margin
-        bx_max = box['max_x'] + margin
-        by_min = box['min_y'] - margin
-        by_max = box['max_y'] + margin
+        # Rozšířené vyhledávací okno výhradně pro sběr bodů detailu (rezerva pro detekci stěn/svíček)
+        search_margin = 25.0
+        bx_min = box['min_x'] - search_margin
+        bx_max = box['max_x'] + search_margin
+        by_min = box['min_y'] - search_margin
+        by_max = box['max_y'] + search_margin
 
-        # Výběr bodů striktně uvnitř boxu převedených přímo do světových souřadnic
+        # Výběr bodů uvnitř rozšířeného okna převedených přímo do světových souřadnic
         world_pts = []
         if cloud_data and len(cloud_data) >= 3:
             n_cloud = len(cloud_data) // 3
@@ -1209,27 +1220,48 @@ class DualLidarVisualizer:
                 'approach_dir': (ux, uy)
             }
 
-        # 2. Hledáme první stěnu (Wall 1) pomocí RANSAC ve světovém prostoru
+        # 2. SEPARACE BODŮ SVÍČKY OD STĚN (Inspirace osvědčenou v12)
+        # Svíčka tvoří kompaktní shluk (průměr 20-55 mm). Najdeme těžiště nejhustšího shluku.
+        n_p = len(world_pts)
+        best_cand_cluster = []
+        best_cand_center = None
+
+        for p in world_pts:
+            cluster = [q for q in world_pts if math.hypot(q[0] - p[0], q[1] - p[1]) <= 40.0]
+            if 2 <= len(cluster) <= 9:
+                if len(cluster) > len(best_cand_cluster):
+                    best_cand_cluster = cluster
+                    best_cand_center = (
+                        sum(q[0] for q in cluster) / len(cluster),
+                        sum(q[1] for q in cluster) / len(cluster)
+                    )
+
+        candle_pts_set = set(best_cand_cluster)
+        wall_pts = [p for p in world_pts if p not in candle_pts_set]
+        if len(wall_pts) < 4:
+            wall_pts = list(world_pts)
+
+        # 3. Hledáme první stěnu (Wall 1) pomocí RANSAC pouze z bodů určených pro stěny
         best_w1_inliers = []
         best_w1_line = None
-        n_p = len(world_pts)
-        step = 1 if n_p < 40 else 2
-        for i in range(0, min(n_p, 30), step):
-            p1 = world_pts[i]
-            for j in range(i + 1, min(n_p, 30), step):
-                p2 = world_pts[j]
+        n_wp = len(wall_pts)
+        step = 1 if n_wp < 40 else 2
+        for i in range(0, min(n_wp, 30), step):
+            p1 = wall_pts[i]
+            for j in range(i + 1, min(n_wp, 30), step):
+                p2 = wall_pts[j]
                 d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
                 if d < 75.0: continue
                 nx = -(p2[1] - p1[1]) / d
                 ny = (p2[0] - p1[0]) / d
-                inliers = [p for p in world_pts if abs((p[0] - p1[0]) * nx + (p[1] - p1[1]) * ny) <= 22.0]
+                inliers = [p for p in wall_pts if abs((p[0] - p1[0]) * nx + (p[1] - p1[1]) * ny) <= 20.0]
                 if len(inliers) > len(best_w1_inliers):
                     best_w1_inliers = inliers
                     best_w1_line = (p1, p2)
 
         if not best_w1_line or len(best_w1_inliers) < 4:
-            cand_x = sum(p[0] for p in world_pts) / len(world_pts)
-            cand_y = sum(p[1] for p in world_pts) / len(world_pts)
+            cand_x = best_cand_center[0] if best_cand_center else (sum(p[0] for p in world_pts) / len(world_pts))
+            cand_y = best_cand_center[1] if best_cand_center else (sum(p[1] for p in world_pts) / len(world_pts))
             d_vec_x = cand_x - rx; d_vec_y = cand_y - ry
             d_len = max(1.0, math.hypot(d_vec_x, d_vec_y))
             ux = d_vec_x / d_len; uy = d_vec_y / d_len
@@ -1254,25 +1286,26 @@ class DualLidarVisualizer:
         w1_e = (p1[0] + u1x * max_t1, p1[1] + u1y * max_t1)
         w1_len = max_t1 - min_t1
 
-        outliers1 = [p for p in world_pts if p not in best_w1_inliers]
+        # Body pro druhou stěnu: z bodů pro stěny vyloučíme inliery stěny 1
+        outliers_for_w2 = [p for p in wall_pts if p not in best_w1_inliers]
 
-        # 3. Hledáme druhou stěnu (Wall 2) kolmou k Wall 1
+        # 4. Hledáme druhou stěnu (Wall 2) kolmou k Wall 1
         best_w2_inliers = []
         best_w2_line = None
-        if len(outliers1) >= 4:
-            n_out = len(outliers1)
+        if len(outliers_for_w2) >= 3:
+            n_out = len(outliers_for_w2)
             for i in range(min(n_out, 25)):
-                q1 = outliers1[i]
+                q1 = outliers_for_w2[i]
                 for j in range(i + 1, min(n_out, 25)):
-                    q2 = outliers1[j]
+                    q2 = outliers_for_w2[j]
                     qd = math.hypot(q2[0] - q1[0], q2[1] - q1[1])
-                    if qd < 65.0: continue
+                    if qd < 60.0: continue
                     qux = (q2[0] - q1[0]) / qd
                     quy = (q2[1] - q1[1]) / qd
                     dot = abs(u1x * qux + u1y * quy)
-                    if dot > 0.65: continue # požadavek kolmosti (50° až 130°)
+                    if dot > 0.60: continue # kolmost (53° až 127°)
                     q_nx = -quy; q_ny = qux
-                    in2 = [p for p in outliers1 if abs((p[0] - q1[0]) * q_nx + (p[1] - q1[1]) * q_ny) <= 22.0]
+                    in2 = [p for p in outliers_for_w2 if abs((p[0] - q1[0]) * q_nx + (p[1] - q1[1]) * q_ny) <= 20.0]
                     if len(in2) > len(best_w2_inliers):
                         best_w2_inliers = in2
                         best_w2_line = (q1, q2)
@@ -1301,10 +1334,11 @@ class DualLidarVisualizer:
             d_s1 = math.hypot(w1_s[0] - Vx, w1_s[1] - Vy)
             d_e1 = math.hypot(w1_e[0] - Vx, w1_e[1] - Vy)
             far1 = w1_e if d_e1 > d_s1 else w1_s
-            len1 = max(140.0, max(d_s1, d_e1))
+            len1 = max(180.0, max(d_s1, d_e1))
             norm_arm1 = max(1.0, math.hypot(far1[0] - Vx, far1[1] - Vy))
             arm1_x = (far1[0] - Vx) / norm_arm1
             arm1_y = (far1[1] - Vy) / norm_arm1
+            # Rameno 1 je POUZE úsečka z vrcholu V podél stěny 1
             wall1_seg = (V, (Vx + arm1_x * len1, Vy + arm1_y * len1))
 
             # Orientujeme rameno 2 směrem OD vrcholu V podél stěny
@@ -1314,15 +1348,18 @@ class DualLidarVisualizer:
             d_s2 = math.hypot(w2_s[0] - Vx, w2_s[1] - Vy)
             d_e2 = math.hypot(w2_e[0] - Vx, w2_e[1] - Vy)
             far2 = w2_e if d_e2 > d_s2 else w2_s
-            len2 = max(140.0, max(d_s2, d_e2))
+            len2 = max(180.0, max(d_s2, d_e2))
             norm_arm2 = max(1.0, math.hypot(far2[0] - Vx, far2[1] - Vy))
             arm2_x = (far2[0] - Vx) / norm_arm2
             arm2_y = (far2[1] - Vy) / norm_arm2
+            # Rameno 2 je POUZE druhá samostatná úsečka z vrcholu V podél stěny 2 (NIKDY se nespojuje konec 1 s koncem 2!)
             wall2_seg = (V, (Vx + arm2_x * len2, Vy + arm2_y * len2))
 
-            # Svíčka C: zbylé body uvnitř rohu
-            cand_pts = [p for p in outliers1 if p not in best_w2_inliers]
-            if cand_pts:
+            # Svíčka C: buď předem separovaný shluk svíčky, nebo zbylé body uvnitř rohu
+            cand_pts = [p for p in world_pts if p not in best_w1_inliers and p not in best_w2_inliers]
+            if best_cand_center is not None:
+                cand_x, cand_y = best_cand_center
+            elif cand_pts:
                 cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
                 cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
             else:
@@ -1360,10 +1397,13 @@ class DualLidarVisualizer:
         # ========================================================
         wall1_seg = (w1_s, w1_e)
 
-        # Svíčka C z outliers
-        if outliers1:
-            cand_x = sum(p[0] for p in outliers1) / len(outliers1)
-            cand_y = sum(p[1] for p in outliers1) / len(outliers1)
+        # Svíčka C z předem separovaného shluku nebo z bodů mimo stěnu 1
+        cand_pts = [p for p in world_pts if p not in best_w1_inliers]
+        if best_cand_center is not None:
+            cand_x, cand_y = best_cand_center
+        elif cand_pts:
+            cand_x = sum(p[0] for p in cand_pts) / len(cand_pts)
+            cand_y = sum(p[1] for p in cand_pts) / len(cand_pts)
         else:
             mid_x = (w1_s[0] + w1_e[0]) * 0.5
             mid_y = (w1_s[1] + w1_e[1]) * 0.5
