@@ -1569,6 +1569,26 @@ class DualLidarVisualizer:
             self.screen.blit(lbl1, (rx + 4, max(4, ry - 18)))
             self.screen.blit(lbl2, (scx + 8, scy - 7))
 
+        # Jemné stěny a nájezdy v Panelu 1 při stisknutí [O]
+        if self.detect_details_enabled and boxes_to_draw:
+            cloud_data = self.last_frame.get("cloud", [])
+            for b_idx, cl in enumerate(boxes_to_draw):
+                raw_d = self.compute_raw_box_details(cl, cloud_data, 0.0, 0.0, 0.0)
+                # Stěny uvnitř boxu
+                for w_seg in raw_d.get('walls_world', []):
+                    wp1 = self.to_screen(w_seg[0][0], w_seg[0][1], offset_x)
+                    wp2 = self.to_screen(w_seg[1][0], w_seg[1][1], offset_x)
+                    pygame.draw.line(self.screen, (255, 250, 130), wp1, wp2, 3)
+                # Svíčka
+                cw = raw_d.get('candle_world', (cl['cx'], cl['cy']))
+                cs = self.to_screen(cw[0], cw[1], offset_x)
+                pygame.draw.circle(self.screen, (255, 50, 30), cs, 6)
+                pygame.draw.circle(self.screen, (255, 220, 0), cs, 3)
+                # Šipka nájezdu
+                wp_p = raw_d.get('waypoint_world', (cw[0], cw[1]))
+                wp_s = self.to_screen(wp_p[0], wp_p[1], offset_x)
+                draw_arrow(self.screen, (255, 75, 40), wp_s, cs, width=3, tip_len=12, tip_width=6)
+
         # Telemetrický panel vlevo nahoře
         panel = pygame.Surface((290, 140))
         panel.set_alpha(220)
@@ -1670,6 +1690,26 @@ class DualLidarVisualizer:
             lbl_c = self.font_main.render(f"X:{int(cl['cx']):+d} Y:{int(cl['cy']):+d} | R:{int(cl['dist_mm'])} mm", True, (255, 245, 140))
             self.screen.blit(lbl_t, (rx + 4, max(4, ry - 18)))
             self.screen.blit(lbl_c, (scx + 8, scy - 7))
+
+        # Jemné stěny a nájezdy v Panelu 2 (Etalon) při stisknutí [O]
+        if self.detect_details_enabled and ref_boxes:
+            cloud_data = self.last_frame.get("cloud", [])
+            for b_idx, cl in enumerate(ref_boxes):
+                raw_d = self.compute_raw_box_details(cl, cloud_data, 0.0, 0.0, 0.0)
+                # Stěny
+                for w_seg in raw_d.get('walls_world', []):
+                    wp1 = self.to_screen(w_seg[0][0], w_seg[0][1], offset_x)
+                    wp2 = self.to_screen(w_seg[1][0], w_seg[1][1], offset_x)
+                    pygame.draw.line(self.screen, (255, 250, 130), wp1, wp2, 3)
+                # Svíčka
+                cw = raw_d.get('candle_world', (cl['cx'], cl['cy']))
+                cs = self.to_screen(cw[0], cw[1], offset_x)
+                pygame.draw.circle(self.screen, (255, 50, 30), cs, 6)
+                pygame.draw.circle(self.screen, (255, 220, 0), cs, 3)
+                # Šipka
+                wp_p = raw_d.get('waypoint_world', (cw[0], cw[1]))
+                wp_s = self.to_screen(wp_p[0], wp_p[1], offset_x)
+                draw_arrow(self.screen, (255, 75, 40), wp_s, cs, width=3, tip_len=12, tip_width=6)
 
         # Horní status panel
         stat_box = pygame.Surface((570, 56))
