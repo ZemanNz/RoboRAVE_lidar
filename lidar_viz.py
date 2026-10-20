@@ -2934,7 +2934,7 @@ class DualLidarVisualizer:
             pygame.draw.circle(self.screen, cand_col, cand_s, 5)
             pygame.draw.circle(self.screen, (255, 220, 0), cand_s, 2)
 
-            # 4. Koridor 20 cm, detekce kolize, ochranná kružnice a vyhýbací tečna s kolmicí (V GRAFICKÉM OBDÉLNÍKU HŘIŠTĚ)
+            # 4. Čistá trasa k nájezdu svíčky (přímá nebo po tečně, pokud je v cestě překážka)
             if self.detect_details_enabled and is_vis:
                 path_info = compute_tangent_avoidance_path(
                     r_pos[0], r_pos[1],
@@ -2942,41 +2942,20 @@ class DualLidarVisualizer:
                     idx, field_targets, (xmin, xmax, ymin, ymax)
                 )
 
-                # Dvě čáry koridoru šířky +-10 cm (bez textu)
-                for line_start, line_end in path_info['corridor_lines']:
-                    ls_s = f_to_screen(line_start[0], line_start[1])
-                    le_s = f_to_screen(line_end[0], line_end[1])
-                    cor_col = (0, 160, 220) if not path_info['collision'] else (240, 130, 40)
-                    pygame.draw.line(self.screen, cor_col, ls_s, le_s, 1)
-
-                if not path_info['collision']:
-                    # Volná přímá trasa (tyrkysová čára)
-                    pygame.draw.line(self.screen, (0, 240, 255), (r_sx, r_sy), wp_s, 1)
+                if not path_info['collision'] or not path_info.get('safe_path'):
+                    # Přímá volná trasa (modrá)
+                    pygame.draw.line(self.screen, (0, 240, 255), (r_sx, r_sy), wp_s, 2)
                 else:
-                    # Kolizní přímá trasa (oranžová tenká linka)
-                    pygame.draw.line(self.screen, (220, 100, 30), (r_sx, r_sy), wp_s, 1)
-
-                    obs = path_info['obstacle']
+                    # Trasa po tečně při vyžadovaném vyhnutí překážce (modrá lomená trasa)
                     sp = path_info['safe_path']
+                    p_s = f_to_screen(sp['perp_pt'][0], sp['perp_pt'][1])
 
-                    # Černá ochranná kružnice kolem překážky s červeným obrysem
-                    if obs:
-                        obs_s = f_to_screen(obs['pos'][0], obs['pos'][1])
-                        r_safe_px = max(4, int(230.0 * draw_scale))
-                        pygame.draw.circle(self.screen, (10, 12, 16), obs_s, r_safe_px)
-                        pygame.draw.circle(self.screen, (255, 50, 50), obs_s, r_safe_px, 1)
-
-                    # Červená tečna a kolmice bez popisků
-                    if sp:
-                        p_s = f_to_screen(sp['perp_pt'][0], sp['perp_pt'][1])
-                        ext_s = f_to_screen(sp['line_ext_end'][0], sp['line_ext_end'][1])
-
-                        # Červená tečna podél kružnice překážky
-                        pygame.draw.line(self.screen, (255, 45, 45), wp_s, ext_s, 2)
-                        # Červená kolmice z robota do bodu P
-                        pygame.draw.line(self.screen, (255, 45, 45), (r_sx, r_sy), p_s, 2)
-                        # Bod P (pata kolmice)
-                        pygame.draw.circle(self.screen, (255, 230, 0), p_s, 3)
+                    # 1. úsek: kolmice z robota na tečnu
+                    pygame.draw.line(self.screen, (0, 220, 255), (r_sx, r_sy), p_s, 2)
+                    # 2. úsek: po tečně přímo do cílového waypointu
+                    pygame.draw.line(self.screen, (0, 220, 255), p_s, wp_s, 2)
+                    # Odbočovací bod P
+                    pygame.draw.circle(self.screen, (255, 230, 0), p_s, 3)
 
                 # Terčík waypointu a 38cm nájezdová šipka
                 pygame.draw.circle(self.screen, (0, 255, 200), wp_s, 5, 1)
