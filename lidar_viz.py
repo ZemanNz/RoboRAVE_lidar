@@ -1603,12 +1603,15 @@ class DualLidarVisualizer:
         self.send_cmd("RESET_MAP")
         print("[MAPA] Mapy vyresetovány -> sběr čistého etalonu.")
 
+    @property
+    def scale(self):
+        return (PANEL_W / 2.0) / self.view_span_mm
+
     def to_screen(self, x_mm, y_mm, panel_offset_x):
         cx = panel_offset_x + PANEL_W / 2.0
         cy = PANEL_H / 2.0
-        scale = (PANEL_W / 2.0) / self.view_span_mm
-        sx = int(cx + x_mm * scale)
-        sy = int(cy - y_mm * scale)
+        sx = int(cx + x_mm * self.scale)
+        sy = int(cy - y_mm * self.scale)
         return sx, sy
 
     def prioritize_and_recover_expected_boxes(self, raw_boxes, cloud_data):
