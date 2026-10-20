@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Kybernoid 27 - LiDAR Detekce, Stabilní Mapování a Relokalizace Robota</title>
+<style>
+  @page {
+    size: A4;
+    margin: 1.8cm 1.5cm 1.8cm 1.5cm;
+    @bottom-right {
+      content: counter(page);
+    }
+  }
+  body {
+    font-family: "Liberation Sans", "DejaVu Sans", "Segoe UI", Arial, sans-serif;
+    font-size: 10pt;
+    line-height: 1.45;
+    color: #1a1a1a;
+    background-color: #ffffff;
+    margin: 0;
+    padding: 0;
+  }
+  h1 {
+    font-size: 20pt;
+    color: #0b3c5d;
+    border-bottom: 2px solid #0b3c5d;
+    padding-bottom: 6px;
+    margin-top: 0;
+    margin-bottom: 8px;
+  }
+  h2 {
+    font-size: 14pt;
+    color: #1d2731;
+    border-bottom: 1px solid #dcdcdc;
+    padding-bottom: 4px;
+    margin-top: 20px;
+    margin-bottom: 10px;
+    page-break-after: avoid;
+  }
+  h3 {
+    font-size: 11pt;
+    color: #328cc1;
+    margin-top: 14px;
+    margin-bottom: 6px;
+    page-break-after: avoid;
+  }
+  h4 {
+    font-size: 10pt;
+    color: #555;
+    margin-top: 10px;
+    margin-bottom: 4px;
+    page-break-after: avoid;
+  }
+  p {
+    margin-top: 4px;
+    margin-bottom: 8px;
+    text-align: justify;
+  }
+  ul, ol {
+    margin-top: 4px;
+    margin-bottom: 8px;
+    padding-left: 22px;
+  }
+  li {
+    margin-bottom: 3px;
+  }
+  .header-meta {
+    background-color: #f4f7f9;
+    border-left: 4px solid #328cc1;
+    padding: 8px 12px;
+    margin-bottom: 16px;
+    font-size: 9pt;
+  }
+  .header-meta p {
+    margin: 2px 0;
+  }
+  .img-container {
+    text-align: center;
+    margin: 14px 0;
+    page-break-inside: avoid;
+  }
+  .img-container img {
+    max-width: 96%;
+    height: auto;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.15);
+  }
+  .img-caption {
+    font-size: 8.5pt;
+    color: #555;
+    font-style: italic;
+    margin-top: 5px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0;
+    font-size: 8.5pt;
+    page-break-inside: avoid;
+  }
+  th, td {
+    border: 1px solid #ccc;
+    padding: 5px 8px;
+    text-align: left;
+  }
+  th {
+    background-color: #e8eef2;
+    color: #0b3c5d;
+    font-weight: bold;
+  }
+  tr:nth-child(even) {
+    background-color: #fbfbfb;
+  }
+  code {
+    font-family: "Liberation Mono", "DejaVu Sans Mono", Consolas, monospace;
+    font-size: 8.5pt;
+    background-color: #f0f2f4;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #c7254e;
+  }
+  pre {
+    font-family: "Liberation Mono", "DejaVu Sans Mono", Consolas, monospace;
+    font-size: 8pt;
+    background-color: #f7f9fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 8px 0;
+    white-space: pre-wrap;
+    line-height: 1.3;
+    page-break-inside: avoid;
+  }
+  .callout {
+    background-color: #f8f9fa;
+    border-left: 4px solid #28a745;
+    padding: 8px 12px;
+    margin: 10px 0;
+    font-size: 9pt;
+    page-break-inside: avoid;
+  }
+  .callout-info {
+    border-left-color: #17a2b8;
+    background-color: #f1f9fb;
+  }
+  .callout-warning {
+    border-left-color: #ffc107;
+    background-color: #fffdf5;
+  }
+  .page-break {
+    page-break-after: always;
+  }
+  .formula-box {
+    background-color: #fafbfc;
+    border: 1px solid #e1e4e8;
+    border-radius: 4px;
+    padding: 6px 12px;
+    margin: 8px 0;
+    text-align: center;
+    font-family: "Liberation Serif", "Times New Roman", serif;
+    font-size: 10.5pt;
+    page-break-inside: avoid;
+  }
+</style>
+</head>
+<body>
+
+<h1>LiDAR Detekce, Stabilní Mapování a Relokalizace Robota</h1>
+<div class="header-meta">
+  <p><strong>Projekt:</strong> Autonomní hasicí robot – Soutěž Kybernoid 27 / RoboRAVE</p>
+  <p><strong>Verze systému:</strong> v12 (<code>lokalizace-v12-automaticky-360-rozhled-v-poli</code>)</p>
+  <p><strong>Architektura:</strong> ToF LiDAR Waveshare D200 (UART 230.4k) &rarr; ESP32 Embedded Detektor (C++) &rarr; PC Relokalizátor &amp; Globální Hřiště (Python 3 / Pygame / NumPy @ 921.6k)</p>
+</div>
+
+<h2>1. Úvod a Soutěžní Kontext</h2>
+<p>
+V soutěžní disciplíně hašení ohně (kategorie Kybernoid 27 a RoboRAVE) má plně autonomní robot za úkol v aréně o nominálních rozměrech <strong>2,4 m &times; 3,5 m</strong> bezpečně vyhledat, objet a zhasnout <strong>4 hořící svíčky</strong> bez fyzického kontaktu s překážkami a mantinely.
+</p>
+<p>
+Hladký a lesklý černý povrch hrací desky způsobuje masivní prokluz pohonných kol. Běžná kolová odometrie akumuluje během několika metrů jízdy neúnosnou poziční chybu v řádu desítek centimetrů a desítek stupňů rotace. Tento projekt proto realizuje kompletní <strong>absolutní relokalizační a mapovací systém</strong> založený výhradně na prostorových datech z 360&deg; laserového ToF skeneru (LiDARu).
+</p>
+
+<h2>2. Fyzická Realita Hřiště a Geometrická Pravidla</h2>
+<p>
+Pravidla soutěže přesně definují rozmístění a charakteristiky objektů na hrací ploše:
+</p>
+<ul>
+  <li><strong>Svíčky:</strong> 4 ks voskových/olejových svíček na černých válcových tělech s vnějším průměrem 45 až 55 mm usazených na bílých soustředných kruzích.</li>
+  <li><strong>Krycí stěny:</strong> Bílé plastové desky o výšce cca 30 cm a tloušťce 3&ndash;5 mm na dřevěných patkách. Nominální délka desky je <strong>300 mm</strong> (v měření 280 až 330 mm).</li>
+  <li><strong>Pravidlo volné svíčky:</strong> Právě jedna ze 4 svíček je umístěna zcela volně v otevřeném prostoru (žádná stěna v dosahu 250 mm). Zbylé tři svíčky jsou kryty stěnami.</li>
+  <li><strong>Minimální rozestup:</strong> Žádné dvě svíčky nesmí být blíže než <strong>800 mm</strong> od sebe.</li>
+  <li><strong>Stěny a rohy:</strong> Stěny tvoří samostatné zástěny (1 stěna), pravé úhly (2 stěny) nebo U-boxy kryjící svíčku ze tří stran. Celkem se v poli nachází nejvýše 6 překážkových stěn.</li>
+</ul>
+
+<div class="img-container">
+  <img src="Snímek obrazovky z 2026-10-10 20-22-53.png" style="max-height: 240px;" alt="Reálná aréna">
+  <div class="img-caption">Obrázek 1: Pohled na reálnou soutěžní arénu Kybernoid / RoboRAVE. V popředí volná svíčka bez stěny, vlevo svíčka za samostatnou 30cm deskou a vpravo svíčka krytá trojicí stěn v U-boxu.</div>
+</div>
+
+<h2>3. Hardwarová Architektura a Low-Level Zpracování na ESP32</h2>
+<p>
+Celý řetězec zpracování signálu je navržen s důrazem na determinismus, nízkou latenci a minimalizaci zátěže komunikační linky:
+</p>
+<ul>
+  <li><strong>LiDAR Waveshare D200:</strong> 360&deg; Time-of-Flight skener, vzorkovací frekvence 3000&ndash;4500 měření/s, rotace 6&ndash;10 Hz, mrtvá zóna 130 mm, maximální aktivní rozsah 2400 mm. Připojení k ESP32 přes UART2 (GPIO 13 RX, GPIO 10 TX @ 230 400 baud).</li>
+  <li><strong>Mikrokontrolér ESP32 (Xtensa Dual-Core):</strong>
+    <ul>
+      <li><code>FilterPipeline::apply</code>: Ořezání vzdálenosti (130&ndash;2400 mm), prahování intenzity odrazivosti (&ge; 15) pro eliminaci šumu černého podkladu, 180&deg; dopředný kužel na startu, softwarová maska sloupků robota.</li>
+      <li><code>GeometryDetector::process</code>: Extrakce svíček pomocí euklidovského shlukování sousedních bodů (vzdálenost &le; 55 mm, průměr 12&ndash;100 mm, 2&ndash;24 bodů). Následné cílené hledání 30cm stěn v prstenci 60&ndash;420 mm kolem každé nalezené svíčky metodou RANSAC / lineární regrese.</li>
+      <li>Výpočetní čas na ESP32: pouhých <strong>2 až 22 ms</strong> na celou otáčku!</li>
+    </ul>
+  </li>
+  <li><strong>Binární protokol (921 600 baud):</strong> ESP32 odesílá do PC kompaktní rámec obsahující telemetrii (FPS, volný heap, CRC chyby, čas výpočtu), seznam nalezených stěn a svíček a podvzorkované mračno bodů.</li>
+</ul>
+
+<div class="page-break"></div>
+
+<h2>4. Dvouvrstvé Stabilní Mapování (StableFieldModel)</h2>
+<p>
+Surová senzorová data trpí chvěním a občasnými výpadky. Třída <code>StableFieldModel</code> v souboru <code>lidar_viz.py</code> vytváří stabilní časovou reprezentaci:
+</p>
+<ul>
+  <li><strong>Časová filtrace (EMA):</strong> Každá nová detekce je spárována s existujícím klastrem v okruhu 150 mm. Pozice je vyhlazována exponenciálním klouzavým průměrem:
+    <div class="formula-box">x_{nové} = (1 - \alpha) \cdot x_{staré} + \alpha \cdot \hat{x}, \quad \text{kde } \alpha = 0.15</div>
+    Úspěšné spárování zvyšuje čítač <code>hits</code>. Svíčka je potvrzena při &ge; 2 hitech, stěna při &ge; 4 hitech.
+  </li>
+  <li><strong>Fialový koridor stěny (Safety Wall Corridor):</strong> Kolem každé potvrzené stěny o délce $L$ s jednotkovým směrovým vektorem $\mathbf{u}$ a normálou $\mathbf{n}$ je definována vylučovací zóna:
+    <div class="formula-box">d_{\perp} = |(C - W_1) \cdot \mathbf{n}| \le 55\text{ mm}, \quad -150\text{ mm} \le (C - W_1) \cdot \mathbf{u} \le L + 150\text{ mm}</div>
+    Pokud kandidát na svíčku leží v tomto obdélníku, jedná se o parazitní odraz od hrany desky a je okamžitě vyloučen.
+  </li>
+  <li><strong>Syntetická rekonstrukce stíněných svíček:</strong> Pokud LiDAR vidí samostatnou 30cm desku, ale svíčka za ní je z daného úhlu zakryta, model automaticky doplní hypotetickou svíčku 130 mm za středem desky podél vnitřní normály.</li>
+</ul>
+
+<div class="img-container">
+  <img src="Snímek obrazovky z 2026-10-16 22-02-16.png" style="max-height: 220px;" alt="Koridory stěn a svíčky">
+  <div class="img-caption">Obrázek 2: Detail detekčního jádra. Fialové obdélníky představují bezpečnostní koridory stěn (šířka 110 mm), zelené úsečky jsou stěny (199, 240, 200 mm), červené kroužky jsou svíčky a azurový terč znázorňuje primární zaměřený cíl (1. CÍL).</div>
+</div>
+
+<h2>5. Hierarchické Geometrické Kotvy a Relokalizace (RobotLocalizer)</h2>
+<p>
+Pro absolutní lokalizaci robota porovnáváme dvě stabilní mapy:
+</p>
+<ol>
+  <li><strong>Referenční etalon (<code>ref_model</code>):</strong> Zprůměrovaná mapa ze startovní pozice $[0, 0]$ při natočení $0^\circ$, uzamčená klávesou <code>[L]</code>.</li>
+  <li><strong>Aktuální mapa (<code>curr_model</code>):</strong> Průběžně budovaná stabilní mapa na novém stanovišti robota.</li>
+</ol>
+
+<p>
+Základním matematickým principem je euklidovská invariance: <strong>vzdálenost mezi dvěma pevnými body v aréně se pohybem robota nemění</strong>. Spočítá se matice vzájemných vzdáleností $D_{ij} = \|S_i - S_j\|$. Páry svíček se stejnou vzdáleností ($\Delta d < 45\text{ mm}$) tvoří prostorové <strong>kotvy</strong>:
+</p>
+<ul>
+  <li><strong>KOTVA 1 (PRIMÁRNÍ &ndash; Zlatá linie):</strong> Spojnice mezi dvěma svíčkami, kde obě mají &ge; 2 stěny (rohové L-boxy). Jedná se o mechanicky nejspolehlivější bázi v poli.</li>
+  <li><strong>ZÁLOŽNÍ KOTVY 2 až 6 (Oranžové linie):</strong> Spojnice zahrnující svíčky s 1 stěnou nebo volnou svíčku.</li>
+  <li><strong>Trojúhelníková shoda (Triangle Invariant Matching):</strong> Při zachycení 3 svíček se ověří shoda všech 3 stran, vnitřních úhlů i orientace vrcholů. Tím je vyloučena jakákoliv záměna symetrických bodů.</li>
+</ul>
+
+<div class="formula-box">
+  \theta_{ref} = \text{atan2}(R_{B.y} - R_{A.y}, R_{B.x} - R_{A.x}), \quad \theta_{curr} = \text{atan2}(C_{B.y} - C_{A.y}, C_{B.x} - C_{A.x}) \\
+  \Delta\theta = \theta_{curr} - \theta_{ref}, \quad \begin{pmatrix} X_R \\ Y_R \end{pmatrix} = M_{ref} - \begin{pmatrix} \cos\Delta\theta & -\sin\Delta\theta \\ \sin\Delta\theta & \cos\Delta\theta \end{pmatrix} M_{curr}
+</div>
+
+<p>
+Následná RANSAC verifikace transformuje všechny ostatní objekty a spočítá průměrnou residuální odchylku. Pokud je residuum $< 40\text{ mm}$, poloha je přijata se $100\%$ jistotou. Při zastavení robota aktivuje systém <strong>Deadband klidový zámek</strong> ($\Delta \le 8\text{ mm}, \Delta\theta \le 0.8^\circ$), který zcela eliminuje mikroskopický šum v klidovém stavu.
+</p>
+
+<div class="img-container">
+  <img src="Snímek obrazovky z 2026-10-18 11-44-57.png" style="max-height: 200px;" alt="Trojúhelníková shoda">
+  <div class="img-caption">Obrázek 3: Zámek plné trojúhelníkové shody (KOTVA 1 + KOTVA 2). Horní stavový proužek hlásí 12 inlierů, prostorovou chybu pouhých 17.1 mm a vzdálenost od startu 756 mm.</div>
+</div>
+
+<div class="page-break"></div>
+
+<h2>6. Globální Mapa Celého Hřiště (GlobalFieldMap)</h2>
+<p>
+Třída <code>GlobalFieldMap</code> integruje lokální měření do globálního souřadnicového systému:
+</p>
+<ul>
+  <li><strong>Adaptivní obdélník pole (2.4 m &times; 3.5 m):</strong> Robot startuje cca 200 mm od zadní zdi ($Y_{min} = -200\text{ mm}$). Šířka arény $W$ se automaticky vycentruje podle polohy svíček a trajektorie robota s exponenciálním vyhlazením ($\alpha = 0.15$).</li>
+  <li><strong>Volba startovní stěny:</strong> Klávesou <code>[2]</code>/<code>[ě]</code> se volí start u kratší zdi (2.4 m), klávesou <code>[3]</code>/<code>[š]</code> start u delší zdi (3.5 m).</li>
+  <li><strong>Automatické přepínání 180&deg; &rarr; 360&deg;:</strong> Na startu u zdi běží čistý 180&deg; dopředný kužel eliminující odrazy za polem. Po stisku <code>[L]</code> a vjezdu do arény se senzor automaticky přepne na 360&deg; plný kruh, takže robot neztratí kotvy ani při otočení zády k cíli.</li>
+</ul>
+
+<h2>7. Detailní Rozbor Hlavního Uživatelského Rozhraní</h2>
+<p>
+Následující snímek zachycuje systém v plném soutěžním nasazení verze 12:
+</p>
+
+<div class="img-container">
+  <img src="Snímek obrazovky z 2026-10-18 13-42-21.png" style="width: 100%;" alt="Hlavní obrazovka v12">
+  <div class="img-caption">Obrázek 4: Hlavní obrazovka vizualizéru Kybernoid 27 - LiDAR D200 Detector (verze v12). Obrazovka je rozdělena na 3 horní radarové panely a 3 spodní panely celkového hřiště.</div>
+</div>
+
+<h3>Podrobný popis jednotlivých sekcí a panelů z Obrázku 4:</h3>
+
+<h4>Panel 1 (Vlevo nahoře): ŽIVÝ RADAR (SENZOR)</h4>
+<p>
+Zobrazuje surový pohled přímo ze senzoru v reálném čase:
+</p>
+<ul>
+  <li><strong>Telemetrie vlevo nahoře:</strong>
+    <ul>
+      <li><code>Frekvence skenu: 6.7 Hz</code> &ndash; Reálná rychlost otáčení LiDARu.</li>
+      <li><code>Filtrované body: 184 bodů</code> &ndash; Počet bodů otáčky po aplikaci range a intensity filtrů.</li>
+      <li><code>Zorné pole (FoV): 360° [V POLI]</code> &ndash; Indikace plného kruhového rozhledu.</li>
+      <li><code>Výpočet ESP32: 22.76 ms</code> &ndash; Doba běhu geometrické detekce na mikrokontroléru.</li>
+      <li><code>Volná RAM ESP32: 290 kB</code> &ndash; Paměťová stabilita mikrokontroléru.</li>
+      <li><code>CRC8 Chyby: 1926</code> &ndash; Kontrola integrity sériové linky UART.</li>
+      <li><code>Nalezené stěny: 2</code> (zeleně) a <code>Nalezené svíčky: 3</code> (červeně) &ndash; Objekty nalezené firmwarem v aktuální otáčce.</li>
+    </ul>
+  </li>
+  <li><strong>Radarová plocha:</strong> Kótovací kružnice po 0.5 m (až do 3 m), zelené úsečky stěn (<code>STĚNA 300mm</code>, <code>345mm</code>), červené kroužky svíček (<code>SVÍČKA 717mm</code>, <code>539mm</code>, <code>1215mm</code>) a azurový zaměřovací kužel <code>ZÁMĚR +10° (1. CÍL)</code> na primární svíčku.</li>
+</ul>
+
+<h4>Panel 2 (Uprostřed nahoře): PŮVODNÍ STATICKÁ MAPA &ndash; ZAMČENA</h4>
+<p>
+Referenční etalon vytvořený na výchozím stanovišti START:
+</p>
+<ul>
+  <li><code>Referenční etalon: 4 svíček, 6 stěn | Pevná geometrie uložena</code> &ndash; Všech 4/4 svíček i 6 stěn bylo úspěšně uloženo do paměti.</li>
+  <li><strong>Kotevní linie:</strong> Zlatá <code>KOTVA 1 (PRIMÁRNÍ): 1876 mm</code> spojuje dvě rohové svíčky K1 a K2. Dále jsou vykresleny záložní kotvy (Kotva 4: 1013 mm, Kotva 5: 877 mm, Kotva 6: 1573 mm).</li>
+  <li><strong>Klasifikace svíček:</strong> <code>SVÍČKA #1 [BEZ STĚNY]</code> (volná svíčka), <code>SVÍČKA #2 [2 stěn] [K1]</code>, <code>SVÍČKA #3 [2 stěn] [K2]</code>, <code>SVÍČKA #4 [1 stěn]</code>. Modrý křížek označuje <code>START (0,0)</code>.</li>
+</ul>
+
+<h4>Panel 3 (Vpravo nahoře): SHODA [360&deg; V POLI]</h4>
+<p>
+Živý relokalizační engine porovnávající aktuální polohu s referenčním etalonem:
+</p>
+<ul>
+  <li><strong>Zelený stavový proužek:</strong> <code>Inliery: 13 | Chyba: 25.4 mm | Od startu: 847 mm (skenů: 802)</code> &ndash; 13 shodných bodů s referencí, prostorová chyba pouhých 2.5 cm při vzdálenosti 84.7 cm od startu.</li>
+  <li><strong>Poloha robota:</strong> Růžový terč s popisem <code>ROBOT [KLID]</code> &ndash; Robot stojí v klidu na souřadnicích s aktivním filtrem chvění. Modrý bod <code>START (0,0)</code> ukazuje vzdálenost od výchozího bodu.</li>
+  <li><strong>Aktivní kotva:</strong> Purpurová úsečka <code>KOTVA 3 (ZÁLOŽNÍ) (1050 mm)</code> určuje přesné natočení $+40.5^\circ$.</li>
+</ul>
+
+<div class="page-break"></div>
+
+<h4>Spodní levý oddíl: Grafický obdélník hřiště</h4>
+<p>
+Přesný model arény ($2400 \times 3500\text{ mm}$):
+</p>
+<ul>
+  <li>Zelené stěny hřiště a oranžové terčíky svíček <strong>S1, S2, S3, S4</strong>.</li>
+  <li>Zelená pravoúhlá souřadnicová síť po <strong>500 mm</strong>.</li>
+  <li>Purpurová trajektorie pohybu robota od modrého křížku START (0,0) a růžový bod robota s orientovanou šipkou natočení.</li>
+  <li>Indikátor konfigurace startovní zdi: <code>START. STĚNA: [3/š] 3.5 m DELŠÍ [AKTIVNÍ]</code>.</li>
+</ul>
+
+<h4>Spodní prostřední oddíl: Geometrická pravidla soutěže</h4>
+<p>
+Automatická verifikace soutěžních kritérií v reálném čase:
+</p>
+<ul>
+  <li><code>✓ POČET SVÍČEK: 4/4 (SPLNĚNO)</code></li>
+  <li><code>✓ HRANICE HŘIŠTĚ: 100% UVNITŘ (4/4 v poli, všechny uvnitř pole)</code></li>
+  <li><code>✓ MIN. ROZESTUP 800 mm: SPLNĚNO (min 866 mm)</code></li>
+  <li><code>✓ MAX 1 VOLNÁ SVÍČKA: SPLNĚNO (1 volná)</code></li>
+  <li><code>✓ STĚNY HŘIŠTĚ: 6/6 (bez kolizí a uvnitř pole)</code></li>
+</ul>
+<p><strong>Tabulka dosazených svíček v milimetrech:</strong></p>
+<table>
+  <tr><th>Označení</th><th>X [mm]</th><th>Y [mm]</th><th>Typ / Stěny</th><th>Počet hitů</th></tr>
+  <tr><td><strong>S1</strong></td><td>-779 mm</td><td>+370 mm</td><td>[U STĚNY: 2] (rohová vlevo dole)</td><td>859 hitů</td></tr>
+  <tr><td><strong>S2</strong></td><td>-718 mm</td><td>+1392 mm</td><td>[U STĚNY: 2] (rohová vlevo nahoře)</td><td>856 hitů</td></tr>
+  <tr><td><strong>S3</strong></td><td>+688 mm</td><td>+1302 mm</td><td>[U STĚNY: 1] (u stěny vpravo nahoře)</td><td>825 hitů</td></tr>
+  <tr><td><strong>S4</strong></td><td>+14 mm</td><td>+720 mm</td><td>[VOLNÁ SVÍČKA] (střed pole)</td><td>484 hitů</td></tr>
+</table>
+
+<h4>Spodní pravý oddíl: Celkový obraz hřiště &amp; Telemetrie</h4>
+<ul>
+  <li><code>🔒 MAPOVÁNÍ AKTIVNÍ (KOTVA 3 (ZÁLOŽNÍ))</code> &ndash; Relokalizace běží a poloha je fixována.</li>
+  <li><code>POKRYTÍ HŘIŠTĚ: 100%</code> &ndash; Grafický ukazatel kompletnosti prozkoumání arény (všechny 4 svíčky a 6 stěn = 100%).</li>
+  <li><strong>Přesná pozice robota od startu:</strong>
+    <ul>
+      <li><code>X: -398 mm</code> (posun 39.8 cm vlevo)</li>
+      <li><code>Y: +748 mm</code> (posun 74.8 cm dopředu)</li>
+      <li><code>Vzdálenost: 847 mm</code></li>
+      <li><code>Natočení: +40.5°</code>, <code>Jistota: 100%</code></li>
+    </ul>
+  </li>
+</ul>
+
+<h2>8. Klávesové Zkratky a Operátorský Postup</h2>
+<table>
+  <tr><th>Klávesa</th><th>Funkce</th><th>Detailní popis</th></tr>
+  <tr><td><strong><code>L</code></strong></td><td><strong>Zamknout / Odemknout etalon</strong></td><td>Uzamkne referenční mapu STARTu a automaticky aktivuje 360&deg; FoV v poli.</td></tr>
+  <tr><td><strong><code>2</code> / <code>ě</code></strong></td><td><strong>Start u KRATŠÍ stěny (2.4 m)</strong></td><td>Nastaví nominální rozměry arény na 2400 mm (šířka) &times; 3500 mm (hloubka).</td></tr>
+  <tr><td><strong><code>3</code> / <code>š</code></strong></td><td><strong>Start u DELŠÍ stěny (3.5 m)</strong></td><td>Nastaví nominální rozměry arény na 3500 mm (šířka) &times; 2400 mm (hloubka).</td></tr>
+  <tr><td><strong><code>P</code></strong></td><td><strong>Přepnout startovní stěnu</strong></td><td>Cyklicky přepíná mezi kratší a delší stěnou.</td></tr>
+  <tr><td><strong><code>N</code></strong></td><td><strong>Reset nové mapy</strong></td><td>Vymaže lokální mapu na aktuální pozici robota a provede nový čistý sběr.</td></tr>
+  <tr><td><strong><code>C</code></strong></td><td><strong>Kompletní reset (Clear)</strong></td><td>Vymaže veškeré mapy, trajektorii i etalon pro nový začátek měření.</td></tr>
+  <tr><td><strong><code>F</code></strong></td><td><strong>Přepínač FoV (180&deg; / 360&deg;)</strong></td><td>Manuální přepnutí zorného pole LiDARu.</td></tr>
+  <tr><td><strong><code>Mezerník</code></strong></td><td><strong>Freeze / Pauza</strong></td><td>Okamžité zmrazení příjmu dat pro klidnou vizuální inspekci.</td></tr>
+  <tr><td><strong><code>R</code> / <code>E</code></strong></td><td><strong>Minimální dosah</strong></td><td>Zvýšení / snížení mrtvé zóny senzoru (min range).</td></tr>
+  <tr><td><strong><code>T</code> / <code>G</code></strong></td><td><strong>Maximální dosah</strong></td><td>Zvýšení / snížení maximální ořezávací vzdálenosti (1800&ndash;3000 mm).</td></tr>
+  <tr><td><strong><code>I</code> / <code>K</code></strong></td><td><strong>Práh intenzity</strong></td><td>Nastavení citlivosti filtru odrazivosti (10&ndash;50).</td></tr>
+</table>
+
+<div class="callout callout-info">
+  <strong>Doporučený postup před startem:</strong> Postavte robota na start zády k mantinelu &rarr; Zvolte stěnu klávesou <code>[2]</code> nebo <code>[3]</code> &rarr; Počkejte 2 sekundy na ustálení referenčního etalonu &rarr; Stiskněte <code>[L]</code> (etalon se zamkne a senzor se přepne na 360&deg;) &rarr; Odstartujte jízdu robota.
+</div>
+
+<h2>9. Závěr</h2>
+<p>
+Systém verze <strong>v12</strong> poskytuje stoprocentně spolehlivou prostorovou orientaci robota v soutěžním poli. Kombinací hardwarové geometrické filtrace na ESP32 s invariantním kotevním párováním v Pythonu bylo dosaženo absolutní eliminace driftu odometrie s prostorovou chybou pod 25 mm a plnou automatickou kontrolou soutěžních pravidel.
+</p>
+
+</body>
+</html>

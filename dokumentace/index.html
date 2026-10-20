@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kybernoid 27 - Kompletní Průvodce LiDAR Detekcí a Relokalizací Robota</title>
+<style>
+  :root {
+    --bg-page: #f8fafc;
+    --bg-card: #ffffff;
+    --text-main: #1e293b;
+    --text-muted: #64748b;
+    --primary: #0284c7;
+    --primary-dark: #0369a1;
+    --primary-light: #e0f2fe;
+    --accent: #10b981;
+    --accent-light: #d1fae5;
+    --warning: #f59e0b;
+    --warning-light: #fef3c7;
+    --border: #e2e8f0;
+    --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--bg-page);
+    color: var(--text-main);
+    line-height: 1.65;
+    font-size: 16px;
+    padding: 0;
+  }
+
+  /* Hlavička stránky */
+  header.hero {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0369a1 100%);
+    color: #ffffff;
+    padding: 48px 24px;
+    text-align: center;
+    border-bottom: 4px solid var(--primary);
+  }
+
+  header.hero h1 {
+    font-size: 2.2rem;
+    font-weight: 800;
+    margin-bottom: 12px;
+    letter-spacing: -0.02em;
+  }
+
+  header.hero p.subtitle {
+    font-size: 1.15rem;
+    color: #94a3b8;
+    max-width: 800px;
+    margin: 0 auto 20px auto;
+  }
+
+  .badges {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  .badge {
+    background-color: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    padding: 6px 14px;
+    border-radius: 9999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+
+  /* Rozložení kontejneru */
+  .layout-wrapper {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 32px 20px;
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 36px;
+  }
+
+  @media (max-width: 900px) {
+    .layout-wrapper {
+      grid-template-columns: 1fr;
+    }
+    nav.toc {
+      display: none;
+    }
+  }
+
+  /* Postranní navigace (TOC) */
+  nav.toc {
+    position: sticky;
+    top: 24px;
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
+    background: var(--bg-card);
+    padding: 20px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+  }
+
+  nav.toc h3 {
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+    border-bottom: 2px solid var(--primary-light);
+    padding-bottom: 6px;
+  }
+
+  nav.toc ul {
+    list-style: none;
+  }
+
+  nav.toc li {
+    margin-bottom: 8px;
+    font-size: 0.88rem;
+  }
+
+  nav.toc a {
+    color: var(--text-main);
+    text-decoration: none;
+    transition: color 0.15s ease;
+    display: block;
+    padding: 3px 6px;
+    border-radius: 4px;
+  }
+
+  nav.toc a:hover {
+    color: var(--primary);
+    background-color: var(--primary-light);
+  }
+
+  /* Hlavní obsah */
+  main.content {
+    min-width: 0; /* Zabrání přetečení gridu */
+  }
+
+  section.doc-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    margin-bottom: 32px;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.03);
+  }
+
+  h2.section-title {
+    font-size: 1.55rem;
+    font-weight: 700;
+    color: #0f172a;
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  h3.subsection-title {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--primary-dark);
+    margin: 24px 0 12px 0;
+  }
+
+  h4.subsubsection-title {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #334155;
+    margin: 18px 0 8px 0;
+  }
+
+  p {
+    margin-bottom: 14px;
+    color: #334155;
+  }
+
+  ul, ol {
+    margin: 8px 0 16px 24px;
+    color: #334155;
+  }
+
+  li {
+    margin-bottom: 6px;
+  }
+
+  strong {
+    color: #0f172a;
+  }
+
+  /* Karty a Callouty */
+  .callout {
+    border-left: 4px solid var(--primary);
+    background-color: var(--primary-light);
+    padding: 16px 18px;
+    border-radius: 0 8px 8px 0;
+    margin: 20px 0;
+  }
+
+  .callout.success {
+    border-left-color: var(--accent);
+    background-color: var(--accent-light);
+  }
+
+  .callout.warning {
+    border-left-color: var(--warning);
+    background-color: var(--warning-light);
+  }
+
+  .callout-title {
+    font-weight: 700;
+    font-size: 0.95rem;
+    margin-bottom: 4px;
+    color: #0f172a;
+  }
+
+  /* Ilustrace a obrázky - ZÁKAZ DEFORMACE */
+  .figure-box {
+    margin: 28px 0;
+    background: #0f172a;
+    padding: 12px;
+    border-radius: 10px;
+    text-align: center;
+    border: 1px solid #334155;
+  }
+
+  .figure-box.light-bg {
+    background: #f1f5f9;
+    border-color: #cbd5e1;
+  }
+
+  .figure-box img {
+    max-width: 100%;
+    height: auto; /* NEZDEFORMOVAT! */
+    object-fit: contain;
+    border-radius: 6px;
+    display: block;
+    margin: 0 auto;
+  }
+
+  .figure-caption {
+    margin-top: 10px;
+    font-size: 0.88rem;
+    color: #94a3b8;
+    text-align: center;
+    font-style: italic;
+  }
+
+  .figure-box.light-bg .figure-caption {
+    color: #64748b;
+  }
+
+  /* Kód a vzorce */
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background-color: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #be185d;
+  }
+
+  pre {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    background-color: #0f172a;
+    color: #e2e8f0;
+    padding: 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin: 16px 0;
+    line-height: 1.45;
+  }
+
+  /* Tabulky */
+  table.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 20px 0;
+    font-size: 0.92rem;
+  }
+
+  table.data-table th, table.data-table td {
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    text-align: left;
+  }
+
+  table.data-table th {
+    background-color: #f1f5f9;
+    font-weight: 700;
+    color: #0f172a;
+  }
+
+  table.data-table tr:nth-child(even) {
+    background-color: #f8fafc;
+  }
+
+  /* Interaktivní detaily */
+  details {
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 14px 0;
+  }
+
+  details summary {
+    font-weight: 600;
+    cursor: pointer;
+    color: var(--primary-dark);
+  }
+
+  details[open] summary {
+    margin-bottom: 10px;
+    border-bottom: 1px dashed var(--border);
+    padding-bottom: 6px;
+  }
+
+  /* Zvýraznění panelů z obrázku */
+  .panel-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+    margin: 18px 0;
+    background: #fafafa;
+  }
+
+  .panel-card.radar { border-left: 6px solid #00e5ff; }
+  .panel-card.ref   { border-left: 6px solid #eab308; }
+  .panel-card.match { border-left: 6px solid #22c55e; }
+  .panel-card.field { border-left: 6px solid #16a34a; }
+  .panel-card.rules { border-left: 6px solid #f97316; }
+  .panel-card.tele  { border-left: 6px solid #ec4899; }
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+
+  .panel-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #0f172a;
+  }
+
+  .panel-badge {
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 3px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+
+  footer {
+    text-align: center;
+    padding: 36px 20px;
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    border-top: 1px solid var(--border);
+    margin-top: 40px;
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>Kybernoid 27 &ndash; Autonomní LiDAR Detekce a Relokalizace</h1>
+  <p class="subtitle">Podrobný průvodce a vysvětlení všech metod: od prvního odrazu laseru až po absolutní navigaci robota v soutěžním poli.</p>
+  <div class="badges">
+    <span class="badge">Stabilní verze: v12</span>
+    <span class="badge">Senzor: Waveshare D200 (ToF)</span>
+    <span class="badge">Mikrokontrolér: ESP32 (C++)</span>
+    <span class="badge">PC Vizualizér: Python 3 / Pygame</span>
+  </div>
+</header>
+
+<div class="layout-wrapper">
+
+  <!-- Postranní navigace -->
+  <nav class="toc">
+    <h3>Obsah dokumentu</h3>
+    <ul>
+      <li><a href="#sec-1">1. O čem je tento projekt</a></li>
+      <li><a href="#sec-2">2. Reálné hřiště a pravidla</a></li>
+      <li><a href="#sec-3">3. Cesta signálu z laseru do PC</a></li>
+      <li><a href="#sec-4">4. Jak hledáme svíčky</a></li>
+      <li><a href="#sec-5">5. Jak hledáme stěny</a></li>
+      <li><a href="#sec-6">6. Fialový koridor proti duchům</a></li>
+      <li><a href="#sec-7">7. Stabilní mapa a časový filtr</a></li>
+      <li><a href="#sec-8">8. Zázrak relokalizace (Kotvy)</a></li>
+      <li><a href="#sec-9">9. Zorné pole: 180° vs 360°</a></li>
+      <li><a href="#sec-10">10. Globální obdélník hřiště</a></li>
+      <li><a href="#sec-11">11. Pitva hlavní obrazovky (v12)</a></li>
+      <li><a href="#sec-12">12. Návod na soutěžní jízdu</a></li>
+      <li><a href="#sec-13">13. Slovníček pojmů</a></li>
+    </ul>
+  </nav>
+
+  <!-- Hlavní obsah -->
+  <main class="content">
+
+    <!-- SEKCE 1 -->
+    <section id="sec-1" class="doc-section">
+      <h2 class="section-title">1. O čem je tento projekt a co vlastně stavíme?</h2>
+      <p>
+        Představ si, že stavíš autonomního mobilního robota na soutěž <strong>Kybernoid 27 (hašení svíček)</strong> nebo <strong>RoboRAVE Fire Fighting</strong>. 
+        Úkol zní zdánlivě jednoduše: robot se postaví na start, odstartuje, musí sám najít <strong>4 hořící svíčky</strong> v aréně o velikosti <strong>2,4 m &times; 3,5 m</strong>, ke každé přijet a sfouknout ji (větrákem nebo stlačeným plynem).
+      </p>
+      
+      <div class="callout warning">
+        <div class="callout-title">Proč je to ve skutečnosti obrovská výzva?</div>
+        <p>
+          Hřiště je hladká černá deska. Kola robota na ní nevyhnutelně <strong>prokluzují</strong>. Kdybys polohu počítal jen z otáčení kol (odometrie), po dvou zatáčkách si robot myslí, že je o 30 cm jinde a otočený o 20 stupňů jinam. Během chvíle narazí do stěny a soutěž končí.
+        </p>
+      </div>
+
+      <p>
+        <strong>Naše řešení:</strong> Robot má na zádech rotující laserový radar &ndash; <strong>LiDAR</strong>. Ten se otáčí 7krát za sekundu a do všech stran měří vzdálenosti. 
+        Tato data neposíláme naslepo, ale vybudovali jsme dvoustupňový chytrý systém:
+      </p>
+      <ol>
+        <li><strong>Malý čip ESP32 přímo na robotu:</strong> Během zlomku vteřiny (2 až 20 milisekund) pročistí tisíce změřených bodů a najde v nich polohy svíček a bílých desek.</li>
+        <li><strong>Mozek v počítači / Pythonu:</strong> Vezme tyto nalezené objekty, porovná je s tím, co viděl na startu, a jako zkušený námořník podle majáků přesně spočítá: <em>„Jsem 39,8 cm vlevo, 74,8 cm vepředu a otočený o 40,5 stupně doprava.“</em></li>
+      </ol>
+    </section>
+
+    <!-- SEKCE 2 -->
+    <section id="sec-2" class="doc-section">
+      <h2 class="section-title">2. Reálné hřiště a pravidla: Co je v aréně doopravdy</h2>
+      <p>
+        Abychom pochopili kód, musíme nejprve vidět, jak to hřiště vypadá v reálu. Následující fotografie zachycuje skutečnou soutěžní desku:
+      </p>
+
+      <div class="figure-box light-bg">
+        <img src="Snímek obrazovky z 2026-10-10 20-22-53.png" alt="Reálná aréna soutěže">
+        <div class="figure-caption">Obrázek 1: Skutečné hřiště Kybernoid / RoboRAVE. Všimněte si tří různých situací: volná svíčka bez stěny (vpředu), svíčka za jednou stěnou (vlevo vzadu) a svíčka v trojitém U-boxu (vpravo).</div>
+      </div>
+
+      <h3 class="subsection-title">Pravidla, která musíme splnit:</h3>
+      <ul>
+        <li><strong>Svíčky:</strong> Jsou to černé válce o průměru cca <strong>5 cm</strong> na bílém kruhovém podstavci. Na celém hřišti jsou právě <strong>4 svíčky</strong>.</li>
+        <li><strong>Pravidlo volné svíčky:</strong> Právě <strong>jedna svíčka stojí zcela volně</strong> v otevřeném prostoru. Žádná stěna kolem ní není.</li>
+        <li><strong>Svíčky u stěn:</strong> Zbylé <strong>3 svíčky stojí u bílých desek</strong>. Desky mají délku přesně <strong>30 cm</strong>.
+          <ul>
+            <li>Někdy je to jen jedna samostatná deska stojící před svíčkou.</li>
+            <li>Někdy jsou to dvě desky spojené do pravého úhlu (roh tvaru L).</li>
+            <li>Někdy jsou to tři desky spojené do tvaru písmene U (tzv. U-box).</li>
+          </ul>
+        </li>
+        <li><strong>Rozestup mezi svíčkami:</strong> Žádné dvě svíčky nesmí být blíže než <strong>80 cm</strong> od sebe.</li>
+        <li><strong>Rozměry pole:</strong> Obdélník <strong>2,4 m &times; 3,5 m</strong> ohraničený bílými obvodovými mantinely.</li>
+      </ul>
+    </section>
+
+    <!-- SEKCE 3 -->
+    <section id="sec-3" class="doc-section">
+      <h2 class="section-title">3. Cesta signálu: Od laserového paprsku až na monitor</h2>
+      <p>Jak probíhá měření krok za krokem? Zde je celý datový řetězec:</p>
+
+      <pre>
+┌──────────────────┐     UART 230400 bd     ┌──────────────────────┐     USB 921600 bd     ┌────────────────────────┐
+│  Waveshare D200  │ ─────────────────────> │     ESP32 Čip        │ ────────────────────> │  Python Vizualizér     │
+│  (360° laser)    │   450 bodů / otáčka    │  (Detekce za 15 ms)  │   Kompaktní paket     │  (Relokalizace & Mapa) │
+└──────────────────┘                        └──────────────────────┘                       └────────────────────────┘
+      </pre>
+
+      <ol>
+        <li><strong>LiDAR vyšle laserový pulz:</strong> Používá technologii <em>Time-of-Flight (ToF)</em>. Stopkami změří čas, za jak dlouho se světlo odrazí od překážky zpátky. Z toho s přesností na milimetry ví vzdálenost a úhel.</li>
+        <li><strong>ESP32 zachytí bajty:</strong> V paměti má kruhový buffer o velikosti 2048 bajtů. Každý paket zkontroluje kontrolním součtem CRC8. Pokud by kabel zachytil rušení, poškozený bod se zahodí.</li>
+        <li><strong>Čisticí filtr (Range & Intenzita):</strong>
+          <ul>
+            <li>Body blíž než 13 cm (mrtvá zóna samotného senzoru) se zahodí.</li>
+            <li>Body dál než 2,4 metru se zahodí (nechceme měřit stěny tělocvičny).</li>
+            <li>Body se slabou odrazivostí (intenzita pod 15) se zahodí &ndash; to jsou jen nechtěné odlesky od lesklého černého stolu.</li>
+          </ul>
+        </li>
+        <li><strong>Extrakce geometrie:</strong> Z vyčištěných bodů algoritmus na ESP32 během 2 až 20 ms spočítá středy svíček a úsečky stěn.</li>
+        <li><strong>Odeslání do PC:</strong> Přes USB kabel letí rychlostí 921 600 baudů hotové výsledky (žádné zbytečné zatěžování počítače gigabajty surových dat).</li>
+      </ol>
+    </section>
+
+    <!-- SEKCE 4 -->
+    <section id="sec-4" class="doc-section">
+      <h2 class="section-title">4. Jak hledáme svíčky (Algoritmus shlukování)</h2>
+      <p>
+        Představ si, jak laser vidí svíčku. Svíčka je válec o průměru 5 cm. Laser se točí dokola a když narazí na svíčku, odrazí se od její zaoblené přední strany. 
+        Výsledkem je <strong>malý shluk bodů těsně vedle sebe</strong>.
+      </p>
+
+      <div class="callout">
+        <div class="callout-title">Princip metody (Krok za krokem):</div>
+        <ol>
+          <li>Procházíme body po kruhu za sebou.</li>
+          <li>Když je následující bod od předchozího vzdálen méně než <strong>5,5 cm</strong>, řekneme si: <em>„Patří k sobě!“</em> a přidáme ho do skupiny.</li>
+          <li>Jakmile je mezera větší, skupina končí a prověříme ji:
+            <ul>
+              <li><strong>Kolik má bodů?</strong> Musí mít alespoň 2 body a maximálně 24 bodů. (Kdyby měla 100 bodů, je to dlouhá zeď, ne svíčka!).</li>
+              <li><strong>Jak je velká?</strong> Změříme největší vzdálenost mezi krajními body ve skupině. Musí být mezi <strong>1,2 cm a 10 cm</strong>.</li>
+            </ul>
+          </li>
+          <li>Pokud podmínky sedí, spočítáme průměr souřadnic všech bodů &ndash; a máme přesný <strong>střed svíčky [X, Y]</strong>!</li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- SEKCE 5 -->
+    <section id="sec-5" class="doc-section">
+      <h2 class="section-title">5. Jak hledáme stěny (Chytré prokládání přímek)</h2>
+      <p>
+        Běžný program by zkoušel hledat přímky ve všech bodech najednou. To je pomalé a nespolehlivé. Náš algoritmus na to jde chytře &ndash; využívá fyziku hřiště:
+        <strong>Kde bývají stěny? Přece okolo svíček!</strong>
+      </p>
+
+      <h3 class="subsection-title">Metoda zkoušení přímky (RANSAC logika):</h3>
+      <ol>
+        <li>Vezmeme nalezenou svíčku. Okolo jejího středu si uděláme pomyslnou kružnici ve vzdálenosti <strong>6 až 42 cm</strong>.</li>
+        <li>Vezmeme všechny laserové body, které v tomto prstenci leží.</li>
+        <li>Vybereme dva body a <strong>proložíme jimi přímku</strong>.</li>
+        <li>Změříme kolmou vzdálenost všech ostatních bodů od této přímky. Ty body, které leží blíž než <strong>2,5 cm</strong> od čáry, prohlásíme za „souhlasící body“.</li>
+        <li>Ta přímka, která posbírá nejvíce souhlasících bodů s nejmenší odchylkou, se stává vítěznou kandidátkou na stěnu.</li>
+        <li>Zkontrolujeme její délku: deska v soutěži měří 30 cm, takže tolerujeme <strong>24 cm až 36 cm</strong>.</li>
+      </ol>
+
+      <div class="callout success">
+        <div class="callout-title">Geniální trik: Co když svíčka stíní střed stěny?</div>
+        <p>
+          Když se robot dívá na svíčku přímo proti stěně, tělo svíčky zakryje prostředek desky. Laser vidí kousek stěny vlevo a kousek vpravo. Hloupý algoritmus by řekl: <em>„Vidím dvě malé destičky 10 cm.“</em> Náš algoritmus ví, že oba konce leží na jedné přímce a svíčka je mezi nimi &ndash; <strong>obě křídla spojí do jedné plnohodnotné 30cm stěny!</strong>
+        </p>
+      </div>
+    </section>
+
+    <!-- SEKCE 6 -->
+    <section id="sec-6" class="doc-section">
+      <h2 class="section-title">6. Fialový koridor: Zbraň proti falešným duchům</h2>
+      <p>
+        Při práci s laserem nastává zrádný jev: když paprsek trefí ostrou hranu bílé desky, odrazí se tak podivně, že to v datech vypadá přesně jako malý válec. Algoritmus by si mohl myslet: <em>„Hurá, tady je svíčka!“</em> Jenže tam žádná není, je to jen hrana zdi.
+      </p>
+      <p>
+        Abychom tyto falešné odrazy zlikvidovali, zavedli jsme <strong>Fialový koridor stěny (Safety Wall Corridor)</strong>:
+      </p>
+
+      <div class="figure-box light-bg">
+        <img src="Snímek obrazovky z 2026-10-16 22-02-16.png" style="max-height: 340px;" alt="Fialové koridory a svíčky">
+        <div class="figure-caption">Obrázek 2: Pohled zblízka na fialové koridory stěn. Zelené čáry jsou stěny (199 mm, 240 mm, 200 mm), fialové obdélníky jsou zakázané zóny (šířka 11 cm). Červené kroužky jsou skutečné svíčky v bezpečné vzdálenosti.</div>
+      </div>
+
+      <div class="callout">
+        <div class="callout-title">Jak fialový koridor funguje?</div>
+        <p>
+          Kolem každé potvrzené zelené stěny nafoukneme ochranný obdélník o šířce <strong>11 cm</strong> (5,5 cm na každou stranu od osy zdi). 
+          Kdykoliv se uvnitř tohoto fialového obdélníku objeví jakákoliv podezřelá „svíčka“, okamžitě ji smažeme. Řekneme: <em>„Svíčka nemůže fyzicky růst uvnitř dřevěné desky!“</em> Díky tomu zůstanou jen stoprocentně pravé svíčky.
+        </p>
+      </div>
+    </section>
+
+    <!-- SEKCE 7 -->
+    <section id="sec-7" class="doc-section">
+      <h2 class="section-title">7. Stabilní mapa: Jak z roztřepaného měření udělat pevnou skálu</h2>
+      <p>
+        Laser měří 7krát za sekundu. Každé měření se o milimetr liší &ndash; plamínek svíčky se mihotá, robot vibruje. Kdybychom řídili robota podle surových kmitajících bodů, zbláznil by se.
+      </p>
+      <p>
+        Vytvořili jsme proto třídu <code>StableFieldModel</code>, která funguje jako filtr s pamětí:
+      </p>
+      <ul>
+        <li><strong>Exponenciální klouzavý průměr (EMA):</strong> Když v novém skenu najdeme svíčku, neskočíme na její novou pozici okamžitě. Započítáme ji z <strong>15 %</strong> a z <strong>85 %</strong> necháme starou pozici:
+          <br><code>nová_pozice = 0.85 * stará_pozice + 0.15 * naměřená_pozice</code>.
+          Bod se na obrazovce okamžitě uklidní a stojí pevně jako přibitý.
+        </li>
+        <li><strong>Počítadlo zásahů (Hits):</strong> Každému objektu počítáme, v kolika po sobě jdoucích otáčkách byl viděn. Náhodný odraz, který blikne jen jednou, je ignorován. Svíčce začneme věřit až po 2 hitech, stěně až po 4 hitech.</li>
+      </ul>
+    </section>
+
+    <!-- SEKCE 8 -->
+    <section id="sec-8" class="doc-section">
+      <h2 class="section-title">8. Zázrak relokalizace: Jak robot pozná, kde je a kam se otočil</h2>
+      <p>
+        Tohle je nejgeniálnější část celého systému. Jak robot pozná, kde přesně na hřišti stojí, když mu nemůže pomoci odometrie kol?
+      </p>
+      
+      <div class="callout success">
+        <div class="callout-title">Představ si to ze života:</div>
+        <p>
+          Stojíš v pokoji a vidíš skříň A a skříň B. Změříš si pásmem, že jsou od sebe přesně <strong>187 cm</strong>.
+          Pak tě někdo se zavázanýma očima odvede na jiné místo a otočí tě. 
+          Otevřeš oči. Vidíš spoustu věcí. Změříš vzdálenosti a najednou najdeš dva předměty, které jsou od sebe PŘESNĚ 187 cm!
+          V tu ránu víš: <em>„To jsou ty moje skříně A a B!“</em> 
+          A protože vidíš, pod jakým úhlem je teď vidíš, přesně spočítáš: <em>„Aha, otočili mě o 40 stupňů doprava a stojím 85 cm od místa, kde jsem začínal.“</em>
+        </p>
+      </div>
+
+      <p>Přesně takto funguje náš modul <code>RobotLocalizer</code>:</p>
+
+      <h3 class="subsection-title">Hierarchie kotev (Zlatá, Oranžová, Záložní):</h3>
+      <ul>
+        <li><strong>KOTVA 1 (PRIMÁRNÍ &ndash; Zlatá přímka):</strong> Spojnice mezi dvěma svíčkami, které obě stojí v rozích u dvou stěn. Rohy L jsou mechanicky nejpevnější body v celé hale. Tato kotva má absolutní přednost.</li>
+        <li><strong>KOTVA 2 a 3 (SEKUNDÁRNÍ / ZÁLOŽNÍ &ndash; Oranžová přímka):</strong> Spojnice mezi svíčkami s jednou stěnou. Použijí se, pokud robot při manévru ztratí výhled na jeden z rohů.</li>
+        <li><strong>PLNÝ TROJÚHELNÍK (Obrázek 3):</strong> Pokud robot vidí 3 svíčky najednou, vytvoří mezi nimi trojúhelník. Zkontroluje délky všech 3 stran i vnitřní úhly. Trojúhelník v prostoru nelze zaměnit s ničím jiným &ndash; dává 100% jistotu shody s chybou pod 2 cm!</li>
+      </ul>
+
+      <div class="figure-box light-bg">
+        <img src="Snímek obrazovky z 2026-10-18 11-44-57.png" style="max-height: 320px;" alt="Trojúhelníková shoda">
+        <div class="figure-caption">Obrázek 3: Zámek trojúhelníkové shody (KOTVA 1 + KOTVA 2). Zelený pruh nahoře hlásí 12 inlierů (shodných bodů), prostorovou chybu pouhých 17,1 mm a změřenou vzdálenost od startu 756 mm.</div>
+      </div>
+
+      <div class="callout">
+        <div class="callout-title">Klidový zámek (Deadband filter):</div>
+        <p>
+          Když robot dojede na místo a zastaví, motory stojí, ale laser stále kmitá o &plusmn;2 mm. Aby se poloha robota na displeji netřásla a řízení zbytečně nekorigovalo mikroskopické záchvěvy, zavedli jsme Deadband: pokud je posun menší než 8 mm a úhel menší než 0,8°, stav se zamkne na <code>ROBOT [KLID]</code>.
+        </p>
+      </div>
+    </section>
+
+    <!-- SEKCE 9 -->
+    <section id="sec-9" class="doc-section">
+      <h2 class="section-title">9. Zorné pole: Proč na startu vidíme 180° a v poli 360°?</h2>
+      <p>
+        Tohle byla jedna z nejdůležitějších oprav, kterou jsme v projektu vyřešili (verze v12):
+      </p>
+      <table class="data-table">
+        <tr>
+          <th>Kde se robot nachází</th>
+          <th>Nastavení zorného pole (FoV)</th>
+          <th>Proč to tak musí být?</th>
+        </tr>
+        <tr>
+          <td><strong>1. Na startovní čáře</strong></td>
+          <td><strong>180° dopředný kužel</strong><br>(dívá se jen dopředu)</td>
+          <td>
+            Robot stojí zády u zadního mantinelu. Za ním stojí rozhodčí, jsou tam kabely, stoly, židle. Kdyby měřil 360°, tyto cizí objekty by se uložily do referenční mapy a zničily by ji. Omezením na 180° dopředu získáme dokonale čistý etalon hřiště.
+          </td>
+        </tr>
+        <tr>
+          <td><strong>2. Po zamknutí klávesou [L] a vjezdu do pole</strong></td>
+          <td><strong>360° plný kruh</strong><br>(dívá se všude kolem sebe)</td>
+          <td>
+            Jakmile robot vyjede do arény, otáčí se do stran. Kdyby měl stále jen 180° dopředný pohled, při otočení o 90 stupňů by se díval do boční stěny, ztratil by z dohledu svíčky za sebou a byl by slepý. V poli proto automaticky přepínáme na 360°, aby viděl mantinely a svíčky před sebou i za sebou!
+          </td>
+        </tr>
+      </table>
+    </section>
+
+    <!-- SEKCE 10 -->
+    <section id="sec-10" class="doc-section">
+      <h2 class="section-title">10. Globální obdélník hřiště: Skládáme celou arénu dohromady</h2>
+      <p>
+        Zatímco horní radarové panely ukazují, co vidí robot ze své perspektivy, spodní panel <code>GlobalFieldMap</code> skládá <strong>celou arénu jako stavebnici dohromady</strong>.
+      </p>
+      <p>
+        Jak to funguje matematicky bez složitých vzorců?
+      </p>
+      <ol>
+        <li>Každou svíčku, kterou robot vidí na své pozici, přepočítáme podle jeho aktuálního otočení a posunu do absolutních souřadnic arény, kde bod <code>START (0,0)</code> leží uprostřed startovní čáry.</li>
+        <li><strong>Jak usadíme mantinely hřiště?</strong>
+          <ul>
+            <li>Víme, že robot startuje zhruba 20 cm od zadní stěny. Zadní stěnu tedy nakreslíme 20 cm za bod START ($Y = -200\text{ mm}$).</li>
+            <li>Přední stěna leží ve vzdálenosti 3,5 metru dopředu ($Y = +3300\text{ mm}$).</li>
+            <li>Boční stěny automaticky vycentrujeme tak, aby všechny nalezené svíčky ležely symetricky uvnitř arény.</li>
+          </ul>
+        </li>
+        <li><strong>Výběr stěny klávesami [2] a [3]:</strong>
+          <ul>
+            <li>Stisk <code>[2]</code> (nebo <code>[ě]</code>): Robot startuje u kratší zdi (šířka 2,4 m, hloubka 3,5 m).</li>
+            <li>Stisk <code>[3]</code> (nebo <code>[š]</code>): Robot startuje u delší zdi (šířka 3,5 m, hloubka 2,4 m).</li>
+          </ul>
+        </li>
+      </ol>
+    </section>
+
+    <!-- SEKCE 11 -->
+    <section id="sec-11" class="doc-section">
+      <h2 class="section-title">11. Kompletní pitva hlavní obrazovky (Snímek 2026-10-18 13-42-21)</h2>
+      <p>
+        Nyní si do nejmenších detailů rozebereme hlavní screenshot celého systému. Zde vidíte obrazovku přesně tak, jak běžela při testu verze v12:
+      </p>
+
+      <div class="figure-box">
+        <img src="Snímek obrazovky z 2026-10-18 13-42-21.png" alt="Hlavní obrazovka systému v12">
+        <div class="figure-caption">Obrázek 4: Hlavní řídicí obrazovka Kybernoid 27 - LiDAR D200 Detector ve stabilní verzi v12. Žádná deformace, plné rozlišení.</div>
+      </div>
+
+      <p>Pojďme si projít všech 6 panelů krok za krokem:</p>
+
+      <!-- Panel 1 -->
+      <div class="panel-card radar">
+        <div class="panel-header">
+          <div class="panel-title">1. Horní levý panel: ŽIVÝ RADAR (SENZOR)</div>
+          <span class="panel-badge" style="background:#e0f2fe; color:#0369a1;">Senzorová data</span>
+        </div>
+        <p><strong>Co panel ukazuje:</strong> Surová data přicházející přímo z rotujícího laseru v souřadném systému robota (střed radaru = poloha senzoru na střeše robota).</p>
+        <ul>
+          <li><code>Frekvence skenu: 6.7 Hz</code> &ndash; LiDAR se otočí 6,7krát za sekundu (cca každých 150 milisekund máme nový kompletní 360° sken).</li>
+          <li><code>Filtrované body: 184 bodů</code> &ndash; Tolik platných bodů zbylo z otáčky po odfiltrování lesků podlahy a vzdálených stěn.</li>
+          <li><code>Zorné pole (FoV): 360° [V POLI]</code> &ndash; Robot už je v poli, takže vidí všude kolem dokola.</li>
+          <li><code>Výpočet ESP32: 22.76 ms</code> &ndash; Mikrokontroléru trvalo pouhých 22 milisekund najít v mračnu bodů všechny svíčky a stěny.</li>
+          <li><code>Volná RAM ESP32: 290 kB</code> &ndash; Diagnostika paměti čipu; číslo se nehýbe, nedochází k žádnému přetékání paměti.</li>
+          <li><code>CRC8 Chyby: 1926</code> &ndash; Celkový počet zahozených vadných bajtů od startu (z celkových milionů bajtů je to zanedbatelné promile).</li>
+          <li><code>Nalezené stěny: 2 (zeleně)</code> a <code>Nalezené svíčky: 3 (červeně)</code> &ndash; Kolik objektů vidí senzor přímo v této jedné otáčce.</li>
+          <li><strong>Zelené úsečky:</strong> Reálné desky v poli (např. <code>STĚNA 300mm</code> a <code>345mm</code>).</li>
+          <li><strong>Červené kroužky s popisem:</strong> Detekované svíčky a jejich okamžitá vzdálenost od robota (<code>717mm</code>, <code>539mm</code>, <code>1215mm</code>).</li>
+          <li><strong>Azurový kužel záměru:</strong> <code>ZÁMĚR +10° (1. CÍL)</code> &ndash; Směr, kterým by měl robot natočit své foukací trysky, aby sfoukl nejbližší volnou svíčku.</li>
+        </ul>
+      </div>
+
+      <!-- Panel 2 -->
+      <div class="panel-card ref">
+        <div class="panel-header">
+          <div class="panel-title">2. Horní prostřední panel: PŮVODNÍ STATICKÁ MAPA – ZAMČENA</div>
+          <span class="panel-badge" style="background:#fef9c3; color:#854d0e;">Výchozí etalon</span>
+        </div>
+        <p><strong>Co panel ukazuje:</strong> Zmrazený referenční obrazec arény naskenovaný na startu před rozjezdem robota.</p>
+        <ul>
+          <li><code>Referenční etalon: 4 svíček, 6 stěn | Pevná geometrie uložena</code> &ndash; Potvrzení, že na startu se úspěšně načetly všechny 4 svíčky a všech 6 desek.</li>
+          <li><strong>Zlatá čára KOTVA 1 (PRIMÁRNÍ): 1876 mm:</strong> Pevná geometrická spojnice mezi rohovými svíčkami K1 a K2. Její délka je přesně 187,6 cm a poslouží jako neotřesitelná reference pro orientaci v prostoru.</li>
+          <li><strong>Tenké žluté čáry kotev 4, 5 a 6:</strong> Záložní spojnice mezi ostatními svíčkami (1013 mm, 877 mm, 1573 mm).</li>
+          <li><strong>Typy svíček:</strong>
+            <ul>
+              <li><code>SVÍČKA #1 [BEZ STĚNY]</code> &ndash; Jediná volná svíčka v aréně. Azurová šipka ukazuje: <code>--> 1. CÍL (706mm, -0.8°)</code>.</li>
+              <li><code>SVÍČKA #2 [2 stěn] [K1]</code> &ndash; Svíčka v rohu chráněná dvěma stěnami.</li>
+              <li><code>SVÍČKA #3 [2 stěn] [K2]</code> &ndash; Druhá rohová svíčka chráněná dvěma stěnami.</li>
+              <li><code>SVÍČKA #4 [1 stěn]</code> &ndash; Svíčka chráněná jednou rovnou stěnou.</li>
+            </ul>
+          </li>
+          <li><strong>Modrý terčík START (0,0):</strong> Přesné místo na startovní čáře, odkud robot vyjel.</li>
+        </ul>
+      </div>
+
+      <!-- Panel 3 -->
+      <div class="panel-card match">
+        <div class="panel-header">
+          <div class="panel-title">3. Horní pravý panel: SHODA [360° V POLI] (Relokalizace)</div>
+          <span class="panel-badge" style="background:#dcfce7; color:#166534;">Živá poloha robota</span>
+        </div>
+        <p><strong>Co panel ukazuje:</strong> Zázrak párování &ndash; aktuální sken z nové pozice je napasován na referenční etalon ze startu.</p>
+        <ul>
+          <li><strong>Zelený horní proužek shody:</strong>
+            <ul>
+              <li><code>Inliery: 13</code> &ndash; Celkem 13 geometrických prvků (středy svíček a konce stěn) z aktuálního pohledu přesně sedí na referenční etalon!</li>
+              <li><code>Chyba: 25.4 mm</code> &ndash; Průměrná odchylka napasování je pouhých 2,5 centimetru! Na vzdálenost skoro 1 metru od startu je to fantastický výsledek.</li>
+              <li><code>Od startu: 847 mm</code> &ndash; Robot ujel ze startovní čáry přesně 84,7 cm.</li>
+              <li><code>(skenů: 802)</code> &ndash; Tolik otáček LiDARu systém bez jediné chyby zprocesoval.</li>
+            </ul>
+          </li>
+          <li><strong>Růžový terčík ROBOT [KLID]:</strong> Zde se robot právě nachází v aréně. Nápis <code>[KLID]</code> znamená, že sepnul Deadband filtr &ndash; robot fyzicky stojí, takže souřadnice jsou zamčené a netřesou se.</li>
+          <li><strong>Purpurová přímka KOTVA 3 (ZÁLOŽNÍ) (1050 mm):</strong> Právě tato kotva byla použita k dopočtení přesného natočení robota (+40,5° doprava).</li>
+        </ul>
+      </div>
+
+      <!-- Panel 4 -->
+      <div class="panel-card field">
+        <div class="panel-header">
+          <div class="panel-title">4. Spodní levý panel: GRAFICKÝ OBDÉLNÍK HŘIŠTĚ</div>
+          <span class="panel-badge" style="background:#dcfce7; color:#15803d;">Půdorys arény</span>
+        </div>
+        <p><strong>Co panel ukazuje:</strong> Globální mapu celé arény v měřítku s pohledem shora.</p>
+        <ul>
+          <li><strong>Zelená plocha hřiště:</strong> Obdélník o rozměrech 2400 mm &times; 3500 mm.</li>
+          <li><strong>Čtvercová síť po 500 mm:</strong> Zelené mřížkové čáry jsou od sebe přesně 50 cm. Operátor pouhým okem okamžitě vidí souřadnice v decimetrech.</li>
+          <li><strong>Oranžové terčíky S1 až S4:</strong> Přesné polohy všech 4 potvrzených svíček na hřišti.</li>
+          <li><strong>Zelené čáry uvnitř:</strong> Všech 6 stěn v aréně.</li>
+          <li><strong>Purpurová křivka (trajektorie):</strong> Trasa, kudy robot fyzicky projel od modrého křížku <code>START (0,0)</code> až na své nynější místo.</li>
+          <li><strong>Růžová šipka robota:</strong> Zobrazuje polohu robota a šipka ukazuje jeho natočení do úhlu +40,5°.</li>
+          <li><strong>Spodní štítek:</strong> <code>[3/š] 3.5 m DELŠÍ [AKTIVNÍ]</code> &ndash; Zelené podsvícení jasně oznamuje, že aréna je přepnutá pro start u delší zdi 3,5 metru.</li>
+        </ul>
+      </div>
+
+      <!-- Panel 5 -->
+      <div class="panel-card rules">
+        <div class="panel-header">
+          <div class="panel-title">5. Spodní prostřední panel: PRAVIDLA SOUTĚŽE A TABULKA SVÍČEK</div>
+          <span class="panel-badge" style="background:#ffedd5; color:#9a3412;">Kontrola pravidel</span>
+        </div>
+        <p><strong>Co panel ukazuje:</strong> Automatický rozhodčí, který v reálném čase hlídá shodu s pravidly soutěže.</p>
+        <ul>
+          <li><code>✓ POČET SVÍČEK: 4/4 (SPLNĚNO)</code> &ndash; Všechny 4 svíčky byly objeveny.</li>
+          <li><code>✓ HRANICE HŘIŠTĚ: 100% UVNITŘ</code> &ndash; Všech 4/4 svíček leží bezpečně uvnitř pole. Žádný parazitní bod neleží mimo mantinel.</li>
+          <li><code>✓ MIN. ROZESTUP 800 mm: SPLNĚNO (min 866 mm)</code> &ndash; Nejkratší změřená vzdálenost mezi dvěma sousedními svíčkami je 86,6 cm. Pravidlo min. 80 cm je s přehledem splněno!</li>
+          <li><code>✓ MAX 1 VOLNÁ SVÍČKA: SPLNĚNO (1 volná)</code> &ndash; V poli je přesně jedna svíčka bez stěny.</li>
+          <li><code>✓ STĚNY HŘIŠTĚ: 6/6 (bez kolizí a uvnitř pole)</code> &ndash; Všech 6 stěn je potvrzeno a žádné dvě se nekříží.</li>
+        </ul>
+        <p><strong>Absolutní tabulka souřadnic svíček (v milimetrech od STARTu):</strong></p>
+        <ul>
+          <li><code>S1: X=-779 mm, Y=+370 mm  [U STĚNY: 2] (hitů: 859)</code> &ndash; Rohová svíčka vlevo dole.</li>
+          <li><code>S2: X=-718 mm, Y=+1392 mm [U STĚNY: 2] (hitů: 856)</code> &ndash; Rohová svíčka vlevo nahoře.</li>
+          <li><code>S3: X=+688 mm, Y=+1302 mm [U STĚNY: 1] (hitů: 825)</code> &ndash; Svíčka za rovnou stěnou vpravo nahoře.</li>
+          <li><code>S4: X=+14 mm,  Y=+720 mm  [VOLNÁ SVÍČKA] (hitů: 484)</code> &ndash; Volná svíčka uprostřed pole.</li>
+        </ul>
+        <p><em>Všimněte si počtu hitů: přes 800 potvrzení! Tyto svíčky tam opravdu fyzicky stojí, není to žádný náhodný šum.</em></p>
+      </div>
+
+      <!-- Panel 6 -->
+      <div class="panel-card tele">
+        <div class="panel-header">
+          <div class="panel-title">6. Spodní pravý panel: CELKOVÝ OBRAZ HŘIŠTĚ A OVLÁDÁNÍ</div>
+          <span class="panel-badge" style="background:#fce7f3; color:#9d174d;">Stav a telemetrie</span>
+        </div>
+        <p><strong>Co panel ukazuje:</strong> Finální souhrn stavu mise a nápovědu pro operátora.</p>
+        <ul>
+          <li><code>🔒 MAPOVÁNÍ AKTIVNÍ (KOTVA 3 (ZÁLOŽNÍ))</code> &ndash; Lokalizace robota běží na 100 %.</li>
+          <li><code>POKRYTÍ HŘIŠTĚ: 100% [████████████████████]</code> &ndash; Zelený proužek kompletnosti: pole máme prozkoumané celé.</li>
+          <li><strong>Přesná poloha robota od startu:</strong>
+            <ul>
+              <li><code>X: -398 mm</code> &ndash; Robot je 39,8 cm vlevo od své startovní podélné osy.</li>
+              <li><code>Y: +748 mm</code> &ndash; Robot ujel 74,8 cm dopředu od zadního mantinelu.</li>
+              <li><code>Vzdálenost: 847 mm</code> &ndash; Přímá euklidovská vzdálenost od startu.</li>
+              <li><code>Natočení: +40.5°</code> &ndash; Robot je pootočen o 40,5 stupně doprava.</li>
+              <li><code>Jistota: 100%</code> &ndash; Shoda s referenčním etalonem je absolutní.</li>
+            </ul>
+          </li>
+          <li><strong>Klávesová nápověda:</strong> Přehled zkratek pro rychlou volbu stěny a uzamčení etalonu.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- SEKCE 12 -->
+    <section id="sec-12" class="doc-section">
+      <h2 class="section-title">12. Návod na soutěžní jízdu krok za krokem</h2>
+      <p>Když přijedeš na soutěž, postupuj přesně podle těchto kroků:</p>
+
+      <div class="callout success">
+        <div class="callout-title">Soutěžní kuchařka (Checklist):</div>
+        <ol>
+          <li><strong>Zapojit USB kabel</strong> mezi ESP32 a notebookem. Spustit vizualizér v terminálu:
+            <br><code>python3 lidar_viz.py /dev/ttyUSB0</code>
+          </li>
+          <li><strong>Postavit robota na start</strong> zády k mantinelu (cca 15&ndash;20 cm od zdi).</li>
+          <li><strong>Zvolit startovní stěnu:</strong>
+            <ul>
+              <li>Pokud začínáte u <strong>kratší zdi (2,4 m)</strong>, stiskni klávesu <strong><code>2</code></strong> (nebo <code>ě</code>).</li>
+              <li>Pokud začínáte u <strong>delší zdi (3,5 m)</strong>, stiskni klávesu <strong><code>3</code></strong> (nebo <code>š</code>).</li>
+            </ul>
+          </li>
+          <li><strong>Počkat 2 vteřiny v klidu:</strong> Sleduj Panel 2 (PŮVODNÍ STATICKÁ MAPA). Svíčky dosáhnou hitů a rozsvítí se žluté kotevní čáry.</li>
+          <li><strong>Stisknout klávesu <code>[L]</code> (Zamknout etalon):</strong>
+            <ul>
+              <li>Na Panelu 2 se rozsvítí nápis <code>ZAMČENA</code>.</li>
+              <li>LiDAR se automaticky přepne na <strong>360° plný rozhled</strong>.</li>
+              <li>Na Panelu 3 naskočí zelený proužek a aktivuje se sledování polohy.</li>
+            </ul>
+          </li>
+          <li><strong>Spustit motory robota!</strong> Robot vyjede do arény, na mapě se kreslí růžová trajektorie a robot přesně ví, kde je a ke které svíčce má jet.</li>
+        </ol>
+      </div>
+
+      <h3 class="subsection-title">Rychlý tahák všech klávesových zkratek:</h3>
+      <table class="data-table">
+        <tr><th>Klávesa</th><th>Co to udělá</th><th>Kdy to použít</th></tr>
+        <tr><td><strong><code>L</code></strong></td><td>Zamkne / odemkne referenční etalon</td><td>Před startem na čáře (aktivuje 360° rozhled v poli).</td></tr>
+        <tr><td><strong><code>2</code> / <code>ě</code></strong></td><td>Start u KRATŠÍ zdi (2.4 m)</td><td>Při losu kratší stěny (arénu postaví na výšku).</td></tr>
+        <tr><td><strong><code>3</code> / <code>š</code></strong></td><td>Start u DELŠÍ zdi (3.5 m)</td><td>Při losu delší stěny (arénu položí na šířku).</td></tr>
+        <tr><td><strong><code>P</code></strong></td><td>Přepnout stěnu</td><td>Cyklicky prohodí 2.4 m &harr; 3.5 m.</td></tr>
+        <tr><td><strong><code>N</code></strong></td><td>Reset nové mapy</td><td>Když robot prudce trhne a chceš vynutit nový sběr na pozici.</td></tr>
+        <tr><td><strong><code>C</code></strong></td><td>Kompletní smazání (Clear)</td><td>Při zahájení nového pokusu od nuly.</td></tr>
+        <tr><td><strong><code>F</code></strong></td><td>Ruční přepínač 180° / 360°</td><td>Pro testování zorného pole LiDARu.</td></tr>
+        <tr><td><strong><code>Mezerník</code></strong></td><td>Freeze (Zmrazit obraz)</td><td>Když si chceš v klidu prohlédnout čísla na obrazovce.</td></tr>
+      </table>
+    </section>
+
+    <!-- SEKCE 13 -->
+    <section id="sec-13" class="doc-section">
+      <h2 class="section-title">13. Slovníček pojmů pro každého, kdo to čte za půl roku</h2>
+      <dl style="display: grid; grid-template-columns: 200px 1fr; gap: 12px 18px; font-size: 0.95rem;">
+        <dt><strong>ToF (Time-of-Flight)</strong></dt>
+        <dd>Měření vzdálenosti pomocí stopek: senzor vyšle světelný záblesk a změří čas v pikosekundách, za jak dlouho se odraz vrátí.</dd>
+
+        <dt><strong>LiDAR</strong></dt>
+        <dd>Rotující laserový dálkoměr. Měří vzdálenost ve všech úhlech 360 stupňů kolem dokola.</dd>
+
+        <dt><strong>EMA (Exponenciální průměr)</strong></dt>
+        <dd>Metoda zklidnění šumu: nová hodnota se započítá jen z malé části (15 %), zbytek drží stará hodnota. Bod se netřese.</dd>
+
+        <dt><strong>Kotva (Anchor)</strong></dt>
+        <dd>Pevná spojnice mezi dvěma známými svíčkami v poli. Její délka se nikdy nemění a slouží jako neotřesitelný maják pro výpočet otočení a pozice robota.</dd>
+
+        <dt><strong>Inlier</strong></dt>
+        <dd>„Souhlasící bod“. Objekt z nového pohledu, který po posunu a otočení robota přesně sedí na původní mapu ze startu.</dd>
+
+        <dt><strong>Deadband filter</strong></dt>
+        <dd>Pásmo necitlivosti. Pokud robot fyzicky stojí na místě a neprovádí manévr, zamkne polohu na <code>[KLID]</code> a neposílá do řízení chvění.</dd>
+
+        <dt><strong>Fialový koridor</strong></dt>
+        <dd>Bezpečnostní obdélník 11 cm kolem každé stěny, který maže falešné body z hran desek.</dd>
+
+        <dt><strong>FoV (Field of View)</strong></dt>
+        <dd>Zorné pole senzoru ve stupních (180 stupňů = dopředný půlkruh, 360 stupňů = plný kruh).</dd>
+      </dl>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <p><strong>Kybernoid 27 / RoboRAVE Fire Fighting &ndash; Dokumentace systému LiDAR v12</strong></p>
+  <p>Vygenerováno jako interaktivní HTML dokumentace s plným zachováním poměru stran fotografií a detailním popisem algoritmů.</p>
+</footer>
+
+</body>
+</html>
