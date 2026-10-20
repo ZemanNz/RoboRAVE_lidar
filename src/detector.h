@@ -1489,7 +1489,7 @@ public:
         };
 
         // Vyhodnotíme geometrii stěn pro zónu vyloučení
-        float wallExclusionDist = 32.0f; // 32 mm ochranný koridor kolem stěn
+        float wallExclusionDist = 26.0f; // 26 mm ochranný koridor (spolehlivě odfiltruje stěnu, ale nepohltí svíčku)
         int nonWallPts[120];
         int nonWallCount = 0;
 
@@ -1580,19 +1580,19 @@ public:
             }
 
             // Svíčka je největší kompaktní shluk v nonWallPts
-            int bestCandCluster[20];
+            int bestCandCluster[30];
             int bestCandCount = 0;
             float bestCandX = 0.0f, bestCandY = 0.0f;
 
             for (int i = 0; i < nonWallCount; i++) {
                 int p1 = nonWallPts[i];
                 float px = points[p1].x, py = points[p1].y;
-                int tempClust[20];
+                int tempClust[30];
                 int cCount = 0;
                 float cSumX = 0.0f, cSumY = 0.0f;
-                for (int j = 0; j < nonWallCount && cCount < 20; j++) {
+                for (int j = 0; j < nonWallCount && cCount < 30; j++) {
                     int p2 = nonWallPts[j];
-                    if (hypotf(points[p2].x - px, points[p2].y - py) <= 45.0f) {
+                    if (hypotf(points[p2].x - px, points[p2].y - py) <= 50.0f) {
                         tempClust[cCount++] = p2;
                         cSumX += points[p2].x;
                         cSumY += points[p2].y;
@@ -1606,9 +1606,20 @@ public:
                 }
             }
 
-            if (bestCandCount >= 2) {
+            bool realClusterFound = (bestCandCount >= 2);
+
+            if (realClusterFound) {
                 target.candle_x = bestCandX;
                 target.candle_y = bestCandY;
+
+                // Jemná pojistka: Pokud střed svíčky leží blíž než 32 mm od stěny (poloměr svíčky je 25 mm),
+                // pouze ji odtlačíme od stěny do otevřeného prostoru rohu, ale nemažeme její reálnou pozici!
+                float d_w1 = distToSegment(target.candle_x, target.candle_y, target.walls[0].x1, target.walls[0].y1, target.walls[0].x2, target.walls[0].y2);
+                float d_w2 = distToSegment(target.candle_x, target.candle_y, target.walls[1].x1, target.walls[1].y1, target.walls[1].x2, target.walls[1].y2);
+                if (d_w1 < 32.0f || d_w2 < 32.0f) {
+                    target.candle_x += u_open_x * 20.0f;
+                    target.candle_y += u_open_y * 20.0f;
+                }
             } else if (nonWallCount > 0) {
                 float nSumX = 0.0f, nSumY = 0.0f;
                 for (int i = 0; i < nonWallCount; i++) {
@@ -1618,20 +1629,9 @@ public:
                 target.candle_x = nSumX / (float)nonWallCount;
                 target.candle_y = nSumY / (float)nonWallCount;
             } else {
-                // Fallback: syntéza svíčky uvnitř rohu podél bisektoru
-                target.candle_x = Vx + u_open_x * 80.0f;
-                target.candle_y = Vy + u_open_y * 80.0f;
-            }
-
-            // Fyzikální pojistka: Svíčka se NIKDY nesmí dotýkat ani sedět na stěnách rohu!
-            float c_dist1 = distToSegment(target.candle_x, target.candle_y, target.walls[0].x1, target.walls[0].y1, target.walls[0].x2, target.walls[0].y2);
-            float c_dist2 = distToSegment(target.candle_x, target.candle_y, target.walls[1].x1, target.walls[1].y1, target.walls[1].x2, target.walls[1].y2);
-            float c_distV = hypotf(target.candle_x - Vx, target.candle_y - Vy);
-
-            // Pokud svíčka zasahuje do stěny nebo je moc blízko stěn, usadíme ji podél bisektoru na nominální pozici 80 mm
-            if (c_dist1 < 48.0f || c_dist2 < 48.0f || c_distV < 55.0f || c_distV > 130.0f) {
-                target.candle_x = Vx + u_open_x * 80.0f;
-                target.candle_y = Vy + u_open_y * 80.0f;
+                // Fallback nastane POUZE tehdy, pokud v boxu není vůbec žádný bod svíčky (např. úplný zástin)
+                target.candle_x = Vx + u_open_x * 85.0f;
+                target.candle_y = Vy + u_open_y * 85.0f;
             }
 
             target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
@@ -1661,6 +1661,7 @@ public:
         target.walls[0].point_count = bestW1Count;
 
         // Vyloučíme body v koridoru stěny 1
+        nonWallCount = 0;
         for (int i = 0; i < boxPtCount; i++) {
             int idx = boxIndices[i];
             float px = points[idx].x;
@@ -1672,19 +1673,19 @@ public:
         }
 
         // Svíčka je největší kompaktní shluk v nonWallPts
-        int bestCandCluster[20];
+        int bestCandCluster[30];
         int bestCandCount = 0;
         float bestCandX = 0.0f, bestCandY = 0.0f;
 
         for (int i = 0; i < nonWallCount; i++) {
             int p1 = nonWallPts[i];
             float px = points[p1].x, py = points[p1].y;
-            int tempClust[20];
+            int tempClust[30];
             int cCount = 0;
             float cSumX = 0.0f, cSumY = 0.0f;
-            for (int j = 0; j < nonWallCount && cCount < 20; j++) {
+            for (int j = 0; j < nonWallCount && cCount < 30; j++) {
                 int p2 = nonWallPts[j];
-                if (hypotf(points[p2].x - px, points[p2].y - py) <= 45.0f) {
+                if (hypotf(points[p2].x - px, points[p2].y - py) <= 50.0f) {
                     tempClust[cCount++] = p2;
                     cSumX += points[p2].x;
                     cSumY += points[p2].y;
@@ -1742,8 +1743,14 @@ public:
             norm_x = nx; norm_y = ny;
         }
 
-        // Fyzikální pojistka: Svíčka musí ležet minimálně 65 mm od stěny (jinak leží přímo na ní!)
-        if (perp_dist < 65.0f || perp_dist > 130.0f) {
+        if (bestCandCount >= 2) {
+            // Skutečná svíčka naměřena: zajistíme jen aby nestála přímo ve stěně (střed min 32 mm od stěny)
+            if (perp_dist < 32.0f) {
+                target.candle_x = p_proj_x + norm_x * 35.0f;
+                target.candle_y = p_proj_y + norm_y * 35.0f;
+            }
+        } else if (nonWallCount == 0) {
+            // Pouze při úplném zástinu použijeme geometrický odhad 75 mm od stěny
             target.candle_x = p_proj_x + norm_x * 75.0f;
             target.candle_y = p_proj_y + norm_y * 75.0f;
         }
@@ -1765,7 +1772,11 @@ public:
 
 struct TrackedTarget {
     TargetDetail target;
-    int type_votes[3]; // [0]=SOLO, [1]=WALL, [2]=CORNER
+    TargetDetail best_target;       // Nejlepší detailní geometrie zaznamenaná zblízka
+    float best_dist_mm;             // Nejkratší naměřená vzdálenost od senzoru k cíli
+    int close_hits;                 // Počet potvrzení zblízka (< 950 mm)
+    bool has_close_lock;            // Zda je aktivní zámek vysoké jistoty zblízka
+    int type_votes[3];              // [0]=SOLO, [1]=WALL, [2]=CORNER
     int hits;
     int missed;
     int solo_streak;
@@ -1796,6 +1807,9 @@ public:
             _trackedTargets[i].hits = 0;
             _trackedTargets[i].missed = 0;
             _trackedTargets[i].solo_streak = 0;
+            _trackedTargets[i].best_dist_mm = 99999.0f;
+            _trackedTargets[i].close_hits = 0;
+            _trackedTargets[i].has_close_lock = false;
         }
     }
 
@@ -1908,6 +1922,19 @@ public:
                 tt.missed = 0;
                 matchedTracked[bestIdx] = true;
 
+                float d_sensor = hypotf(liveT.candle_x, liveT.candle_y);
+                if (d_sensor < tt.best_dist_mm) {
+                    tt.best_dist_mm = d_sensor;
+                }
+
+                // Pokud jsme k cíli blízko (< 950 mm), měření má nejvyšší spolehlivost
+                if (d_sensor < 950.0f) {
+                    tt.close_hits++;
+                    if ((liveT.type == TARGET_CORNER || liveT.type == TARGET_WALL) && tt.close_hits >= 3) {
+                        tt.has_close_lock = true;
+                    }
+                }
+
                 if (liveT.type == TARGET_SOLO) {
                     tt.solo_streak++;
                 } else {
@@ -1928,19 +1955,26 @@ public:
                 int vWall = tt.type_votes[TARGET_WALL];
                 int vCorner = tt.type_votes[TARGET_CORNER];
 
-                if (tt.hits <= 2) {
-                    tt.target.type = liveT.type;
-                } else if (vCorner >= 4 && vCorner >= vWall && vCorner >= vSolo) {
-                    tt.target.type = TARGET_CORNER;
-                } else if (vWall >= 4 && vWall >= vSolo) {
-                    tt.target.type = TARGET_WALL;
-                } else if (vSolo >= vWall + 2 && vSolo >= vCorner + 2) {
-                    tt.target.type = TARGET_SOLO;
-                }
+                // PRAVIDLO "ZBLÍZKA VÍME NEJLÍP":
+                // Pokud už byl cíl zblízka důkladně prozkoumán a potvrzen jako STĚNA nebo ROH,
+                // vzdálené měření z dálky (> 1050 mm) ho NIKDY nesmí ponížit na sólo svíčku!
+                if (tt.has_close_lock && d_sensor > 1050.0f) {
+                    tt.target.type = tt.best_target.type;
+                    tt.solo_streak = 0;
+                } else {
+                    if (tt.hits <= 2) {
+                        tt.target.type = liveT.type;
+                    } else if (vCorner >= 4 && vCorner >= vWall && vCorner >= vSolo) {
+                        tt.target.type = TARGET_CORNER;
+                    } else if (vWall >= 4 && vWall >= vSolo) {
+                        tt.target.type = TARGET_WALL;
+                    } else if (vSolo >= vWall + 2 && vSolo >= vCorner + 2) {
+                        tt.target.type = TARGET_SOLO;
+                    }
 
-                // Pokud je stabilizovaný box malý (< 160 mm) nebo je označen jako SOLO, cíl NESMÍ mít stěny
-                if (stabBox.span_mm < 160.0f || stabBox.is_solo_candle) {
-                    tt.target.type = TARGET_SOLO;
+                    if (stabBox.span_mm < 160.0f || stabBox.is_solo_candle) {
+                        tt.target.type = TARGET_SOLO;
+                    }
                 }
 
                 const float alpha = 0.15f;
@@ -2032,6 +2066,11 @@ public:
                         tt.target.walls[w_idx].y2 = (1.0f - alpha) * e1y + alpha * e2y;
                         tt.target.walls[w_idx].length_mm = hypotf(tt.target.walls[w_idx].x2 - tt.target.walls[w_idx].x1,
                                                                  tt.target.walls[w_idx].y2 - tt.target.walls[w_idx].y1);
+                    } else if (tt.has_close_lock && d_sensor > 1050.0f) {
+                        // Z dálky stěna rohu vypadla, ale zblízka víme, že tam je!
+                        tt.target.wall_count = tt.best_target.wall_count;
+                        tt.target.walls[0] = tt.best_target.walls[0];
+                        tt.target.walls[1] = tt.best_target.walls[1];
                     }
                 } else if (tt.target.type == TARGET_WALL) {
                     tt.target.wall_count = 1;
@@ -2053,7 +2092,15 @@ public:
                         tt.target.walls[0].y2 = (1.0f - alpha) * e1y + alpha * e2y;
                         tt.target.walls[0].length_mm = hypotf(tt.target.walls[0].x2 - tt.target.walls[0].x1,
                                                              tt.target.walls[0].y2 - tt.target.walls[0].y1);
+                    } else if (tt.has_close_lock && d_sensor > 1050.0f) {
+                        // Z dálky stěna vypadla, ale zblízka víme, že tam je!
+                        tt.target.wall_count = tt.best_target.wall_count;
+                        tt.target.walls[0] = tt.best_target.walls[0];
                     }
+                }
+
+                if (tt.has_close_lock && d_sensor < 950.0f) {
+                    tt.best_target = tt.target;
                 }
             } else {
                 int emptyIdx = -1;
@@ -2063,6 +2110,10 @@ public:
                 if (emptyIdx >= 0) {
                     TrackedTarget& tt = _trackedTargets[emptyIdx];
                     tt.target = liveT;
+                    tt.best_target = liveT;
+                    tt.best_dist_mm = hypotf(liveT.candle_x, liveT.candle_y);
+                    tt.close_hits = (tt.best_dist_mm < 950.0f) ? 1 : 0;
+                    tt.has_close_lock = false;
                     tt.hits = 1;
                     tt.missed = 0;
                     tt.active = true;

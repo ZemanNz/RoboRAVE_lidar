@@ -129,12 +129,19 @@ def parse_target_list(raw_targets):
             if len(w) == 2:
                 walls.append(((float(w[0][0]), float(w[0][1])), (float(w[1][0]), float(w[1][1]))))
 
-        t_type = t.get("type", "VOLNÁ")
+        raw_type = t.get("type", "VOLNÁ")
+        if raw_type in ("ROH", "CORNER"):
+            t_type = "CORNER"
+        elif raw_type in ("STĚNA", "WALL"):
+            t_type = "WALL"
+        else:
+            t_type = "SOLO"
+
         targets.append({
             'id': int(t.get("id", len(targets) + 1)),
             'type': t_type,
-            'is_corner': (t_type == "ROH"),
-            'is_solo': (t_type == "VOLNÁ"),
+            'is_corner': (t_type == "CORNER"),
+            'is_solo': (t_type == "SOLO"),
             'candle': (float(c[0]), float(c[1])),
             'box': box_dict,
             'waypoint': (float(wp[0]), float(wp[1])),
@@ -768,8 +775,12 @@ class TrackedBoxDetail:
     def __init__(self, track_id, init_meas):
         self.track_id = track_id
         self.type_history = collections.deque(maxlen=14)
-        self.type_history.append(init_meas['type'])
-        self.confirmed_type = init_meas['type']
+        init_type = init_meas['type']
+        if init_type in ('ROH', 'CORNER'): init_type = 'CORNER'
+        elif init_type in ('STĚNA', 'WALL'): init_type = 'WALL'
+        else: init_type = 'SOLO'
+        self.type_history.append(init_type)
+        self.confirmed_type = init_type
         self.candle_world = init_meas['candle_world']
         self.walls_world = list(init_meas['walls_world'])
         self.approach_dir = init_meas['approach_dir']
@@ -778,10 +789,30 @@ class TrackedBoxDetail:
         self.missed = 0
         self.travel_dist_mm = 0.0
 
+        # PRAVIDLO "ZBLÍZKA VÍME NEJLÍP":
+        self.best_type = init_type
+        self.best_walls_world = list(init_meas['walls_world'])
+        self.best_dist_mm = 99999.0
+        self.close_hits = 0
+        self.has_close_lock = False
+
     def update(self, meas, rx, ry):
         self.hits += 1
         self.missed = 0
-        self.type_history.append(meas['type'])
+        m_type = meas['type']
+        if m_type in ('ROH', 'CORNER'): m_type = 'CORNER'
+        elif m_type in ('STĚNA', 'WALL'): m_type = 'WALL'
+        else: m_type = 'SOLO'
+        self.type_history.append(m_type)
+
+        d_sensor = math.hypot(meas['candle_world'][0] - rx, meas['candle_world'][1] - ry)
+        if d_sensor < self.best_dist_mm:
+            self.best_dist_mm = d_sensor
+
+        if d_sensor < 950.0:
+            self.close_hits += 1
+            if m_type in ('CORNER', 'WALL') and self.close_hits >= 3:
+                self.has_close_lock = True
 
         # Většinové hlasování o typu cíle s robustní hysterezí
         c_corner = self.type_history.count('CORNER')
@@ -791,20 +822,25 @@ class TrackedBoxDetail:
         meas_box = meas.get('box', {})
         span_mm = meas_box.get('span_mm', 999.0)
 
-        if span_mm < 160.0:
-            self.confirmed_type = 'SOLO'
-        elif self.hits <= 2:
-            self.confirmed_type = meas['type']
-        elif c_corner >= 4 and c_corner >= c_wall and c_corner >= c_solo:
-            self.confirmed_type = 'CORNER'
-        elif c_wall >= 4 and c_wall >= c_solo:
-            self.confirmed_type = 'WALL'
-        elif c_solo >= c_wall + 3 and c_solo >= c_corner + 3:
-            self.confirmed_type = 'SOLO'
+        # PRAVIDLO "ZBLÍZKA VÍME NEJLÍP":
+        # Pokud už byl cíl zblízka potvrzen jako STĚNA nebo ROH, vzdálené měření (> 1050 mm)
+        # ho nesmí degradovat na SOLO ani smazat stěny!
+        if self.has_close_lock and d_sensor > 1050.0:
+            self.confirmed_type = self.best_type
+        else:
+            if span_mm < 160.0:
+                self.confirmed_type = 'SOLO'
+            elif self.hits <= 2:
+                self.confirmed_type = m_type
+            elif c_corner >= 4 and c_corner >= c_wall and c_corner >= c_solo:
+                self.confirmed_type = 'CORNER'
+            elif c_wall >= 4 and c_wall >= c_solo:
+                self.confirmed_type = 'WALL'
+            elif c_solo >= c_wall + 3 and c_solo >= c_corner + 3:
+                self.confirmed_type = 'SOLO'
 
         # Klidný filtr polohy (EMA alpha = 0.15 pro maximální stabilitu jako u bounding boxů)
         alpha = 0.15
-        # Vyhlazení polohy svíčky (EMA)
         mc = meas['candle_world']
         self.candle_world = (
             (1.0 - alpha) * self.candle_world[0] + alpha * mc[0],
@@ -857,6 +893,8 @@ class TrackedBoxDetail:
                 ns = ((1.0 - alpha) * s1[0] + alpha * s2[0], (1.0 - alpha) * s1[1] + alpha * s2[1])
                 ne = ((1.0 - alpha) * e1[0] + alpha * e2[0], (1.0 - alpha) * e1[1] + alpha * e2[1])
                 self.walls_world[w_idx] = (ns, ne)
+            elif self.has_close_lock and d_sensor > 1050.0 and len(self.best_walls_world) == 2:
+                self.walls_world = list(self.best_walls_world)
             # Pokud mw je prázdné, walls_world se PONECHÁ!
         elif self.confirmed_type == 'WALL':
             mw = list(meas.get('walls_world', []))
@@ -872,7 +910,13 @@ class TrackedBoxDetail:
                     self.walls_world = [(ns, ne)]
                 else:
                     self.walls_world = [mw[0]]
+            elif self.has_close_lock and d_sensor > 1050.0 and len(self.best_walls_world) >= 1:
+                self.walls_world = list(self.best_walls_world)
             # Pokud mw je prázdné, walls_world se PONECHÁ!
+
+        if self.has_close_lock and d_sensor < 950.0:
+            self.best_walls_world = list(self.walls_world)
+            self.best_type = self.confirmed_type
 
         # Vyhlazení směru nájezdu a cílového waypointu
         mdir = meas['approach_dir']
@@ -1365,7 +1409,7 @@ class DualLidarVisualizer:
             t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / l2))
             return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
-        def find_best_cluster(pts, max_d=45.0):
+        def find_best_cluster(pts, max_d=50.0):
             if not pts: return None
             best_c = []
             for p in pts:
@@ -1376,7 +1420,7 @@ class DualLidarVisualizer:
                 return (sum(q[0] for q in best_c) / len(best_c), sum(q[1] for q in best_c) / len(best_c))
             return (sum(q[0] for q in pts) / len(pts), sum(q[1] for q in pts) / len(pts))
 
-        wall_exclusion_dist = 32.0
+        wall_exclusion_dist = 26.0
 
         # ========================================================
         # VĚTEV A: ROH (2 STĚNY KOLEM SVÍČKY)
@@ -1438,17 +1482,14 @@ class DualLidarVisualizer:
 
             if cand_center is not None:
                 cand_x, cand_y = cand_center
+                d_w1 = pt_seg_dist(cand_x, cand_y, wall1_seg)
+                d_w2 = pt_seg_dist(cand_x, cand_y, wall2_seg)
+                if d_w1 < 32.0 or d_w2 < 32.0:
+                    cand_x += u_open_x * 20.0
+                    cand_y += u_open_y * 20.0
             else:
-                cand_x = Vx + u_open_x * 80.0
-                cand_y = Vy + u_open_y * 80.0
-
-            # Fyzikální pojistka: Svíčka se NIKDY nesmí dotýkat ani sedět na stěnách rohu!
-            c_dist1 = pt_seg_dist(cand_x, cand_y, wall1_seg)
-            c_dist2 = pt_seg_dist(cand_x, cand_y, wall2_seg)
-            c_distV = math.hypot(cand_x - Vx, cand_y - Vy)
-            if c_dist1 < 48.0 or c_dist2 < 48.0 or c_distV < 55.0 or c_distV > 130.0:
-                cand_x = Vx + u_open_x * 80.0
-                cand_y = Vy + u_open_y * 80.0
+                cand_x = Vx + u_open_x * 85.0
+                cand_y = Vy + u_open_y * 85.0
 
             wp_x = cand_x + u_open_x * 380.0
             wp_y = cand_y + u_open_y * 380.0
@@ -1506,8 +1547,11 @@ class DualLidarVisualizer:
                 nx = -nx; ny = -ny
             norm_x = nx; norm_y = ny
 
-        # Fyzikální pojistka: Svíčka musí ležet minimálně 65 mm od stěny (jinak leží přímo na ní!)
-        if perp_dist < 65.0 or perp_dist > 130.0:
+        if cand_center is not None:
+            if perp_dist < 32.0:
+                cand_x = p_proj_x + norm_x * 35.0
+                cand_y = p_proj_y + norm_y * 35.0
+        else:
             cand_x = p_proj_x + norm_x * 75.0
             cand_y = p_proj_y + norm_y * 75.0
 
