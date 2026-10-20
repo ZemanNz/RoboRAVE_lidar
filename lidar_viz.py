@@ -238,6 +238,184 @@ def classify_box_size(box):
         return BOX_SIZE_MEDIUM
 
 
+def dist_point_to_segment(px, py, ax, ay, bx, by):
+    """Vrátí minimální vzdálenost bodu P od úsečky AB."""
+    abx = bx - ax; aby = by - ay
+    lab2 = abx * abx + aby * aby
+    if lab2 < 1e-6:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * abx + (py - ay) * aby) / lab2))
+    proj_x = ax + t * abx
+    proj_y = ay + t * aby
+    return math.hypot(px - proj_x, py - proj_y)
+
+
+def compute_tangent_avoidance_path(rx, ry, target_wp, target_candle, target_idx, all_targets, field_bounds):
+    """
+    Zkontroluje koridor šířky 200 mm (+-100 mm) od lidaru robota (rx, ry) k nájezdovému waypointu target_wp.
+    Pokud koridor protne jinou svíčku/bounding box:
+    1. Vytvoří ochrannou kružnici kolem překážky (R_safe = 230 mm).
+    2. Sestrojí tečnu z cílového waypointu target_wp ke kružnici překážky.
+    3. Spustí kolmici z lidaru robota na tuto přímku tečny (bod P).
+    4. Zkontroluje bezpečnost obou stran (levá/pravá tečna), vyloučí kolize s dalšími cíli a mantinely.
+    5. Vrátí geometrii koridoru a kompletní náhradní trasu.
+    """
+    wx, wy = float(target_wp[0]), float(target_wp[1])
+    ROBOT_HALF_WIDTH = 100.0   # Rezerva +-100 mm na každou stranu (šířka robota 20 cm)
+    OBSTACLE_SAFE_R = 230.0    # Poloměr ochranné kružnice kolem překážky (23 cm)
+
+    dx = wx - rx; dy = wy - ry
+    dist_direct = math.hypot(dx, dy)
+    if dist_direct < 1.0:
+        return {
+            'collision': False,
+            'obstacle': None,
+            'corridor_lines': [],
+            'direct_dist': 0.0,
+            'safe_path': None
+        }
+
+    ux = dx / dist_direct; uy = dy / dist_direct
+    nx = -uy; ny = ux # Normála ke koridoru
+
+    # Hranice koridoru pro vykreslení
+    c_left_start  = (rx + nx * ROBOT_HALF_WIDTH, ry + ny * ROBOT_HALF_WIDTH)
+    c_left_end    = (wx + nx * ROBOT_HALF_WIDTH, wy + ny * ROBOT_HALF_WIDTH)
+    c_right_start = (rx - nx * ROBOT_HALF_WIDTH, ry - ny * ROBOT_HALF_WIDTH)
+    c_right_end   = (wx - nx * ROBOT_HALF_WIDTH, wy - ny * ROBOT_HALF_WIDTH)
+
+    # Hledání překážek protínajících koridor
+    colliding_obs = []
+    for idx, obs in enumerate(all_targets):
+        if idx == target_idx:
+            continue
+        ocx, ocy = float(obs['candle_world'][0]), float(obs['candle_world'][1])
+        t_proj = (ocx - rx) * ux + (ocy - ry) * uy
+        # Překážka leží mezi robotem a cílovým waypointem
+        if 40.0 <= t_proj <= (dist_direct - 40.0):
+            d_perp = abs((ocx - rx) * nx + (ocy - ry) * ny)
+            if d_perp < (OBSTACLE_SAFE_R + ROBOT_HALF_WIDTH):
+                colliding_obs.append({
+                    'idx': idx,
+                    'obs': obs,
+                    'pos': (ocx, ocy),
+                    't_proj': t_proj,
+                    'd_perp': d_perp
+                })
+
+    if not colliding_obs:
+        return {
+            'collision': False,
+            'obstacle': None,
+            'corridor_lines': [(c_left_start, c_left_end), (c_right_start, c_right_end)],
+            'direct_dist': dist_direct,
+            'safe_path': None
+        }
+
+    # Vybereme nejbližší překážku
+    colliding_obs.sort(key=lambda o: o['t_proj'])
+    prim_obs = colliding_obs[0]
+    ox, oy = prim_obs['pos']
+
+    # Výpočet tečen z cílového waypointu W na kružnici překážky se středem (ox, oy) a poloměrem OBSTACLE_SAFE_R
+    vwx = wx - ox; vwy = wy - oy
+    dw = math.hypot(vwx, vwy)
+    if dw <= OBSTACLE_SAFE_R:
+        return {
+            'collision': True,
+            'obstacle': prim_obs,
+            'corridor_lines': [(c_left_start, c_left_end), (c_right_start, c_right_end)],
+            'direct_dist': dist_direct,
+            'safe_path': None
+        }
+
+    phi = math.atan2(vwy, vwx)
+    theta = math.asin(min(0.9999, OBSTACLE_SAFE_R / dw))
+
+    candidates = []
+    # Testujeme obě tečny: + (levá) a - (pravá)
+    for sign in (+1.0, -1.0):
+        alpha = phi + sign * (math.pi * 0.5 - theta)
+        tx = ox + OBSTACLE_SAFE_R * math.cos(alpha)
+        ty = oy + OBSTACLE_SAFE_R * math.sin(alpha)
+
+        # Směrový vektor tečny z W přes T
+        dtx = tx - wx; dty = ty - wy
+        lt = math.hypot(dtx, dty)
+        if lt < 1.0:
+            continue
+        utx = dtx / lt; uty = dty / lt
+
+        # Kolmice z robota (rx, ry) na přímku tečny
+        s_p = (rx - wx) * utx + (ry - wy) * uty
+        px = wx + s_p * utx
+        py = wy + s_p * uty
+
+        d_perp = math.hypot(px - rx, py - ry)
+        d_tang = math.hypot(wx - px, wy - py)
+        total_d = d_perp + d_tang
+
+        # Kontrola, zda pata kolmice leží v poli
+        f_xmin, f_xmax, f_ymin, f_ymax = field_bounds
+        in_bounds = (f_xmin + 60.0 <= px <= f_xmax - 60.0) and (f_ymin + 60.0 <= py <= f_ymax - 60.0)
+
+        # Kontrola kolize segmentů s jinými svíčkami
+        other_collision = False
+        for o_idx, o_other in enumerate(all_targets):
+            if o_idx == target_idx:
+                continue
+            other_cx, other_cy = float(o_other['candle_world'][0]), float(o_other['candle_world'][1])
+            if o_idx == prim_obs['idx']:
+                # U primární překážky kontrolujeme, zda kolmice do ní nenaráží
+                d_to_col = dist_point_to_segment(other_cx, other_cy, rx, ry, px, py)
+                if d_to_col < (OBSTACLE_SAFE_R * 0.92):
+                    other_collision = True
+                    break
+            else:
+                # U všech ostatních překážek nesmí kolmice ani tečna narazit
+                d_p1 = dist_point_to_segment(other_cx, other_cy, rx, ry, px, py)
+                d_p2 = dist_point_to_segment(other_cx, other_cy, px, py, wx, wy)
+                if d_p1 < (OBSTACLE_SAFE_R * 0.92) or d_p2 < (OBSTACLE_SAFE_R * 0.92):
+                    other_collision = True
+                    break
+
+        # Bod pro prodloužené vykreslení tečny (jak nakreslil uživatel)
+        ext_len = max(s_p + 350.0, lt + 350.0)
+        line_ext_end = (wx + ext_len * utx, wy + ext_len * uty)
+
+        score = total_d
+        if not in_bounds:
+            score += 5000.0
+        if other_collision:
+            score += 8000.0
+        if s_p < 0.0:
+            score += 3000.0  # Pata kolmice je v opačném směru
+
+        candidates.append({
+            'sign': sign,
+            'tangent_pt': (tx, ty),
+            'perp_pt': (px, py),
+            'line_ext_end': line_ext_end,
+            'd_perp': d_perp,
+            'd_tang': d_tang,
+            'total_dist': total_d,
+            'in_bounds': in_bounds,
+            'has_collision': other_collision,
+            'score': score
+        })
+
+    candidates.sort(key=lambda c: c['score'])
+    best_cand = candidates[0] if candidates else None
+
+    return {
+        'collision': True,
+        'obstacle': prim_obs,
+        'corridor_lines': [(c_left_start, c_left_end), (c_right_start, c_right_end)],
+        'direct_dist': dist_direct,
+        'safe_path': best_cand
+    }
+
+
 # ============================================================
 #  Map-to-Map Lokalizátor robota (Porovnání Bounding Boxů)
 # ============================================================
@@ -2495,6 +2673,7 @@ class DualLidarVisualizer:
 
         if self.detect_details_enabled and self.current_box_details:
             r_pos_scr = self.to_screen(loc.robot_x, loc.robot_y, offset_x)
+            f_bounds = self.field_map.get_auto_field_bounds()
 
             for idx, details in enumerate(self.current_box_details):
                 wp_world = details['waypoint_world']
@@ -2502,12 +2681,80 @@ class DualLidarVisualizer:
                 wp_scr = self.to_screen(wp_world[0], wp_world[1], offset_x)
                 cand_scr = self.to_screen(cand_world[0], cand_world[1], offset_x)
 
-                # 1. Trasa od středu lidaru k Waypointu (nájezdovému bodu)
-                pygame.draw.line(self.screen, (0, 240, 255), r_pos_scr, wp_scr, 2)
-                mid_tr_x = (r_pos_scr[0] + wp_scr[0]) // 2
-                mid_tr_y = (r_pos_scr[1] + wp_scr[1]) // 2
-                lbl_path = self.font_bold.render(f"CESTA #{idx+1}: {int(details['travel_dist_mm'])} mm", True, (0, 255, 240))
-                self.screen.blit(lbl_path, (mid_tr_x + 6, mid_tr_y - 8))
+                # 1. Výpočet koridoru a vyhýbací tečny pro tento cíl
+                path_info = compute_tangent_avoidance_path(
+                    loc.robot_x, loc.robot_y,
+                    wp_world, cand_world,
+                    idx, self.current_box_details, f_bounds
+                )
+
+                # Vykreslení modrých čar koridoru (šířka robota +-10 cm)
+                for line_start, line_end in path_info['corridor_lines']:
+                    ls_scr = self.to_screen(line_start[0], line_start[1], offset_x)
+                    le_scr = self.to_screen(line_end[0], line_end[1], offset_x)
+                    cor_col = (0, 160, 225) if not path_info['collision'] else (240, 130, 40)
+                    pygame.draw.line(self.screen, cor_col, ls_scr, le_scr, 1)
+
+                if not path_info['collision']:
+                    # 1a. VOLNÁ PŘÍMÁ TRASA (Modrá / tyrkysová)
+                    pygame.draw.line(self.screen, (0, 240, 255), r_pos_scr, wp_scr, 2)
+                    mid_tr_x = (r_pos_scr[0] + wp_scr[0]) // 2
+                    mid_tr_y = (r_pos_scr[1] + wp_scr[1]) // 2
+                    lbl_path = self.font_bold.render(f"CESTA #{idx+1} [VOLNÁ]: {int(path_info['direct_dist'])} mm", True, (0, 255, 240))
+                    self.screen.blit(lbl_path, (mid_tr_x + 6, mid_tr_y - 8))
+                else:
+                    # 1b. KOLIZNÍ PŘÍMÁ TRASA + ČERNÁ OCHRANNÁ KRUŽNICE + ČERVENÁ TEČNA & KOLMICE
+                    pygame.draw.line(self.screen, (240, 110, 40), r_pos_scr, wp_scr, 1)
+
+                    obs = path_info['obstacle']
+                    sp = path_info['safe_path']
+
+                    if obs:
+                        # Černá ochranná kružnice kolem kolizní svíčky (poloměr 23 cm)
+                        obs_pos = obs['pos']
+                        obs_scr = self.to_screen(obs_pos[0], obs_pos[1], offset_x)
+                        r_safe_px = max(6, int(230.0 * self.scale))
+                        s_circ = pygame.Surface((r_safe_px * 2 + 6, r_safe_px * 2 + 6), pygame.SRCALPHA)
+                        pygame.draw.circle(s_circ, (10, 12, 16, 200), (r_safe_px + 3, r_safe_px + 3), r_safe_px)
+                        pygame.draw.circle(s_circ, (255, 50, 50, 230), (r_safe_px + 3, r_safe_px + 3), r_safe_px, 2)
+                        self.screen.blit(s_circ, (obs_scr[0] - r_safe_px - 3, obs_scr[1] - r_safe_px - 3))
+                        self.screen.blit(self.font_main.render(f"PŘEKÁŽKA C#{obs['idx']+1}", True, (255, 90, 90)), (obs_scr[0] - 30, obs_scr[1] - r_safe_px - 14))
+
+                    if sp:
+                        p_scr = self.to_screen(sp['perp_pt'][0], sp['perp_pt'][1], offset_x)
+                        ext_scr = self.to_screen(sp['line_ext_end'][0], sp['line_ext_end'][1], offset_x)
+
+                        # ČERVENÁ TEČNA (od cílového waypointu wp_scr přes p_scr až po prodloužení ext_scr)
+                        pygame.draw.line(self.screen, (255, 40, 40), wp_scr, ext_scr, 3)
+
+                        # ČERVENÁ KOLMICE z lidaru robota (r_pos_scr) do bodu P (p_scr) na tečně
+                        pygame.draw.line(self.screen, (255, 40, 40), r_pos_scr, p_scr, 3)
+
+                        # Zvýraznění odbočovacího bodu P (pata kolmice)
+                        pygame.draw.circle(self.screen, (255, 230, 0), p_scr, 6)
+                        pygame.draw.circle(self.screen, (255, 40, 40), p_scr, 3)
+
+                        # Značka pravého úhlu v bodě P (malý kolmý čtvereček)
+                        vpr_x = r_pos_scr[0] - p_scr[0]; vpr_y = r_pos_scr[1] - p_scr[1]
+                        vpw_x = wp_scr[0] - p_scr[0]; vpw_y = wp_scr[1] - p_scr[1]
+                        lpr = math.hypot(vpr_x, vpr_y); lpw = math.hypot(vpw_x, vpw_y)
+                        if lpr > 15.0 and lpw > 15.0:
+                            sq_sz = 9.0
+                            sq_u1 = (vpr_x / lpr * sq_sz, vpr_y / lpr * sq_sz)
+                            sq_u2 = (vpw_x / lpw * sq_sz, vpw_y / lpw * sq_sz)
+                            p_c1 = (int(p_scr[0] + sq_u1[0]), int(p_scr[1] + sq_u1[1]))
+                            p_c2 = (int(p_scr[0] + sq_u1[0] + sq_u2[0]), int(p_scr[1] + sq_u1[1] + sq_u2[1]))
+                            p_c3 = (int(p_scr[0] + sq_u2[0]), int(p_scr[1] + sq_u2[1]))
+                            pygame.draw.lines(self.screen, (255, 240, 80), False, [p_c1, p_c2, p_c3], 2)
+
+                        # Popisek náhradní trasy
+                        lbl_obj = self.font_bold.render(
+                            f"OBJÍŽĎKA #{idx+1}: KOLMICE {int(sp['d_perp'])} + TEČNA {int(sp['d_tang'])} = {int(sp['total_dist'])} mm",
+                            True, (255, 75, 75)
+                        )
+                        mid_perp_x = (r_pos_scr[0] + p_scr[0]) // 2
+                        mid_perp_y = (r_pos_scr[1] + p_scr[1]) // 2
+                        self.screen.blit(lbl_obj, (mid_perp_x + 8, mid_perp_y - 12))
 
                 # 2. Cílový bod nájezdu (Approach Waypoint - terčík)
                 pygame.draw.circle(self.screen, (0, 255, 200), wp_scr, 9, 2)
