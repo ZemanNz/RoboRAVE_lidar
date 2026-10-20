@@ -884,9 +884,10 @@ class TrackedBoxDetail:
         if d_sensor < self.best_dist_mm:
             self.best_dist_mm = d_sensor
 
-        if d_sensor < 950.0:
+        in_close_zone = (d_sensor <= 1000.0)
+        if in_close_zone:
             self.close_hits += 1
-            if m_type in ('CORNER', 'WALL') and self.close_hits >= 3:
+            if m_type in ('CORNER', 'WALL') and self.close_hits >= 2:
                 self.has_close_lock = True
 
         # Většinové hlasování o typu cíle s robustní hysterezí
@@ -897,19 +898,27 @@ class TrackedBoxDetail:
         meas_box = meas.get('box', {})
         span_mm = meas_box.get('span_mm', 999.0)
 
-        # PRAVIDLO "ZBLÍZKA VÍME NEJLÍP":
-        # Pokud už byl cíl zblízka potvrzen jako STĚNA nebo ROH, vzdálené měření (> 1050 mm)
-        # ho nesmí degradovat na SOLO ani smazat stěny!
-        if self.has_close_lock and d_sensor > 1050.0:
+        # PRAVIDLO "ZBLÍZKA VÍME NEJLÍP (Zóna 1000 mm)":
+        # 1. Pokud živé měření vidí 2 stěny (ROH), má ROH okamžitou strukturální přednost!
+        if m_type == 'CORNER' or len(meas.get('walls_world', [])) >= 2:
+            self.confirmed_type = 'CORNER'
+            self.best_type = 'CORNER'
+            if in_close_zone:
+                self.has_close_lock = True
+        # 2. Pokud se robot vzdálí na více než metr (> 1000 mm) a cíl byl zamčen zblízka, ponechá se pevný nejlepší model!
+        elif self.has_close_lock and d_sensor > 1000.0:
             self.confirmed_type = self.best_type
+        # 3. V zóně do 1 metru nepodléhá dříve zjištěný ROH degradaci na 1 stěnu kvůli slepé zóně LiDARu
+        elif self.best_type == 'CORNER' and in_close_zone and span_mm >= 160.0:
+            self.confirmed_type = 'CORNER'
         else:
             if span_mm < 160.0:
                 self.confirmed_type = 'SOLO'
             elif self.hits <= 2:
                 self.confirmed_type = m_type
-            elif c_corner >= 4 and c_corner >= c_wall and c_corner >= c_solo:
+            elif c_corner >= 3 and c_corner >= c_wall and c_corner >= c_solo:
                 self.confirmed_type = 'CORNER'
-            elif c_wall >= 4 and c_wall >= c_solo:
+            elif c_wall >= 3 and c_wall >= c_solo:
                 self.confirmed_type = 'WALL'
             elif c_solo >= c_wall + 3 and c_solo >= c_corner + 3:
                 self.confirmed_type = 'SOLO'
@@ -968,7 +977,7 @@ class TrackedBoxDetail:
                 ns = ((1.0 - alpha) * s1[0] + alpha * s2[0], (1.0 - alpha) * s1[1] + alpha * s2[1])
                 ne = ((1.0 - alpha) * e1[0] + alpha * e2[0], (1.0 - alpha) * e1[1] + alpha * e2[1])
                 self.walls_world[w_idx] = (ns, ne)
-            elif self.has_close_lock and d_sensor > 1050.0 and len(self.best_walls_world) == 2:
+            elif self.has_close_lock and d_sensor > 1000.0 and len(self.best_walls_world) == 2:
                 self.walls_world = list(self.best_walls_world)
             # Pokud mw je prázdné, walls_world se PONECHÁ!
         elif self.confirmed_type == 'WALL':
@@ -985,11 +994,11 @@ class TrackedBoxDetail:
                     self.walls_world = [(ns, ne)]
                 else:
                     self.walls_world = [mw[0]]
-            elif self.has_close_lock and d_sensor > 1050.0 and len(self.best_walls_world) >= 1:
+            elif self.has_close_lock and d_sensor > 1000.0 and len(self.best_walls_world) >= 1:
                 self.walls_world = list(self.best_walls_world)
             # Pokud mw je prázdné, walls_world se PONECHÁ!
 
-        if self.has_close_lock and d_sensor < 950.0:
+        if self.has_close_lock and d_sensor <= 1000.0:
             self.best_walls_world = list(self.walls_world)
             self.best_type = self.confirmed_type
 
