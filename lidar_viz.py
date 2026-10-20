@@ -783,23 +783,23 @@ class TrackedBoxDetail:
         self.missed = 0
         self.type_history.append(meas['type'])
 
-        # Většinové hlasování o typu cíle (pokud je SOLO většinové, je to SOLO)
+        # Většinové hlasování o typu cíle s robustní hysterezí
         c_corner = self.type_history.count('CORNER')
         c_wall   = self.type_history.count('WALL')
         c_solo   = self.type_history.count('SOLO')
 
-        if self.hits <= 2:
+        meas_box = meas.get('box', {})
+        span_mm = meas_box.get('span_mm', 999.0)
+
+        if span_mm < 160.0:
+            self.confirmed_type = 'SOLO'
+        elif self.hits <= 2:
             self.confirmed_type = meas['type']
         elif c_corner >= 4 and c_corner >= c_wall and c_corner >= c_solo:
             self.confirmed_type = 'CORNER'
         elif c_wall >= 4 and c_wall >= c_solo:
             self.confirmed_type = 'WALL'
-        elif c_solo >= c_wall and c_solo >= c_corner:
-            self.confirmed_type = 'SOLO'
-
-        # Pokud box nemá rozměr pro stěny (< 160 mm), stěny mít NESMÍ
-        meas_box = meas.get('box', {})
-        if meas_box.get('span_mm', 999.0) < 160.0 or meas_box.get('is_solo', False):
+        elif c_solo >= c_wall + 3 and c_solo >= c_corner + 3:
             self.confirmed_type = 'SOLO'
 
         # Klidný filtr polohy (EMA alpha = 0.15 pro maximální stabilitu jako u bounding boxů)
@@ -811,26 +811,25 @@ class TrackedBoxDetail:
             (1.0 - alpha) * self.candle_world[1] + alpha * mc[1]
         )
 
-        # Vyhlazení stěn
+        # Vyhlazení stěn bez nechtěného mazání při výpadku
         if self.confirmed_type == 'SOLO':
-            self.walls_world = []
-        else:
-            mw = list(meas['walls_world'])
-            if mw:
-                if len(mw) == len(self.walls_world):
-                    # Pro 2 stěny zajistíme minimální součet vzdáleností středů (zabraňuje záměně ramen rohu)
-                    if len(mw) == 2:
-                        (s1_0, e1_0), (s1_1, e1_1) = self.walls_world
-                        (s2_a, e2_a), (s2_b, e2_b) = mw
-                        m1_0 = ((s1_0[0] + e1_0[0]) * 0.5, (s1_0[1] + e1_0[1]) * 0.5)
-                        m1_1 = ((s1_1[0] + e1_1[0]) * 0.5, (s1_1[1] + e1_1[1]) * 0.5)
-                        m2_a = ((s2_a[0] + e2_a[0]) * 0.5, (s2_a[1] + e2_a[1]) * 0.5)
-                        m2_b = ((s2_b[0] + e2_b[0]) * 0.5, (s2_b[1] + e2_b[1]) * 0.5)
+            if span_mm < 160.0 or c_solo >= 5:
+                self.walls_world = []
+        elif self.confirmed_type == 'CORNER':
+            mw = list(meas.get('walls_world', []))
+            if len(mw) == 2:
+                if len(self.walls_world) == 2:
+                    (s1_0, e1_0), (s1_1, e1_1) = self.walls_world
+                    (s2_a, e2_a), (s2_b, e2_b) = mw
+                    m1_0 = ((s1_0[0] + e1_0[0]) * 0.5, (s1_0[1] + e1_0[1]) * 0.5)
+                    m1_1 = ((s1_1[0] + e1_1[0]) * 0.5, (s1_1[1] + e1_1[1]) * 0.5)
+                    m2_a = ((s2_a[0] + e2_a[0]) * 0.5, (s2_a[1] + e2_a[1]) * 0.5)
+                    m2_b = ((s2_b[0] + e2_b[0]) * 0.5, (s2_b[1] + e2_b[1]) * 0.5)
 
-                        c_dir = math.hypot(m1_0[0] - m2_a[0], m1_0[1] - m2_a[1]) + math.hypot(m1_1[0] - m2_b[0], m1_1[1] - m2_b[1])
-                        c_swp = math.hypot(m1_0[0] - m2_b[0], m1_0[1] - m2_b[1]) + math.hypot(m1_1[0] - m2_a[0], m1_1[1] - m2_a[1])
-                        if c_swp < c_dir:
-                            mw = [mw[1], mw[0]]
+                    c_dir = math.hypot(m1_0[0] - m2_a[0], m1_0[1] - m2_a[1]) + math.hypot(m1_1[0] - m2_b[0], m1_1[1] - m2_b[1])
+                    c_swp = math.hypot(m1_0[0] - m2_b[0], m1_0[1] - m2_b[1]) + math.hypot(m1_1[0] - m2_a[0], m1_1[1] - m2_a[1])
+                    if c_swp < c_dir:
+                        mw = [mw[1], mw[0]]
 
                     new_w = []
                     for (s1, e1), (s2, e2) in zip(self.walls_world, mw):
@@ -844,8 +843,36 @@ class TrackedBoxDetail:
                     self.walls_world = new_w
                 else:
                     self.walls_world = list(mw)
-            else:
-                self.walls_world = []
+            elif len(mw) == 1 and len(self.walls_world) == 2:
+                # Jedna stěna živě -> vyhladíme bližší rameno, druhé rameno zachováme
+                (s2, e2) = mw[0]
+                m2 = ((s2[0] + e2[0]) * 0.5, (s2[1] + e2[1]) * 0.5)
+                m0 = ((self.walls_world[0][0][0] + self.walls_world[0][1][0]) * 0.5, (self.walls_world[0][0][1] + self.walls_world[0][1][1]) * 0.5)
+                m1 = ((self.walls_world[1][0][0] + self.walls_world[1][1][0]) * 0.5, (self.walls_world[1][0][1] + self.walls_world[1][1][1]) * 0.5)
+                w_idx = 1 if math.hypot(m2[0] - m1[0], m2[1] - m1[1]) < math.hypot(m2[0] - m0[0], m2[1] - m0[1]) else 0
+                s1, e1 = self.walls_world[w_idx]
+                d_same = math.hypot(s1[0] - s2[0], s1[1] - s2[1]) + math.hypot(e1[0] - e2[0], e1[1] - e2[1])
+                d_flip = math.hypot(s1[0] - e2[0], s1[1] - e2[1]) + math.hypot(e1[0] - s2[0], e1[1] - s2[1])
+                if d_flip < d_same: s2, e2 = e2, s2
+                ns = ((1.0 - alpha) * s1[0] + alpha * s2[0], (1.0 - alpha) * s1[1] + alpha * s2[1])
+                ne = ((1.0 - alpha) * e1[0] + alpha * e2[0], (1.0 - alpha) * e1[1] + alpha * e2[1])
+                self.walls_world[w_idx] = (ns, ne)
+            # Pokud mw je prázdné, walls_world se PONECHÁ!
+        elif self.confirmed_type == 'WALL':
+            mw = list(meas.get('walls_world', []))
+            if len(mw) >= 1:
+                s2, e2 = mw[0]
+                if len(self.walls_world) >= 1:
+                    s1, e1 = self.walls_world[0]
+                    d_same = math.hypot(s1[0] - s2[0], s1[1] - s2[1]) + math.hypot(e1[0] - e2[0], e1[1] - e2[1])
+                    d_flip = math.hypot(s1[0] - e2[0], s1[1] - e2[1]) + math.hypot(e1[0] - s2[0], e1[1] - s2[1])
+                    if d_flip < d_same: s2, e2 = e2, s2
+                    ns = ((1.0 - alpha) * s1[0] + alpha * s2[0], (1.0 - alpha) * s1[1] + alpha * s2[1])
+                    ne = ((1.0 - alpha) * e1[0] + alpha * e2[0], (1.0 - alpha) * e1[1] + alpha * e2[1])
+                    self.walls_world = [(ns, ne)]
+                else:
+                    self.walls_world = [mw[0]]
+            # Pokud mw je prázdné, walls_world se PONECHÁ!
 
         # Vyhlazení směru nájezdu a cílového waypointu
         mdir = meas['approach_dir']
@@ -1249,13 +1276,13 @@ class DualLidarVisualizer:
         best_w1_inliers = []
         best_w1_line = None
         n_p = len(world_pts)
-        step = 1 if n_p < 40 else 2
-        for i in range(0, min(n_p, 30), step):
+        step = max(1, n_p // 30)
+        for i in range(0, n_p, step):
             p1 = world_pts[i]
-            for j in range(i + 1, min(n_p, 30), step):
+            for j in range(i + step, n_p, step):
                 p2 = world_pts[j]
                 d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-                if d < 85.0: continue
+                if d < 75.0: continue
                 nx = -(p2[1] - p1[1]) / d
                 ny = (p2[0] - p1[0]) / d
                 inliers = [p for p in world_pts if abs((p[0] - p1[0]) * nx + (p[1] - p1[1]) * ny) <= 18.0]
@@ -1290,7 +1317,7 @@ class DualLidarVisualizer:
         w1_e = (p1[0] + u1x * max_t1, p1[1] + u1y * max_t1)
         w1_len = max_t1 - min_t1
 
-        if w1_len < 100.0:
+        if w1_len < 80.0:
             cand_x = sum(p[0] for p in world_pts) / len(world_pts) if world_pts else w_box_cx
             cand_y = sum(p[1] for p in world_pts) / len(world_pts) if world_pts else w_box_cy
             d_vec_x = cand_x - rx; d_vec_y = cand_y - ry
@@ -1313,16 +1340,17 @@ class DualLidarVisualizer:
         best_w2_line = None
         if len(outliers_for_w2) >= 4:
             n_out = len(outliers_for_w2)
-            for i in range(min(n_out, 25)):
+            step2 = max(1, n_out // 25)
+            for i in range(0, n_out, step2):
                 q1 = outliers_for_w2[i]
-                for j in range(i + 1, min(n_out, 25)):
+                for j in range(i + step2, n_out, step2):
                     q2 = outliers_for_w2[j]
                     qd = math.hypot(q2[0] - q1[0], q2[1] - q1[1])
-                    if qd < 70.0: continue
+                    if qd < 65.0: continue
                     qux = (q2[0] - q1[0]) / qd
                     quy = (q2[1] - q1[1]) / qd
                     dot = abs(u1x * qux + u1y * quy)
-                    if dot > 0.50: continue # kolmost (cca 60° až 120°)
+                    if dot > 0.45: continue # kolmost (cca 63° až 117°)
                     q_nx = -quy; q_ny = qux
                     in2 = [p for p in outliers_for_w2 if abs((p[0] - q1[0]) * q_nx + (p[1] - q1[1]) * q_ny) <= 18.0]
                     if len(in2) >= 4 and len(in2) > len(best_w2_inliers):
@@ -1348,7 +1376,7 @@ class DualLidarVisualizer:
                 return (sum(q[0] for q in best_c) / len(best_c), sum(q[1] for q in best_c) / len(best_c))
             return (sum(q[0] for q in pts) / len(pts), sum(q[1] for q in pts) / len(pts))
 
-        wall_exclusion_dist = 28.0
+        wall_exclusion_dist = 32.0
 
         # ========================================================
         # VĚTEV A: ROH (2 STĚNY KOLEM SVÍČKY)
@@ -1372,7 +1400,7 @@ class DualLidarVisualizer:
             d_s1 = math.hypot(w1_s[0] - Vx, w1_s[1] - Vy)
             d_e1 = math.hypot(w1_e[0] - Vx, w1_e[1] - Vy)
             far1 = w1_e if d_e1 > d_s1 else w1_s
-            len1 = max(220.0, max(d_s1, d_e1))
+            len1 = max(240.0, max(d_s1, d_e1))
             norm_arm1 = max(1.0, math.hypot(far1[0] - Vx, far1[1] - Vy))
             arm1_x = (far1[0] - Vx) / norm_arm1
             arm1_y = (far1[1] - Vy) / norm_arm1
@@ -1384,7 +1412,7 @@ class DualLidarVisualizer:
             d_s2 = math.hypot(w2_s[0] - Vx, w2_s[1] - Vy)
             d_e2 = math.hypot(w2_e[0] - Vx, w2_e[1] - Vy)
             far2 = w2_e if d_e2 > d_s2 else w2_s
-            len2 = max(220.0, max(d_s2, d_e2))
+            len2 = max(240.0, max(d_s2, d_e2))
             norm_arm2 = max(1.0, math.hypot(far2[0] - Vx, far2[1] - Vy))
             arm2_x = (far2[0] - Vx) / norm_arm2
             arm2_y = (far2[1] - Vy) / norm_arm2
@@ -1411,8 +1439,16 @@ class DualLidarVisualizer:
             if cand_center is not None:
                 cand_x, cand_y = cand_center
             else:
-                cand_x = Vx + u_open_x * 85.0
-                cand_y = Vy + u_open_y * 85.0
+                cand_x = Vx + u_open_x * 80.0
+                cand_y = Vy + u_open_y * 80.0
+
+            # Fyzikální pojistka: Svíčka se NIKDY nesmí dotýkat ani sedět na stěnách rohu!
+            c_dist1 = pt_seg_dist(cand_x, cand_y, wall1_seg)
+            c_dist2 = pt_seg_dist(cand_x, cand_y, wall2_seg)
+            c_distV = math.hypot(cand_x - Vx, cand_y - Vy)
+            if c_dist1 < 48.0 or c_dist2 < 48.0 or c_distV < 55.0 or c_distV > 130.0:
+                cand_x = Vx + u_open_x * 80.0
+                cand_y = Vy + u_open_y * 80.0
 
             wp_x = cand_x + u_open_x * 380.0
             wp_y = cand_y + u_open_y * 380.0
@@ -1447,8 +1483,8 @@ class DualLidarVisualizer:
             nx = -u1y; ny = u1x
             if nx * (w_box_cx - mid_x) + ny * (w_box_cy - mid_y) < 0.0:
                 nx = -nx; ny = -ny
-            cand_x = mid_x + nx * 80.0
-            cand_y = mid_y + ny * 80.0
+            cand_x = mid_x + nx * 75.0
+            cand_y = mid_y + ny * 75.0
 
         # Pata kolmice P_proj na přímce stěny 1
         t_proj = (cand_x - w1_s[0]) * u1x + (cand_y - w1_s[1]) * u1y
@@ -1469,8 +1505,11 @@ class DualLidarVisualizer:
             if nx * (w_box_cx - p_proj_x) + ny * (w_box_cy - p_proj_y) < 0.0:
                 nx = -nx; ny = -ny
             norm_x = nx; norm_y = ny
-            cand_x = p_proj_x + norm_x * 80.0
-            cand_y = p_proj_y + norm_y * 80.0
+
+        # Fyzikální pojistka: Svíčka musí ležet minimálně 65 mm od stěny (jinak leží přímo na ní!)
+        if perp_dist < 65.0 or perp_dist > 130.0:
+            cand_x = p_proj_x + norm_x * 75.0
+            cand_y = p_proj_y + norm_y * 75.0
 
         # Waypoint leží na kolmici od stěny přes svíčku a od svíčky dál o 380 mm
         wp_x = cand_x + norm_x * 380.0
@@ -1530,6 +1569,96 @@ class DualLidarVisualizer:
                     self.field_map.ingest_boxes(active_b, loc.robot_x, loc.robot_y, loc.robot_deg)
                     self.field_map.update_robot_pose(loc.robot_x, loc.robot_y, loc.robot_deg)
 
+            # Průběžná aktualizace detailů stěn, svíček a nájezdových bodů (ze startu i za jízdy)
+            self.update_current_details()
+
+    def update_current_details(self):
+        """Aktualizuje stěny, svíčky a nájezdové waypointy pro všechny aktivní boxy."""
+        if not self.detect_details_enabled or self.last_frame is None:
+            self.current_box_details = []
+            return
+
+        loc = self.localizer
+        rx = loc.robot_x if loc.locked else 0.0
+        ry = loc.robot_y if loc.locked else 0.0
+        rdeg = loc.robot_deg if loc.locked else 0.0
+        th_rad = math.radians(rdeg)
+        cos_t = math.cos(th_rad)
+        sin_t = math.sin(th_rad)
+
+        active_boxes = self.processed_boxes if self.processed_boxes else parse_box_list(self.last_frame.get("static_boxes", []))
+        if not active_boxes:
+            active_boxes = parse_box_list(self.last_frame.get("boxes", []))
+        if not active_boxes:
+            self.current_box_details = []
+            return
+
+        cloud_data = self.last_frame.get("cloud", [])
+        f_xmin, f_xmax, f_ymin, f_ymax = self.field_map.get_auto_field_bounds()
+
+        esp_world_targets = []
+        if self.esp_targets:
+            for et in self.esp_targets:
+                esp_world_targets.append(transform_esp_target_to_world(et, rx, ry, th_rad))
+
+        matched_esp_indices = set()
+        raw_details = []
+
+        for cl in active_boxes:
+            cx_local = cl['cx']
+            cy_local = cl['cy']
+            wx = rx + cx_local * cos_t + cy_local * sin_t
+            wy = ry - cx_local * sin_t + cy_local * cos_t
+            hw = max(20.0, cl['width'] * 0.5)
+            hh = max(20.0, cl['height'] * 0.5)
+
+            if wy < (f_ymin - 80.0) or wy > (f_ymax + 80.0) or wx < (f_xmin - 100.0) or wx > (f_xmax + 100.0):
+                continue
+
+            matched_esp = None
+            best_esp_dist = max(180.0, math.hypot(hw, hh) + 50.0)
+            best_esp_idx = -1
+
+            for e_idx, e_tgt in enumerate(esp_world_targets):
+                if e_idx in matched_esp_indices:
+                    continue
+                c_wx, c_wy = e_tgt['candle_world']
+                d = math.hypot(c_wx - wx, c_wy - wy)
+                if d < best_esp_dist:
+                    if c_wy >= 20.0 and (f_xmin - 60.0) <= c_wx <= (f_xmax + 60.0):
+                        best_esp_dist = d
+                        best_esp_idx = e_idx
+                        matched_esp = dict(e_tgt)
+
+            if matched_esp is not None:
+                matched_esp_indices.add(best_esp_idx)
+                c_x = max(wx - hw, min(wx + hw, matched_esp['candle_world'][0]))
+                c_y = max(wy - hh, min(wy + hh, matched_esp['candle_world'][1]))
+                c_y = max(30.0, min(f_ymax - 30.0, c_y))
+                c_x = max(f_xmin + 30.0, min(f_xmax - 30.0, c_x))
+                matched_esp['candle_world'] = (c_x, c_y)
+                matched_esp['box'] = cl
+                if cl.get('span_mm', 999.0) < 160.0:
+                    matched_esp['type'] = 'SOLO'
+                    matched_esp['is_solo'] = True
+                    matched_esp['is_corner'] = False
+                    matched_esp['walls_world'] = []
+                raw_details.append(matched_esp)
+            else:
+                raw_d = self.compute_raw_box_details(cl, cloud_data, rx, ry, th_rad)
+                c_x = max(wx - hw, min(wx + hw, raw_d['candle_world'][0]))
+                c_y = max(wy - hh, min(wy + hh, raw_d['candle_world'][1]))
+                c_y = max(30.0, min(f_ymax - 30.0, c_y))
+                c_x = max(f_xmin + 30.0, min(f_xmax - 30.0, c_x))
+                raw_d['candle_world'] = (c_x, c_y)
+                raw_details.append(raw_d)
+
+        self.current_box_details = self.detail_stabilizer.update_all(raw_details, rx, ry)
+        self.current_box_details = [
+            d for d in self.current_box_details
+            if (d['candle_world'][1] >= 20.0 and d['candle_world'][1] <= (f_ymax + 50.0) and
+                (f_xmin - 80.0) <= d['candle_world'][0] <= (f_xmax + 80.0))
+        ]
 
     def handle_click(self, pos):
         if pos[1] >= PANEL_H:
@@ -1962,87 +2091,6 @@ class DualLidarVisualizer:
             self.screen.blit(lbl2, (scx + 10, scy - 4))
 
         # 5b. JEMNÁ DETEKCE STĚN, SVÍČEK A NÁJEZDOVÝCH ŠIPEK STRIKTNĚ UVNITŘ BOUNDING BOXŮ (KLÁVESA [O])
-        self.current_box_details = []
-        if self.detect_details_enabled and transformed_boxes:
-            cloud_data = self.last_frame.get("cloud", [])
-            f_xmin, f_xmax, f_ymin, f_ymax = self.field_map.get_auto_field_bounds()
-
-            # Převedeme cíle z ESP32 do světových souřadnic (pokud existují)
-            esp_world_targets = []
-            if self.esp_targets:
-                th_rad = math.radians(loc.robot_deg)
-                for et in self.esp_targets:
-                    esp_world_targets.append(transform_esp_target_to_world(et, loc.robot_x, loc.robot_y, th_rad))
-
-            matched_esp_indices = set()
-            raw_details = []
-
-            for tb in transformed_boxes:
-                cl = tb['box']
-                wx, wy = tb['wx'], tb['wy']
-                hw = max(20.0, cl['width'] * 0.5)
-                hh = max(20.0, cl['height'] * 0.5)
-
-                # 1. Kontrola hranic hřiště: Box musí ležet uvnitř hřiště (nikdy za startovní stěnou)
-                if wy < (f_ymin - 80.0) or wy > (f_ymax + 80.0) or wx < (f_xmin - 100.0) or wx > (f_xmax + 100.0):
-                    continue
-
-                # 2. Hledáme odpovídající cíl z ESP32, který leží UVNITŘ TOHOTO KONKRÉTNÍHO BOXU
-                matched_esp = None
-                best_esp_dist = max(180.0, math.hypot(hw, hh) + 40.0)
-                best_esp_idx = -1
-
-                for e_idx, e_tgt in enumerate(esp_world_targets):
-                    if e_idx in matched_esp_indices:
-                        continue
-                    c_wx, c_wy = e_tgt['candle_world']
-                    d = math.hypot(c_wx - wx, c_wy - wy)
-                    if d < best_esp_dist:
-                        # Ověříme, že cíl z ESP32 leží v hřišti (Y >= 20 mm)
-                        if c_wy >= 20.0 and (f_xmin - 60.0) <= c_wx <= (f_xmax + 60.0):
-                            best_esp_dist = d
-                            best_esp_idx = e_idx
-                            matched_esp = dict(e_tgt)
-
-                if matched_esp is not None:
-                    matched_esp_indices.add(best_esp_idx)
-                    # Bezpečnostní pojistka: svíčka leží STRIKTNĚ uvnitř tohoto Bounding Boxu
-                    c_x = max(wx - hw, min(wx + hw, matched_esp['candle_world'][0]))
-                    c_y = max(wy - hh, min(wy + hh, matched_esp['candle_world'][1]))
-                    c_y = max(30.0, min(f_ymax - 30.0, c_y))
-                    c_x = max(f_xmin + 30.0, min(f_xmax - 30.0, c_x))
-                    matched_esp['candle_world'] = (c_x, c_y)
-                    matched_esp['box'] = cl
-                    if cl.get('is_solo', False) or cl.get('span_mm', 999.0) < 160.0:
-                        matched_esp['type'] = 'SOLO'
-                        matched_esp['is_solo'] = True
-                        matched_esp['is_corner'] = False
-                        matched_esp['walls_world'] = []
-                    raw_details.append(matched_esp)
-                else:
-                    # Pokud z ESP32 cíl chybí (např. zachráněná svíčka), spočítáme detail STRIKTNĚ uvnitř tohoto boxu
-                    raw_d = self.compute_raw_box_details(
-                        cl, cloud_data, loc.robot_x, loc.robot_y, math.radians(loc.robot_deg)
-                    )
-                    # Pojistka: svíčka leží STRIKTNĚ uvnitř tohoto boxu a uvnitř pole
-                    c_x = max(wx - hw, min(wx + hw, raw_d['candle_world'][0]))
-                    c_y = max(wy - hh, min(wy + hh, raw_d['candle_world'][1]))
-                    c_y = max(30.0, min(f_ymax - 30.0, c_y))
-                    c_x = max(f_xmin + 30.0, min(f_xmax - 30.0, c_x))
-                    raw_d['candle_world'] = (c_x, c_y)
-                    raw_details.append(raw_d)
-
-            # Časová stabilizace pro stěny a svíčky v potvrzených boxech
-            self.current_box_details = self.detail_stabilizer.update_all(
-                raw_details, loc.robot_x, loc.robot_y
-            )
-
-            # Finální bezpečnostní filtr: NIKDY nepustit žádný cíl mimo mantinely hřiště!
-            self.current_box_details = [
-                d for d in self.current_box_details
-                if (d['candle_world'][1] >= 20.0 and d['candle_world'][1] <= (f_ymax + 50.0) and
-                    (f_xmin - 80.0) <= d['candle_world'][0] <= (f_xmax + 80.0))
-            ]
 
         if self.detect_details_enabled and self.current_box_details:
             r_pos_scr = self.to_screen(loc.robot_x, loc.robot_y, offset_x)

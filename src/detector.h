@@ -1320,22 +1320,25 @@ public:
             return target;
         }
 
-        // 1. Detekce první stěny (Wall 1) pomocí RANSAC ze všech bodů boxu
+        // 1. Detekce první stěny (Wall 1) pomocí RANSAC přes celý box
         int bestW1Inliers[120];
         int bestW1Count = 0;
         int p1_idx = -1, p2_idx = -1;
         float bestW1Len = 0.0f;
 
-        for (int i = 0; i < boxPtCount && i < 30; i++) {
+        int step1 = (boxPtCount > 35) ? (boxPtCount / 30) : 1;
+        if (step1 < 1) step1 = 1;
+
+        for (int i = 0; i < boxPtCount; i += step1) {
             int idx1 = boxIndices[i];
             float x1 = points[idx1].x;
             float y1 = points[idx1].y;
-            for (int j = i + 1; j < boxPtCount && j < 30; j++) {
+            for (int j = i + step1; j < boxPtCount; j += step1) {
                 int idx2 = boxIndices[j];
                 float x2 = points[idx2].x;
                 float y2 = points[idx2].y;
                 float d = hypotf(x2 - x1, y2 - y1);
-                if (d < 85.0f) continue; // stěna musí mít reálné rozpětí
+                if (d < 75.0f) continue; // stěna musí mít reálné rozpětí
 
                 float nx = -(y2 - y1) / d;
                 float ny = (x2 - x1) / d;
@@ -1398,8 +1401,8 @@ public:
         float w1_ey = points[p1_idx].y + u1y * maxT1;
         float w1_len = maxT1 - minT1;
 
-        // Pokud je délka stěny příliš krátká (< 100 mm), není to stěna
-        if (w1_len < 100.0f) {
+        // Pokud je délka stěny příliš krátká (< 80 mm), není to stěna
+        if (w1_len < 80.0f) {
             target.type = TARGET_SOLO;
             target.candle_x = (boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx;
             target.candle_y = (boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy;
@@ -1434,21 +1437,24 @@ public:
         int q1_idx = -1, q2_idx = -1;
 
         if (outCount >= 4) {
-            for (int i = 0; i < outCount && i < 25; i++) {
+            int step2 = (outCount > 30) ? (outCount / 25) : 1;
+            if (step2 < 1) step2 = 1;
+
+            for (int i = 0; i < outCount; i += step2) {
                 int qidx1 = outlierIndices[i];
                 float qx1 = points[qidx1].x;
                 float qy1 = points[qidx1].y;
-                for (int j = i + 1; j < outCount && j < 25; j++) {
+                for (int j = i + step2; j < outCount; j += step2) {
                     int qidx2 = outlierIndices[j];
                     float qx2 = points[qidx2].x;
                     float qy2 = points[qidx2].y;
                     float qd = hypotf(qx2 - qx1, qy2 - qy1);
-                    if (qd < 70.0f) continue;
+                    if (qd < 65.0f) continue;
 
                     float qux = (qx2 - qx1) / qd;
                     float quy = (qy2 - qy1) / qd;
                     float dot = fabsf(u1x * qux + u1y * quy);
-                    if (dot > 0.50f) continue; // kolmost (cca 60° až 120°)
+                    if (dot > 0.45f) continue; // kolmost (cca 63° až 117°)
 
                     float qnx = -quy;
                     float qny = qux;
@@ -1483,7 +1489,7 @@ public:
         };
 
         // Vyhodnotíme geometrii stěn pro zónu vyloučení
-        float wallExclusionDist = 28.0f; // 28 mm ochranný koridor kolem stěn
+        float wallExclusionDist = 32.0f; // 32 mm ochranný koridor kolem stěn
         int nonWallPts[120];
         int nonWallCount = 0;
 
@@ -1510,10 +1516,10 @@ public:
             }
 
             float d_s1 = hypotf(w1_sx - Vx, w1_sy - Vy);
-            float d_e1 = hypotf(w1_ex - Vx, w1_sy - Vy);
+            float d_e1 = hypotf(w1_ex - Vx, w1_ey - Vy);
             float far1x = (d_e1 > d_s1) ? w1_ex : w1_sx;
             float far1y = (d_e1 > d_s1) ? w1_ey : w1_sy;
-            float arm1_len = fmaxf(220.0f, fmaxf(d_s1, d_e1));
+            float arm1_len = fmaxf(240.0f, fmaxf(d_s1, d_e1));
             float norm1 = fmaxf(1.0f, hypotf(far1x - Vx, far1y - Vy));
             float arm1_ux = (far1x - Vx) / norm1;
             float arm1_uy = (far1y - Vy) / norm1;
@@ -1538,7 +1544,7 @@ public:
             float d_e2 = hypotf(w2_ex - Vx, w2_ey - Vy);
             float far2x = (d_e2 > d_s2) ? w2_ex : w2_sx;
             float far2y = (d_e2 > d_s2) ? w2_ey : w2_sy;
-            float arm2_len = fmaxf(220.0f, fmaxf(d_s2, d_e2));
+            float arm2_len = fmaxf(240.0f, fmaxf(d_s2, d_e2));
             float norm2 = fmaxf(1.0f, hypotf(far2x - Vx, far2y - Vy));
             float arm2_ux = (far2x - Vx) / norm2;
             float arm2_uy = (far2y - Vy) / norm2;
@@ -1613,8 +1619,19 @@ public:
                 target.candle_y = nSumY / (float)nonWallCount;
             } else {
                 // Fallback: syntéza svíčky uvnitř rohu podél bisektoru
-                target.candle_x = Vx + u_open_x * 85.0f;
-                target.candle_y = Vy + u_open_y * 85.0f;
+                target.candle_x = Vx + u_open_x * 80.0f;
+                target.candle_y = Vy + u_open_y * 80.0f;
+            }
+
+            // Fyzikální pojistka: Svíčka se NIKDY nesmí dotýkat ani sedět na stěnách rohu!
+            float c_dist1 = distToSegment(target.candle_x, target.candle_y, target.walls[0].x1, target.walls[0].y1, target.walls[0].x2, target.walls[0].y2);
+            float c_dist2 = distToSegment(target.candle_x, target.candle_y, target.walls[1].x1, target.walls[1].y1, target.walls[1].x2, target.walls[1].y2);
+            float c_distV = hypotf(target.candle_x - Vx, target.candle_y - Vy);
+
+            // Pokud svíčka zasahuje do stěny nebo je moc blízko stěn, usadíme ji podél bisektoru na nominální pozici 80 mm
+            if (c_dist1 < 48.0f || c_dist2 < 48.0f || c_distV < 55.0f || c_distV > 130.0f) {
+                target.candle_x = Vx + u_open_x * 80.0f;
+                target.candle_y = Vy + u_open_y * 80.0f;
             }
 
             target.candle_x = fmaxf(box.min_x, fminf(box.max_x, target.candle_x));
@@ -1700,8 +1717,8 @@ public:
             if (nx * (box.cx - mid_x) + ny * (box.cy - mid_y) < 0.0f) {
                 nx = -nx; ny = -ny;
             }
-            target.candle_x = mid_x + nx * 80.0f;
-            target.candle_y = mid_y + ny * 80.0f;
+            target.candle_x = mid_x + nx * 75.0f;
+            target.candle_y = mid_y + ny * 75.0f;
         }
 
         float t_proj = (target.candle_x - w1_sx) * u1x + (target.candle_y - w1_sy) * u1y;
@@ -1723,8 +1740,12 @@ public:
                 nx = -nx; ny = -ny;
             }
             norm_x = nx; norm_y = ny;
-            target.candle_x = p_proj_x + norm_x * 80.0f;
-            target.candle_y = p_proj_y + norm_y * 80.0f;
+        }
+
+        // Fyzikální pojistka: Svíčka musí ležet minimálně 65 mm od stěny (jinak leží přímo na ní!)
+        if (perp_dist < 65.0f || perp_dist > 130.0f) {
+            target.candle_x = p_proj_x + norm_x * 75.0f;
+            target.candle_y = p_proj_y + norm_y * 75.0f;
         }
 
         // Bezpečnostní pojistka: svíčka se NIKDY nesmí ocitnout mimo svůj Bounding Box!
@@ -1747,6 +1768,7 @@ struct TrackedTarget {
     int type_votes[3]; // [0]=SOLO, [1]=WALL, [2]=CORNER
     int hits;
     int missed;
+    int solo_streak;
     bool active;
 };
 
@@ -1773,6 +1795,7 @@ public:
             _trackedTargets[i].active = false;
             _trackedTargets[i].hits = 0;
             _trackedTargets[i].missed = 0;
+            _trackedTargets[i].solo_streak = 0;
         }
     }
 
@@ -1885,6 +1908,12 @@ public:
                 tt.missed = 0;
                 matchedTracked[bestIdx] = true;
 
+                if (liveT.type == TARGET_SOLO) {
+                    tt.solo_streak++;
+                } else {
+                    tt.solo_streak = 0;
+                }
+
                 // Útlum staré historie hlasů (aby živý majoritní stav okamžitě převážil a starý šum nezůstal viset)
                 int totalVotes = tt.type_votes[0] + tt.type_votes[1] + tt.type_votes[2];
                 if (totalVotes >= 14) {
@@ -1905,7 +1934,7 @@ public:
                     tt.target.type = TARGET_CORNER;
                 } else if (vWall >= 4 && vWall >= vSolo) {
                     tt.target.type = TARGET_WALL;
-                } else if (vSolo >= vWall && vSolo >= vCorner) {
+                } else if (vSolo >= vWall + 2 && vSolo >= vCorner + 2) {
                     tt.target.type = TARGET_SOLO;
                 }
 
@@ -1931,32 +1960,33 @@ public:
                 tt.target.is_visible = true;
                 tt.target.hits = tt.hits;
 
-                // Stěny: vyhlazení se zachováním stejné orientace úsečky
+                // Stěny: vyhlazení se zachováním stejné orientace úsečky a bez nechtěného nulování při výpadku
                 if (tt.target.type == TARGET_SOLO) {
-                    tt.target.wall_count = 0;
-                } else if (liveT.wall_count > 0) {
-                    if (tt.target.wall_count == liveT.wall_count) {
+                    if (stabBox.span_mm < 160.0f || stabBox.is_solo_candle || tt.solo_streak >= 5) {
+                        tt.target.wall_count = 0;
+                    }
+                } else if (tt.target.type == TARGET_CORNER) {
+                    tt.target.wall_count = 2;
+                    if (liveT.wall_count == 2) {
                         TargetDetail liveOrdered = liveT;
-                        if (liveT.wall_count == 2) {
-                            float m1_0x = (tt.target.walls[0].x1 + tt.target.walls[0].x2) * 0.5f;
-                            float m1_0y = (tt.target.walls[0].y1 + tt.target.walls[0].y2) * 0.5f;
-                            float m1_1x = (tt.target.walls[1].x1 + tt.target.walls[1].x2) * 0.5f;
-                            float m1_1y = (tt.target.walls[1].y1 + tt.target.walls[1].y2) * 0.5f;
+                        float m1_0x = (tt.target.walls[0].x1 + tt.target.walls[0].x2) * 0.5f;
+                        float m1_0y = (tt.target.walls[0].y1 + tt.target.walls[0].y2) * 0.5f;
+                        float m1_1x = (tt.target.walls[1].x1 + tt.target.walls[1].x2) * 0.5f;
+                        float m1_1y = (tt.target.walls[1].y1 + tt.target.walls[1].y2) * 0.5f;
 
-                            float m2_ax = (liveT.walls[0].x1 + liveT.walls[0].x2) * 0.5f;
-                            float m2_ay = (liveT.walls[0].y1 + liveT.walls[0].y2) * 0.5f;
-                            float m2_bx = (liveT.walls[1].x1 + liveT.walls[1].x2) * 0.5f;
-                            float m2_by = (liveT.walls[1].y1 + liveT.walls[1].y2) * 0.5f;
+                        float m2_ax = (liveT.walls[0].x1 + liveT.walls[0].x2) * 0.5f;
+                        float m2_ay = (liveT.walls[0].y1 + liveT.walls[0].y2) * 0.5f;
+                        float m2_bx = (liveT.walls[1].x1 + liveT.walls[1].x2) * 0.5f;
+                        float m2_by = (liveT.walls[1].y1 + liveT.walls[1].y2) * 0.5f;
 
-                            float dDirect = hypotf(m1_0x - m2_ax, m1_0y - m2_ay) + hypotf(m1_1x - m2_bx, m1_1y - m2_by);
-                            float dSwap   = hypotf(m1_0x - m2_bx, m1_0y - m2_by) + hypotf(m1_1x - m2_ax, m1_1y - m2_ay);
-                            if (dSwap < dDirect) {
-                                liveOrdered.walls[0] = liveT.walls[1];
-                                liveOrdered.walls[1] = liveT.walls[0];
-                            }
+                        float dDirect = hypotf(m1_0x - m2_ax, m1_0y - m2_ay) + hypotf(m1_1x - m2_bx, m1_1y - m2_by);
+                        float dSwap   = hypotf(m1_0x - m2_bx, m1_0y - m2_by) + hypotf(m1_1x - m2_ax, m1_1y - m2_ay);
+                        if (dSwap < dDirect) {
+                            liveOrdered.walls[0] = liveT.walls[1];
+                            liveOrdered.walls[1] = liveT.walls[0];
                         }
 
-                        for (int w = 0; w < liveT.wall_count; w++) {
+                        for (int w = 0; w < 2; w++) {
                             float s1x = tt.target.walls[w].x1, s1y = tt.target.walls[w].y1;
                             float e1x = tt.target.walls[w].x2, e1y = tt.target.walls[w].y2;
                             float s2x = liveOrdered.walls[w].x1, s2y = liveOrdered.walls[w].y1;
@@ -1976,13 +2006,54 @@ public:
                             tt.target.walls[w].length_mm = hypotf(tt.target.walls[w].x2 - tt.target.walls[w].x1,
                                                                  tt.target.walls[w].y2 - tt.target.walls[w].y1);
                         }
-                    } else {
-                        tt.target.wall_count = liveT.wall_count;
-                        tt.target.walls[0] = liveT.walls[0];
-                        tt.target.walls[1] = liveT.walls[1];
+                    } else if (liveT.wall_count == 1) {
+                        float m_live_x = (liveT.walls[0].x1 + liveT.walls[0].x2) * 0.5f;
+                        float m_live_y = (liveT.walls[0].y1 + liveT.walls[0].y2) * 0.5f;
+                        float m0_x = (tt.target.walls[0].x1 + tt.target.walls[0].x2) * 0.5f;
+                        float m0_y = (tt.target.walls[0].y1 + tt.target.walls[0].y2) * 0.5f;
+                        float m1_x = (tt.target.walls[1].x1 + tt.target.walls[1].x2) * 0.5f;
+                        float m1_y = (tt.target.walls[1].y1 + tt.target.walls[1].y2) * 0.5f;
+
+                        int w_idx = (hypotf(m_live_x - m1_x, m_live_y - m1_y) < hypotf(m_live_x - m0_x, m_live_y - m0_y)) ? 1 : 0;
+                        float s1x = tt.target.walls[w_idx].x1, s1y = tt.target.walls[w_idx].y1;
+                        float e1x = tt.target.walls[w_idx].x2, e1y = tt.target.walls[w_idx].y2;
+                        float s2x = liveT.walls[0].x1, s2y = liveT.walls[0].y1;
+                        float e2x = liveT.walls[0].x2, e2y = liveT.walls[0].y2;
+
+                        float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
+                        float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
+                        if (d_flip < d_same) {
+                            float tx = s2x; s2x = e2x; e2x = tx;
+                            float ty = s2y; s2y = e2y; e2y = ty;
+                        }
+                        tt.target.walls[w_idx].x1 = (1.0f - alpha) * s1x + alpha * s2x;
+                        tt.target.walls[w_idx].y1 = (1.0f - alpha) * s1y + alpha * s2y;
+                        tt.target.walls[w_idx].x2 = (1.0f - alpha) * e1x + alpha * e2x;
+                        tt.target.walls[w_idx].y2 = (1.0f - alpha) * e1y + alpha * e2y;
+                        tt.target.walls[w_idx].length_mm = hypotf(tt.target.walls[w_idx].x2 - tt.target.walls[w_idx].x1,
+                                                                 tt.target.walls[w_idx].y2 - tt.target.walls[w_idx].y1);
                     }
-                } else {
-                    tt.target.wall_count = 0;
+                } else if (tt.target.type == TARGET_WALL) {
+                    tt.target.wall_count = 1;
+                    if (liveT.wall_count >= 1) {
+                        float s1x = tt.target.walls[0].x1, s1y = tt.target.walls[0].y1;
+                        float e1x = tt.target.walls[0].x2, e1y = tt.target.walls[0].y2;
+                        float s2x = liveT.walls[0].x1, s2y = liveT.walls[0].y1;
+                        float e2x = liveT.walls[0].x2, e2y = liveT.walls[0].y2;
+
+                        float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
+                        float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
+                        if (d_flip < d_same) {
+                            float tx = s2x; s2x = e2x; e2x = tx;
+                            float ty = s2y; s2y = e2y; e2y = ty;
+                        }
+                        tt.target.walls[0].x1 = (1.0f - alpha) * s1x + alpha * s2x;
+                        tt.target.walls[0].y1 = (1.0f - alpha) * s1y + alpha * s2y;
+                        tt.target.walls[0].x2 = (1.0f - alpha) * e1x + alpha * e2x;
+                        tt.target.walls[0].y2 = (1.0f - alpha) * e1y + alpha * e2y;
+                        tt.target.walls[0].length_mm = hypotf(tt.target.walls[0].x2 - tt.target.walls[0].x1,
+                                                             tt.target.walls[0].y2 - tt.target.walls[0].y1);
+                    }
                 }
             } else {
                 int emptyIdx = -1;
