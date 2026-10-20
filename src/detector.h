@@ -1923,50 +1923,39 @@ public:
                 matchedTracked[bestIdx] = true;
 
                 float d_sensor = hypotf(liveT.candle_x, liveT.candle_y);
-                if (d_sensor < tt.best_dist_mm) {
-                    tt.best_dist_mm = d_sensor;
-                }
+                // Pravidlo ZBLÍZKA VÍME NEJLÍP:
+                // Aktualizujeme a zpřesňujeme cíl POUZE tehdy, pokud:
+                // a) jsme v úvodní fázi ustálení (prvních 6 snímků)
+                // b) nebo stojíme k cíli BLÍŽ než kdykoliv předtím (+ malá hystereze 35 mm na šum)
+                bool is_closer = (d_sensor < tt.best_dist_mm + 35.0f);
+                bool is_warmup = (tt.hits <= 6);
 
-                // Pokud jsme k cíli blízko (< 950 mm), měření má nejvyšší spolehlivost
-                if (d_sensor < 950.0f) {
-                    tt.close_hits++;
-                    if ((liveT.type == TARGET_CORNER || liveT.type == TARGET_WALL) && tt.close_hits >= 3) {
-                        tt.has_close_lock = true;
+                if (is_warmup || is_closer) {
+                    if (d_sensor < tt.best_dist_mm) {
+                        tt.best_dist_mm = d_sensor;
                     }
-                }
 
-                if (liveT.type == TARGET_SOLO) {
-                    tt.solo_streak++;
-                } else {
-                    tt.solo_streak = 0;
-                }
+                    if (liveT.type == TARGET_SOLO) {
+                        tt.solo_streak++;
+                    } else {
+                        tt.solo_streak = 0;
+                    }
 
-                // Útlum staré historie hlasů (aby živý majoritní stav okamžitě převážil a starý šum nezůstal viset)
-                int totalVotes = tt.type_votes[0] + tt.type_votes[1] + tt.type_votes[2];
-                if (totalVotes >= 14) {
-                    tt.type_votes[0] /= 2;
-                    tt.type_votes[1] /= 2;
-                    tt.type_votes[2] /= 2;
-                }
-                tt.type_votes[liveT.type]++;
+                    int totalVotes = tt.type_votes[0] + tt.type_votes[1] + tt.type_votes[2];
+                    if (totalVotes >= 14) {
+                        tt.type_votes[0] /= 2; tt.type_votes[1] /= 2; tt.type_votes[2] /= 2;
+                    }
+                    tt.type_votes[liveT.type]++;
 
-                // Typ určíme podle většinového hlasování (pokud má SOLO většinu, cíl je SOLO!)
-                int vSolo = tt.type_votes[TARGET_SOLO];
-                int vWall = tt.type_votes[TARGET_WALL];
-                int vCorner = tt.type_votes[TARGET_CORNER];
+                    int vSolo = tt.type_votes[TARGET_SOLO];
+                    int vWall = tt.type_votes[TARGET_WALL];
+                    int vCorner = tt.type_votes[TARGET_CORNER];
 
-                // PRAVIDLO "ZBLÍZKA VÍME NEJLÍP":
-                // Pokud už byl cíl zblízka důkladně prozkoumán a potvrzen jako STĚNA nebo ROH,
-                // vzdálené měření z dálky (> 1050 mm) ho NIKDY nesmí ponížit na sólo svíčku!
-                if (tt.has_close_lock && d_sensor > 1050.0f) {
-                    tt.target.type = tt.best_target.type;
-                    tt.solo_streak = 0;
-                } else {
                     if (tt.hits <= 2) {
                         tt.target.type = liveT.type;
-                    } else if (vCorner >= 4 && vCorner >= vWall && vCorner >= vSolo) {
+                    } else if (vCorner >= 3 && vCorner >= vWall && vCorner >= vSolo) {
                         tt.target.type = TARGET_CORNER;
-                    } else if (vWall >= 4 && vWall >= vSolo) {
+                    } else if (vWall >= 3 && vWall >= vSolo) {
                         tt.target.type = TARGET_WALL;
                     } else if (vSolo >= vWall + 2 && vSolo >= vCorner + 2) {
                         tt.target.type = TARGET_SOLO;
@@ -1975,56 +1964,83 @@ public:
                     if (stabBox.span_mm < 160.0f || stabBox.is_solo_candle) {
                         tt.target.type = TARGET_SOLO;
                     }
-                }
 
-                const float alpha = 0.15f;
-                tt.target.box = stabBox;
-                tt.target.candle_x = (1.0f - alpha) * tt.target.candle_x + alpha * liveT.candle_x;
-                tt.target.candle_y = (1.0f - alpha) * tt.target.candle_y + alpha * liveT.candle_y;
-                tt.target.waypoint_x = (1.0f - alpha) * tt.target.waypoint_x + alpha * liveT.waypoint_x;
-                tt.target.waypoint_y = (1.0f - alpha) * tt.target.waypoint_y + alpha * liveT.waypoint_y;
-                tt.target.approach_dx = (1.0f - alpha) * tt.target.approach_dx + alpha * liveT.approach_dx;
-                tt.target.approach_dy = (1.0f - alpha) * tt.target.approach_dy + alpha * liveT.approach_dy;
-                float aLen = hypotf(tt.target.approach_dx, tt.target.approach_dy);
-                if (aLen > 0.01f) {
-                    tt.target.approach_dx /= aLen;
-                    tt.target.approach_dy /= aLen;
-                }
-                tt.target.travel_dist_mm = hypotf(tt.target.waypoint_x, tt.target.waypoint_y);
-                tt.target.is_visible = true;
-                tt.target.hits = tt.hits;
-
-                // Stěny: vyhlazení se zachováním stejné orientace úsečky a bez nechtěného nulování při výpadku
-                if (tt.target.type == TARGET_SOLO) {
-                    if (stabBox.span_mm < 160.0f || stabBox.is_solo_candle || tt.solo_streak >= 5) {
-                        tt.target.wall_count = 0;
+                    const float alpha = 0.18f;
+                    tt.target.box = stabBox;
+                    tt.target.candle_x = (1.0f - alpha) * tt.target.candle_x + alpha * liveT.candle_x;
+                    tt.target.candle_y = (1.0f - alpha) * tt.target.candle_y + alpha * liveT.candle_y;
+                    tt.target.waypoint_x = (1.0f - alpha) * tt.target.waypoint_x + alpha * liveT.waypoint_x;
+                    tt.target.waypoint_y = (1.0f - alpha) * tt.target.waypoint_y + alpha * liveT.waypoint_y;
+                    tt.target.approach_dx = (1.0f - alpha) * tt.target.approach_dx + alpha * liveT.approach_dx;
+                    tt.target.approach_dy = (1.0f - alpha) * tt.target.approach_dy + alpha * liveT.approach_dy;
+                    float aLen = hypotf(tt.target.approach_dx, tt.target.approach_dy);
+                    if (aLen > 0.01f) {
+                        tt.target.approach_dx /= aLen;
+                        tt.target.approach_dy /= aLen;
                     }
-                } else if (tt.target.type == TARGET_CORNER) {
-                    tt.target.wall_count = 2;
-                    if (liveT.wall_count == 2) {
-                        TargetDetail liveOrdered = liveT;
-                        float m1_0x = (tt.target.walls[0].x1 + tt.target.walls[0].x2) * 0.5f;
-                        float m1_0y = (tt.target.walls[0].y1 + tt.target.walls[0].y2) * 0.5f;
-                        float m1_1x = (tt.target.walls[1].x1 + tt.target.walls[1].x2) * 0.5f;
-                        float m1_1y = (tt.target.walls[1].y1 + tt.target.walls[1].y2) * 0.5f;
+                    tt.target.travel_dist_mm = hypotf(tt.target.waypoint_x, tt.target.waypoint_y);
+                    tt.target.is_visible = true;
+                    tt.target.hits = tt.hits;
 
-                        float m2_ax = (liveT.walls[0].x1 + liveT.walls[0].x2) * 0.5f;
-                        float m2_ay = (liveT.walls[0].y1 + liveT.walls[0].y2) * 0.5f;
-                        float m2_bx = (liveT.walls[1].x1 + liveT.walls[1].x2) * 0.5f;
-                        float m2_by = (liveT.walls[1].y1 + liveT.walls[1].y2) * 0.5f;
-
-                        float dDirect = hypotf(m1_0x - m2_ax, m1_0y - m2_ay) + hypotf(m1_1x - m2_bx, m1_1y - m2_by);
-                        float dSwap   = hypotf(m1_0x - m2_bx, m1_0y - m2_by) + hypotf(m1_1x - m2_ax, m1_1y - m2_ay);
-                        if (dSwap < dDirect) {
-                            liveOrdered.walls[0] = liveT.walls[1];
-                            liveOrdered.walls[1] = liveT.walls[0];
+                    // Stěny: vyhlazení se zachováním stejné orientace úsečky
+                    if (tt.target.type == TARGET_SOLO) {
+                        if (stabBox.span_mm < 160.0f || stabBox.is_solo_candle) {
+                            tt.target.wall_count = 0;
                         }
+                    } else if (tt.target.type == TARGET_CORNER) {
+                        tt.target.wall_count = 2;
+                        if (liveT.wall_count == 2) {
+                            TargetDetail liveOrdered = liveT;
+                            float m1_0x = (tt.target.walls[0].x1 + tt.target.walls[0].x2) * 0.5f;
+                            float m1_0y = (tt.target.walls[0].y1 + tt.target.walls[0].y2) * 0.5f;
+                            float m1_1x = (tt.target.walls[1].x1 + tt.target.walls[1].x2) * 0.5f;
+                            float m1_1y = (tt.target.walls[1].y1 + tt.target.walls[1].y2) * 0.5f;
 
-                        for (int w = 0; w < 2; w++) {
-                            float s1x = tt.target.walls[w].x1, s1y = tt.target.walls[w].y1;
-                            float e1x = tt.target.walls[w].x2, e1y = tt.target.walls[w].y2;
-                            float s2x = liveOrdered.walls[w].x1, s2y = liveOrdered.walls[w].y1;
-                            float e2x = liveOrdered.walls[w].x2, e2y = liveOrdered.walls[w].y2;
+                            float m2_ax = (liveT.walls[0].x1 + liveT.walls[0].x2) * 0.5f;
+                            float m2_ay = (liveT.walls[0].y1 + liveT.walls[0].y2) * 0.5f;
+                            float m2_bx = (liveT.walls[1].x1 + liveT.walls[1].x2) * 0.5f;
+                            float m2_by = (liveT.walls[1].y1 + liveT.walls[1].y2) * 0.5f;
+
+                            float dDirect = hypotf(m1_0x - m2_ax, m1_0y - m2_ay) + hypotf(m1_1x - m2_bx, m1_1y - m2_by);
+                            float dSwap   = hypotf(m1_0x - m2_bx, m1_0y - m2_by) + hypotf(m1_1x - m2_ax, m1_1y - m2_ay);
+                            if (dSwap < dDirect) {
+                                liveOrdered.walls[0] = liveT.walls[1];
+                                liveOrdered.walls[1] = liveT.walls[0];
+                            }
+
+                            for (int w = 0; w < 2; w++) {
+                                float s1x = tt.target.walls[w].x1, s1y = tt.target.walls[w].y1;
+                                float e1x = tt.target.walls[w].x2, e1y = tt.target.walls[w].y2;
+                                float s2x = liveOrdered.walls[w].x1, s2y = liveOrdered.walls[w].y1;
+                                float e2x = liveOrdered.walls[w].x2, e2y = liveOrdered.walls[w].y2;
+
+                                float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
+                                float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
+                                if (d_flip < d_same) {
+                                    float tx = s2x; s2x = e2x; e2x = tx;
+                                    float ty = s2y; s2y = e2y; e2y = ty;
+                                }
+
+                                tt.target.walls[w].x1 = (1.0f - alpha) * s1x + alpha * s2x;
+                                tt.target.walls[w].y1 = (1.0f - alpha) * s1y + alpha * s2y;
+                                tt.target.walls[w].x2 = (1.0f - alpha) * e1x + alpha * e2x;
+                                tt.target.walls[w].y2 = (1.0f - alpha) * e1y + alpha * e2y;
+                                tt.target.walls[w].length_mm = hypotf(tt.target.walls[w].x2 - tt.target.walls[w].x1,
+                                                                     tt.target.walls[w].y2 - tt.target.walls[w].y1);
+                            }
+                        } else if (liveT.wall_count == 1 && tt.target.walls[0].length_mm > 0.0f) {
+                            float m_live_x = (liveT.walls[0].x1 + liveT.walls[0].x2) * 0.5f;
+                            float m_live_y = (liveT.walls[0].y1 + liveT.walls[0].y2) * 0.5f;
+                            float m0_x = (tt.target.walls[0].x1 + tt.target.walls[0].x2) * 0.5f;
+                            float m0_y = (tt.target.walls[0].y1 + tt.target.walls[0].y2) * 0.5f;
+                            float m1_x = (tt.target.walls[1].x1 + tt.target.walls[1].x2) * 0.5f;
+                            float m1_y = (tt.target.walls[1].y1 + tt.target.walls[1].y2) * 0.5f;
+
+                            int w_idx = (hypotf(m_live_x - m1_x, m_live_y - m1_y) < hypotf(m_live_x - m0_x, m_live_y - m0_y)) ? 1 : 0;
+                            float s1x = tt.target.walls[w_idx].x1, s1y = tt.target.walls[w_idx].y1;
+                            float e1x = tt.target.walls[w_idx].x2, e1y = tt.target.walls[w_idx].y2;
+                            float s2x = liveT.walls[0].x1, s2y = liveT.walls[0].y1;
+                            float e2x = liveT.walls[0].x2, e2y = liveT.walls[0].y2;
 
                             float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
                             float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
@@ -2032,75 +2048,43 @@ public:
                                 float tx = s2x; s2x = e2x; e2x = tx;
                                 float ty = s2y; s2y = e2y; e2y = ty;
                             }
-
-                            tt.target.walls[w].x1 = (1.0f - alpha) * s1x + alpha * s2x;
-                            tt.target.walls[w].y1 = (1.0f - alpha) * s1y + alpha * s2y;
-                            tt.target.walls[w].x2 = (1.0f - alpha) * e1x + alpha * e2x;
-                            tt.target.walls[w].y2 = (1.0f - alpha) * e1y + alpha * e2y;
-                            tt.target.walls[w].length_mm = hypotf(tt.target.walls[w].x2 - tt.target.walls[w].x1,
-                                                                 tt.target.walls[w].y2 - tt.target.walls[w].y1);
+                            tt.target.walls[w_idx].x1 = (1.0f - alpha) * s1x + alpha * s2x;
+                            tt.target.walls[w_idx].y1 = (1.0f - alpha) * s1y + alpha * s2y;
+                            tt.target.walls[w_idx].x2 = (1.0f - alpha) * e1x + alpha * e2x;
+                            tt.target.walls[w_idx].y2 = (1.0f - alpha) * e1y + alpha * e2y;
+                            tt.target.walls[w_idx].length_mm = hypotf(tt.target.walls[w_idx].x2 - tt.target.walls[w_idx].x1,
+                                                                     tt.target.walls[w_idx].y2 - tt.target.walls[w_idx].y1);
                         }
-                    } else if (liveT.wall_count == 1) {
-                        float m_live_x = (liveT.walls[0].x1 + liveT.walls[0].x2) * 0.5f;
-                        float m_live_y = (liveT.walls[0].y1 + liveT.walls[0].y2) * 0.5f;
-                        float m0_x = (tt.target.walls[0].x1 + tt.target.walls[0].x2) * 0.5f;
-                        float m0_y = (tt.target.walls[0].y1 + tt.target.walls[0].y2) * 0.5f;
-                        float m1_x = (tt.target.walls[1].x1 + tt.target.walls[1].x2) * 0.5f;
-                        float m1_y = (tt.target.walls[1].y1 + tt.target.walls[1].y2) * 0.5f;
+                    } else if (tt.target.type == TARGET_WALL) {
+                        tt.target.wall_count = 1;
+                        if (liveT.wall_count >= 1) {
+                            float s1x = tt.target.walls[0].x1, s1y = tt.target.walls[0].y1;
+                            float e1x = tt.target.walls[0].x2, e1y = tt.target.walls[0].y2;
+                            float s2x = liveT.walls[0].x1, s2y = liveT.walls[0].y1;
+                            float e2x = liveT.walls[0].x2, e2y = liveT.walls[0].y2;
 
-                        int w_idx = (hypotf(m_live_x - m1_x, m_live_y - m1_y) < hypotf(m_live_x - m0_x, m_live_y - m0_y)) ? 1 : 0;
-                        float s1x = tt.target.walls[w_idx].x1, s1y = tt.target.walls[w_idx].y1;
-                        float e1x = tt.target.walls[w_idx].x2, e1y = tt.target.walls[w_idx].y2;
-                        float s2x = liveT.walls[0].x1, s2y = liveT.walls[0].y1;
-                        float e2x = liveT.walls[0].x2, e2y = liveT.walls[0].y2;
-
-                        float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
-                        float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
-                        if (d_flip < d_same) {
-                            float tx = s2x; s2x = e2x; e2x = tx;
-                            float ty = s2y; s2y = e2y; e2y = ty;
+                            float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
+                            float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
+                            if (d_flip < d_same) {
+                                float tx = s2x; s2x = e2x; e2x = tx;
+                                float ty = s2y; s2y = e2y; e2y = ty;
+                            }
+                            tt.target.walls[0].x1 = (1.0f - alpha) * s1x + alpha * s2x;
+                            tt.target.walls[0].y1 = (1.0f - alpha) * s1y + alpha * s2y;
+                            tt.target.walls[0].x2 = (1.0f - alpha) * e1x + alpha * e2x;
+                            tt.target.walls[0].y2 = (1.0f - alpha) * e1y + alpha * e2y;
+                            tt.target.walls[0].length_mm = hypotf(tt.target.walls[0].x2 - tt.target.walls[0].x1,
+                                                                 tt.target.walls[0].y2 - tt.target.walls[0].y1);
                         }
-                        tt.target.walls[w_idx].x1 = (1.0f - alpha) * s1x + alpha * s2x;
-                        tt.target.walls[w_idx].y1 = (1.0f - alpha) * s1y + alpha * s2y;
-                        tt.target.walls[w_idx].x2 = (1.0f - alpha) * e1x + alpha * e2x;
-                        tt.target.walls[w_idx].y2 = (1.0f - alpha) * e1y + alpha * e2y;
-                        tt.target.walls[w_idx].length_mm = hypotf(tt.target.walls[w_idx].x2 - tt.target.walls[w_idx].x1,
-                                                                 tt.target.walls[w_idx].y2 - tt.target.walls[w_idx].y1);
-                    } else if (tt.has_close_lock && d_sensor > 1050.0f) {
-                        // Z dálky stěna rohu vypadla, ale zblízka víme, že tam je!
-                        tt.target.wall_count = tt.best_target.wall_count;
-                        tt.target.walls[0] = tt.best_target.walls[0];
-                        tt.target.walls[1] = tt.best_target.walls[1];
                     }
-                } else if (tt.target.type == TARGET_WALL) {
-                    tt.target.wall_count = 1;
-                    if (liveT.wall_count >= 1) {
-                        float s1x = tt.target.walls[0].x1, s1y = tt.target.walls[0].y1;
-                        float e1x = tt.target.walls[0].x2, e1y = tt.target.walls[0].y2;
-                        float s2x = liveT.walls[0].x1, s2y = liveT.walls[0].y1;
-                        float e2x = liveT.walls[0].x2, e2y = liveT.walls[0].y2;
 
-                        float d_same = hypotf(s1x - s2x, s1y - s2y) + hypotf(e1x - e2x, e1y - e2y);
-                        float d_flip = hypotf(s1x - e2x, s1y - e2y) + hypotf(e1x - s2x, e1y - s2y);
-                        if (d_flip < d_same) {
-                            float tx = s2x; s2x = e2x; e2x = tx;
-                            float ty = s2y; s2y = e2y; e2y = ty;
-                        }
-                        tt.target.walls[0].x1 = (1.0f - alpha) * s1x + alpha * s2x;
-                        tt.target.walls[0].y1 = (1.0f - alpha) * s1y + alpha * s2y;
-                        tt.target.walls[0].x2 = (1.0f - alpha) * e1x + alpha * e2x;
-                        tt.target.walls[0].y2 = (1.0f - alpha) * e1y + alpha * e2y;
-                        tt.target.walls[0].length_mm = hypotf(tt.target.walls[0].x2 - tt.target.walls[0].x1,
-                                                             tt.target.walls[0].y2 - tt.target.walls[0].y1);
-                    } else if (tt.has_close_lock && d_sensor > 1050.0f) {
-                        // Z dálky stěna vypadla, ale zblízka víme, že tam je!
-                        tt.target.wall_count = tt.best_target.wall_count;
-                        tt.target.walls[0] = tt.best_target.walls[0];
-                    }
-                }
-
-                if (tt.has_close_lock && d_sensor < 950.0f) {
+                    // Zaznamenáme si nejlepší dosavadní obraz
                     tt.best_target = tt.target;
+                } else {
+                    // ODDÁLILI JSME SE OD CÍLE -> ZMRAZIT!
+                    // Žádné přeposílání horší geometrie, cíl zůstává přesně z nejlepšího měření zblízka
+                    tt.target = tt.best_target;
+                    tt.target.is_visible = true;
                 }
             } else {
                 int emptyIdx = -1;
@@ -2112,7 +2096,7 @@ public:
                     tt.target = liveT;
                     tt.best_target = liveT;
                     tt.best_dist_mm = hypotf(liveT.candle_x, liveT.candle_y);
-                    tt.close_hits = (tt.best_dist_mm < 950.0f) ? 1 : 0;
+                    tt.close_hits = 1;
                     tt.has_close_lock = false;
                     tt.hits = 1;
                     tt.missed = 0;
@@ -2128,7 +2112,8 @@ public:
             if (_trackedTargets[j].active && !matchedTracked[j]) {
                 _trackedTargets[j].missed++;
                 _trackedTargets[j].target.is_visible = false;
-                if (_trackedTargets[j].missed > 20) {
+                // Zastíněné cíle z mapy NIKDY nemizí, pokud již byly spolehlivě potvrzeny (hits >= 4)
+                if (_trackedTargets[j].hits < 4 && _trackedTargets[j].missed > 15) {
                     _trackedTargets[j].active = false;
                 }
             }
@@ -2176,7 +2161,7 @@ public:
         int poolCount = 0;
 
         for (int i = 0; i < MAX_TRACKED_BOXES; i++) {
-            if (_trackedTargets[i].active && _trackedTargets[i].hits >= minHits && _trackedTargets[i].missed <= 3) {
+            if (_trackedTargets[i].active && _trackedTargets[i].hits >= minHits) {
                 // Svíčka musí ležet před robotem v poli (Y >= 30 mm)
                 if (_trackedTargets[i].target.candle_y >= 30.0f) {
                     pool[poolCount] = _trackedTargets[i].target;

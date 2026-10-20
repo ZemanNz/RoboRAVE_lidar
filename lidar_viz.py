@@ -624,98 +624,160 @@ class GlobalFieldMap:
             if len(self.trajectory) > 600:
                 self.trajectory.pop(0)
 
-    def ingest_boxes(self, boxes, rx, ry, rdeg):
+    def ingest_targets(self, incoming_targets, rx, ry):
         """
-        Převezme Bounding Boxy z aktuálního skenu a transformuje je do souřadnic hřiště.
-        - Spáruje známé cíle (aktualizuje EMA polohu).
-        - Přidá nově objevené cíle (doplňování při pohybu robota).
-        - Zastíněné cíle nezahazuje, ale ponechává je s označením [ZASTÍNĚNÝ].
+        Monotónně zpřesňující statická mapa hřiště (Pravidlo: ZBLÍZKA VIDÍME LÍP):
+        - Každý cíl si pamatuje svou nejlepší zaznamenanou vzdálenost od robota (best_view_dist_mm).
+        - Překreslování/aktualizace probíhá POUZE tehdy, když je robot k dané svíčce BLÍŽE než kdykoliv předtím
+          (nebo v úvodních snímcích ustálení).
+        - Pokud se robot od svíčky oddálí, model v mapě se ZCELA ZMRAZÍ a již se nepřekresluje horšími daty.
+        - Zastíněné cíle z mapy NIKDY nemizí (označí se jako zastíněné [Z]).
         """
         self.total_updates += 1
         xmin, xmax, ymin, ymax = self.get_auto_field_bounds()
-        margin = 40.0 # Ochranný okraj od mantinelu
+        margin = 40.0
 
-        heading_rad = math.radians(rdeg)
-        cos_h = math.cos(heading_rad)
-        sin_h = math.sin(heading_rad)
-
-        # 1. Transformace aktuálních boxů do souřadnic hřiště
-        curr_transformed = []
-        rejected = 0
-        for b in boxes:
-            cx, cy = b['cx'], b['cy']
-            wx = rx + cx * cos_h + cy * sin_h
-            wy = ry - cx * sin_h + cy * cos_h
-
-            # Kontrola hranic pole: co leží vně mantinelu, je falešný odraz
-            if (xmin + margin <= wx <= xmax - margin) and (ymin + margin <= wy <= ymax - margin):
-                curr_transformed.append({
-                    'wx': wx, 'wy': wy,
-                    'width': b['width'], 'height': b['height'],
-                    'span_mm': b['span_mm'],
-                    'is_solo': b['is_solo'],
-                    'pts_count': b['pts_count']
-                })
-            else:
-                rejected += 1
-
-        self.rejected_outside_count = rejected
-
-        # 2. Označení všech dosavadních cílů jako prozatím neviděných v tomto snímku
         for t in self.targets:
             t['is_visible'] = False
 
-        # 3. Párování a doplňování cílů
         matched_target_idxs = set()
-        for cb in curr_transformed:
-            best_idx = -1
-            best_d = 280.0 # Tolerance párování v mm
 
-            for idx, t in enumerate(self.targets):
+        for inc in incoming_targets:
+            c_pos = inc['candle_world']
+            if not (xmin - margin <= c_pos[0] <= xmax + margin and ymin - margin <= c_pos[1] <= ymax + margin):
+                continue
+            if c_pos[1] < 20.0:
+                continue
+
+            d_curr = math.hypot(c_pos[0] - rx, c_pos[1] - ry)
+
+            best_idx = -1
+            best_d = 280.0
+            for idx, ex_t in enumerate(self.targets):
                 if idx in matched_target_idxs: continue
-                d = math.hypot(t['x'] - cb['wx'], t['y'] - cb['wy'])
-                if d < best_d:
-                    best_d = d
+                d_match = math.hypot(ex_t['candle_world'][0] - c_pos[0], ex_t['candle_world'][1] - c_pos[1])
+                if d_match < best_d:
+                    best_d = d_match
                     best_idx = idx
 
             if best_idx >= 0:
-                # Nalezena shoda -> vyhlazení polohy a rozměrů
                 t = self.targets[best_idx]
-                alpha = 0.15
-                t['x'] = (1.0 - alpha) * t['x'] + alpha * cb['wx']
-                t['y'] = (1.0 - alpha) * t['y'] + alpha * cb['wy']
-                t['width'] = (1.0 - alpha) * t['width'] + alpha * cb['width']
-                t['height'] = (1.0 - alpha) * t['height'] + alpha * cb['height']
-                t['span_mm'] = math.hypot(t['width'], t['height'])
+                matched_target_idxs.add(best_idx)
                 t['hits'] += 1
                 t['is_visible'] = True
-                t['is_solo'] = cb['is_solo']
                 t['status'] = "VIDITELNÝ"
-                matched_target_idxs.add(best_idx)
+
+                # PRAVIDLO: ZBLÍZKA VIDÍME LÍP
+                is_closer = (d_curr < t.get('best_view_dist_mm', 99999.0) + 35.0)
+                is_warmup = (t['hits'] <= 6)
+
+                if is_warmup or is_closer:
+                    if d_curr < t.get('best_view_dist_mm', 99999.0):
+                        t['best_view_dist_mm'] = d_curr
+
+                    alpha = 0.18
+                    t['candle_world'] = (
+                        (1.0 - alpha) * t['candle_world'][0] + alpha * c_pos[0],
+                        (1.0 - alpha) * t['candle_world'][1] + alpha * c_pos[1]
+                    )
+                    t['x'] = t['candle_world'][0]
+                    t['y'] = t['candle_world'][1]
+
+                    inc_type = inc.get('type', 'SOLO')
+                    if inc_type in ('ROH', 'CORNER'): inc_type = 'CORNER'
+                    elif inc_type in ('STĚNA', 'WALL'): inc_type = 'WALL'
+                    else: inc_type = 'SOLO'
+
+                    if t.get('type') == 'CORNER' and inc_type != 'CORNER' and not is_warmup:
+                        pass
+                    else:
+                        t['type'] = inc_type
+
+                    inc_walls = inc.get('walls_world', [])
+                    if len(inc_walls) >= 1:
+                        t['walls_world'] = list(inc_walls)
+                    elif t['type'] == 'SOLO' and is_warmup:
+                        t['walls_world'] = []
+
+                    t['waypoint_world'] = inc.get('waypoint_world', t.get('waypoint_world', (t['x'], t['y'] + 380.0)))
+                    t['approach_dir'] = inc.get('approach_dir', t.get('approach_dir', (0.0, -1.0)))
+
+                    inc_box = inc.get('box', {})
+                    if inc_box:
+                        t['box'] = inc_box
+                        t['width'] = inc_box.get('width', t.get('width', 300.0))
+                        t['height'] = inc_box.get('height', t.get('height', 300.0))
+                        t['span_mm'] = inc_box.get('span_mm', t.get('span_mm', 300.0))
+
+                    t['is_solo'] = (t['type'] == 'SOLO')
+                    t['is_corner'] = (t['type'] == 'CORNER')
+
+                t['dist_from_robot'] = math.hypot(t['candle_world'][0] - rx, t['candle_world'][1] - ry)
+                t['dist_from_start'] = math.hypot(t['candle_world'][0], t['candle_world'][1])
+
             else:
-                # Nový cíl -> kontrola minimálního rozestupu od stávajících cílů (min 600 mm)
-                too_close = any(math.hypot(cb['wx'] - t['x'], cb['wy'] - t['y']) < 600.0 for t in self.targets)
+                too_close = any(math.hypot(c_pos[0] - ex_t['candle_world'][0], c_pos[1] - ex_t['candle_world'][1]) < 480.0 for ex_t in self.targets)
                 if not too_close and len(self.targets) < 4:
-                    new_target = {
-                        'x': cb['wx'], 'y': cb['wy'],
-                        'width': cb['width'], 'height': cb['height'],
-                        'span_mm': cb['span_mm'],
+                    inc_type = inc.get('type', 'SOLO')
+                    if inc_type in ('ROH', 'CORNER'): inc_type = 'CORNER'
+                    elif inc_type in ('STĚNA', 'WALL'): inc_type = 'WALL'
+                    else: inc_type = 'SOLO'
+
+                    inc_box = inc.get('box', {})
+                    w = inc_box.get('width', 300.0) if inc_box else 300.0
+                    h = inc_box.get('height', 300.0) if inc_box else 300.0
+                    sp = inc_box.get('span_mm', 300.0) if inc_box else 300.0
+
+                    new_t = {
+                        'id': len(self.targets) + 1,
+                        'x': c_pos[0],
+                        'y': c_pos[1],
+                        'candle_world': c_pos,
+                        'walls_world': list(inc.get('walls_world', [])),
+                        'waypoint_world': inc.get('waypoint_world', (c_pos[0], c_pos[1] + 380.0)),
+                        'approach_dir': inc.get('approach_dir', (0.0, -1.0)),
+                        'box': inc_box,
+                        'width': w,
+                        'height': h,
+                        'span_mm': sp,
+                        'type': inc_type,
+                        'is_solo': (inc_type == 'SOLO'),
+                        'is_corner': (inc_type == 'CORNER'),
+                        'best_view_dist_mm': d_curr,
                         'hits': 1,
                         'is_visible': True,
-                        'is_solo': cb['is_solo'],
-                        'status': "VIDITELNÝ"
+                        'status': "VIDITELNÝ",
+                        'dist_from_robot': d_curr,
+                        'dist_from_start': math.hypot(c_pos[0], c_pos[1])
                     }
-                    self.targets.append(new_target)
+                    self.targets.append(new_t)
                     matched_target_idxs.add(len(self.targets) - 1)
 
-        # 4. Pro cíle, které nebyly v tomto skenu spatřeny (zastíněné):
-        for idx, t in enumerate(self.targets):
+        for t in self.targets:
             if not t['is_visible']:
                 t['status'] = "ZASTÍNĚNÝ / ZNÁMÝ"
+                t['dist_from_robot'] = math.hypot(t['candle_world'][0] - rx, t['candle_world'][1] - ry)
+                t['dist_from_start'] = math.hypot(t['candle_world'][0], t['candle_world'][1])
 
-            # Vzdálenost od aktuální pozice robota
-            t['dist_from_robot'] = math.hypot(t['x'] - rx, t['y'] - ry)
-            t['dist_from_start'] = math.hypot(t['x'], t['y'])
+    def ingest_boxes(self, boxes, rx, ry, rdeg):
+        """Fallback pro kompatibilitu s čistými boxy."""
+        th_rad = math.radians(rdeg)
+        cos_t = math.cos(th_rad)
+        sin_t = math.sin(th_rad)
+        sim_targets = []
+        for b in boxes:
+            cx, cy = b['cx'], b['cy']
+            wx = rx + cx * cos_t + cy * sin_t
+            wy = ry - cx * sin_t + cy * cos_t
+            sim_targets.append({
+                'candle_world': (wx, wy),
+                'walls_world': [],
+                'waypoint_world': (wx, wy + 380.0),
+                'approach_dir': (0.0, -1.0),
+                'box': b,
+                'type': 'SOLO' if b.get('is_solo', False) else 'WALL'
+            })
+        self.ingest_targets(sim_targets, rx, ry)
 
     def get_field_targets(self):
         """Vrátí potvrzené cíle hřiště (seřazené podle vzdálenosti od startu)."""
@@ -1598,23 +1660,25 @@ class DualLidarVisualizer:
 
             active_b = self.processed_boxes
 
-            # Pokud ještě není zamčeno [L], průběžně aktualizujeme globální model z pozice START=[0,0]
-            if not self.localizer.locked:
-                if active_b:
-                    self.field_map.ingest_boxes(active_b, 0.0, 0.0, 0.0)
-            else:
-                # Po zamknutí provádíme lokalizaci robota podle aktuálních boxů
+            # Lokalizace robota podle známých boxů
+            if self.localizer.locked:
                 if len(active_b) >= 2:
                     self.localizer.estimate_pose(active_b)
-
                 loc = self.localizer
-                if loc.pose_confidence > 0.3 and len(active_b) >= 1:
-                    # Kumulativní plnění hřiště a zachování/doplnění cílů
-                    self.field_map.ingest_boxes(active_b, loc.robot_x, loc.robot_y, loc.robot_deg)
+                if loc.pose_confidence > 0.3:
                     self.field_map.update_robot_pose(loc.robot_x, loc.robot_y, loc.robot_deg)
 
             # Průběžná aktualizace detailů stěn, svíček a nájezdových bodů (ze startu i za jízdy)
             self.update_current_details()
+
+            # Krmení statické kumulativní mapy celého hřiště (Pravidlo: Zblízka víme líp!)
+            loc = self.localizer
+            rx = loc.robot_x if loc.locked else 0.0
+            ry = loc.robot_y if loc.locked else 0.0
+            if self.current_box_details:
+                self.field_map.ingest_targets(self.current_box_details, rx, ry)
+            elif active_b:
+                self.field_map.ingest_boxes(active_b, rx, ry, loc.robot_deg if loc.locked else 0.0)
 
     def update_current_details(self):
         """Aktualizuje stěny, svíčky a nájezdové waypointy pro všechny aktivní boxy."""
@@ -2337,104 +2401,62 @@ class DualLidarVisualizer:
             tip_y = int(rob_sy - 14 * math.cos(h_rad))
             pygame.draw.line(self.screen, (255, 120, 220), (rob_sx, rob_sy), (tip_x, tip_y), 2)
 
-        # Trasa hašení svíček (optimalizované pořadí)
-        route = []
-        if self.esp_route and self.current_box_details:
-            id_map = {det.get('id', idx + 1): det for idx, det in enumerate(self.current_box_details)}
-            for rid in self.esp_route:
-                if rid in id_map:
-                    det = id_map[rid]
-                    route.append({
-                        'id': det.get('id', rid),
-                        'type': det.get('type', 'CÍL'),
-                        'x': det['candle_world'][0],
-                        'y': det['candle_world'][1],
-                        'waypoint_x': det['waypoint_world'][0],
-                        'waypoint_y': det['waypoint_world'][1],
-                        'dist_from_robot': det.get('travel_dist_mm', 0.0),
-                        'is_visible': True,
-                        'is_solo': det.get('is_solo', False)
-                    })
-        # Doplníme zbývající potvrzené cíle z pole
-        if self.current_box_details and len(route) < len(self.current_box_details):
-            existing_ids = {r.get('id') for r in route}
-            for idx, det in enumerate(self.current_box_details):
-                did = det.get('id', idx + 1)
-                if did not in existing_ids:
-                    route.append({
-                        'id': did,
-                        'type': det.get('type', 'CÍL'),
-                        'x': det['candle_world'][0],
-                        'y': det['candle_world'][1],
-                        'waypoint_x': det['waypoint_world'][0],
-                        'waypoint_y': det['waypoint_world'][1],
-                        'dist_from_robot': det.get('travel_dist_mm', 0.0),
-                        'is_visible': True,
-                        'is_solo': det.get('is_solo', False)
-                    })
-        if not route:
-            route = fm.compute_extinguish_route()
-
+        # Trasa hašení svíček (optimalizované pořadí ze statické mapy)
+        route = fm.compute_extinguish_route()
         # Bezpečnostní filtr: Trasa vede POUZE přes cíle uvnitř hřiště (Y >= 20 mm)
         route = [t for t in route if t['y'] >= 20.0 and (ymin - 50.0) <= t['y'] <= (ymax + 50.0) and (xmin - 50.0) <= t['x'] <= (xmax + 50.0)]
 
         if len(route) >= 2:
-            r_pts = [f_to_screen(rx, ry)] + [f_to_screen(t['x'], t['y']) for t in route]
+            r_pts = [f_to_screen(rx, ry)] + [f_to_screen(t['candle_world'][0], t['candle_world'][1]) for t in route]
             pygame.draw.lines(self.screen, (255, 215, 0), False, r_pts, 2)
 
-        # Bounding Boxy uvnitř pole (kumulativní cíle)
+        # Cíle uvnitř pole (STATICKÁ MAPA HŘIŠTĚ - ZBLÍZKA VIDÍME LÍP)
         field_targets = fm.get_field_targets()
+        r_pos = fm.robot_pos
+        r_sx, r_sy = f_to_screen(r_pos[0], r_pos[1])
+
         for idx, t in enumerate(field_targets):
-            csx, csy = f_to_screen(t['x'], t['y'])
+            cand_w = t['candle_world']
+            wp_w = t['waypoint_world']
+            cand_s = f_to_screen(cand_w[0], cand_w[1])
+            wp_s = f_to_screen(wp_w[0], wp_w[1])
             is_vis = t.get('is_visible', True)
 
-            # Rámeček boxu v měřítku hřiště
+            # 1. Rámeček boxu v měřítku hřiště (ze středu svíčky)
             bw = max(8, int(t.get('width', 300) * draw_scale))
             bh = max(8, int(t.get('height', 300) * draw_scale))
-            box_rect = pygame.Rect(csx - bw // 2, csy - bh // 2, bw, bh)
+            box_rect = pygame.Rect(cand_s[0] - bw // 2, cand_s[1] - bh // 2, bw, bh)
 
             if is_vis:
                 box_color = (0, 240, 160) if not t['is_solo'] else (255, 180, 40)
                 pygame.draw.rect(self.screen, box_color, box_rect, 2)
-                pygame.draw.circle(self.screen, (255, 230, 20), (csx, csy), 5)
             else:
-                # ZASTÍNĚNÝ CÍL (doplněný z paměti, aktuálně skrytý)
+                # ZASTÍNĚNÝ CÍL (stále držen v paměti v nejlepší naměřené podobě!)
                 pygame.draw.rect(self.screen, (160, 140, 60), box_rect, 1)
-                pygame.draw.circle(self.screen, (180, 120, 40), (csx, csy), 4)
 
             lbl_tag = f"C{idx+1}" if is_vis else f"C{idx+1} [Z]"
             lbl_col = (255, 230, 180) if is_vis else (180, 170, 120)
-            self.screen.blit(self.font_bold.render(lbl_tag, True, lbl_col), (csx + bw // 2 + 3, csy - 7))
+            self.screen.blit(self.font_bold.render(lbl_tag, True, lbl_col), (cand_s[0] + bw // 2 + 3, cand_s[1] - 7))
 
-        # Vykreslení stěn, svíček a nájezdových šipek přímo v poli (pokud je [O] aktivní)
-        if self.detect_details_enabled and self.current_box_details:
-            r_pos = fm.robot_pos
-            r_sx, r_sy = f_to_screen(r_pos[0], r_pos[1])
-            for idx, det in enumerate(self.current_box_details):
-                wp_w = det['waypoint_world']
-                cand_w = det['candle_world']
-                wp_s = f_to_screen(wp_w[0], wp_w[1])
-                cand_s = f_to_screen(cand_w[0], cand_w[1])
+            # 2. Stěny uvnitř boxu (z nejlepšího měření zblízka)
+            for w_seg in t.get('walls_world', []):
+                ws1 = f_to_screen(w_seg[0][0], w_seg[0][1])
+                ws2 = f_to_screen(w_seg[1][0], w_seg[1][1])
+                wall_col = (255, 250, 130) if is_vis else (180, 175, 90)
+                pygame.draw.line(self.screen, wall_col, ws1, ws2, 3)
 
-                # Trasa od robota k Waypointu
-                pygame.draw.line(self.screen, (0, 240, 255), (r_sx, r_sy), wp_s, 2)
+            # 3. Svíčka (červený terčík se žlutým středem)
+            cand_col = (255, 50, 30) if is_vis else (180, 40, 25)
+            pygame.draw.circle(self.screen, cand_col, cand_s, 5)
+            pygame.draw.circle(self.screen, (255, 220, 0), cand_s, 2)
 
-                # Terčík waypointu
+            # 4. Trasa od robota k Waypointu, terčík waypointu a nájezdová šipka
+            if self.detect_details_enabled:
+                pygame.draw.line(self.screen, (0, 240, 255), (r_sx, r_sy), wp_s, 1)
                 pygame.draw.circle(self.screen, (0, 255, 200), wp_s, 5, 1)
                 pygame.draw.circle(self.screen, (255, 230, 0), wp_s, 2)
-
-                # Nájezdová šipka
-                draw_arrow(self.screen, (255, 75, 40), wp_s, cand_s, width=2, tip_len=8, tip_width=4)
-
-                # Stěny uvnitř boxu
-                for w_seg in det['walls_world']:
-                    ws1 = f_to_screen(w_seg[0][0], w_seg[0][1])
-                    ws2 = f_to_screen(w_seg[1][0], w_seg[1][1])
-                    pygame.draw.line(self.screen, (255, 250, 130), ws1, ws2, 3)
-
-                # Svíčka (střed)
-                pygame.draw.circle(self.screen, (255, 50, 30), cand_s, 4)
-                pygame.draw.circle(self.screen, (255, 220, 0), cand_s, 2)
+                arrow_col = (255, 75, 40) if is_vis else (180, 60, 30)
+                draw_arrow(self.screen, arrow_col, wp_s, cand_s, width=2, tip_len=8, tip_width=4)
 
         # Tlačítka startovní stěny pod grafickým obdélníkem
         w_active = fm.start_wall_mode
