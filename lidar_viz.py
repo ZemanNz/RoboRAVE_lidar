@@ -286,8 +286,6 @@ class RobotLocalizer:
         self.ref_boxes = [dict(b) for b in boxes]
         self.ref_dists = []
         self.last_match_info = None
-        self.anchors_refined = False
-        self.refinement_count = 0
         self.pending_jump = None
         self.jump_streak = 0
 
@@ -306,77 +304,6 @@ class RobotLocalizer:
         self.trajectory = [(0.0, 0.0)]
         self.is_stationary = True
         return True
-
-    def refine_anchors_from_field(self, field_targets):
-        """
-        Zpřesňuje referenční etalon a invariantní kotvy na základě dlouhodobě stabilizované mapy hřiště (GlobalFieldMap):
-        - Když se robot přiblíží ke svíčkám, získá o nich data zblízka (<= 1000 mm), která jsou přesnější než startovní měření.
-        - Aktualizuje středy referenčních boxů a přepočítá invariantní kotvy.
-        - Pokud se v poli objeví 4. svíčka, která nebyla ze startu vidět (např. skrytá za stěnou), automaticky ji zařadí!
-        """
-        if not self.locked or not field_targets:
-            return False
-
-        changed = False
-
-        for ft in field_targets:
-            # Bereme pouze spolehlivé cíle z pole
-            if ft.get('hits', 0) < 6:
-                continue
-
-            fx, fy = ft['candle_world']
-            dist_from_rob = ft.get('dist_from_robot', 9999.0)
-            best_dist = ft.get('best_view_dist_mm', 9999.0)
-
-            # Párujeme k existujícímu referenčnímu boxu
-            best_idx = -1
-            best_d = 360.0
-            for idx, rb in enumerate(self.ref_boxes):
-                d = math.hypot(rb['cx'] - fx, rb['cy'] - fy)
-                if d < best_d:
-                    best_d = d
-                    best_idx = idx
-
-            if best_idx >= 0:
-                rb = self.ref_boxes[best_idx]
-                # Váha zpřesnění: pokud jsme u cíle blízko (<= 1000 mm), zpřesňujeme svižněji, jinak klidně
-                w_alpha = 0.18 if (best_dist <= 1000.0 or dist_from_rob <= 1000.0) else 0.08
-                old_x, old_y = rb['cx'], rb['cy']
-                rb['cx'] = (1.0 - w_alpha) * rb['cx'] + w_alpha * fx
-                rb['cy'] = (1.0 - w_alpha) * rb['cy'] + w_alpha * fy
-                rb['min_x'] = rb['cx'] - rb.get('width', 200.0) * 0.5
-                rb['max_x'] = rb['cx'] + rb.get('width', 200.0) * 0.5
-                rb['min_y'] = rb['cy'] - rb.get('height', 200.0) * 0.5
-                rb['max_y'] = rb['cy'] + rb.get('height', 200.0) * 0.5
-                rb['dist_mm'] = math.hypot(rb['cx'], rb['cy'])
-                if math.hypot(rb['cx'] - old_x, rb['cy'] - old_y) > 0.5:
-                    changed = True
-            else:
-                # Nový cíl v poli (např. 4. svíčka, kterou robot ze startu neviděl přes stěnu)
-                if len(self.ref_boxes) < 4 and ft.get('hits', 0) >= 8:
-                    new_ref = {
-                        'cx': fx,
-                        'cy': fy,
-                        'min_x': fx - 100.0,
-                        'max_x': fx + 100.0,
-                        'min_y': fy - 100.0,
-                        'max_y': fy + 100.0,
-                        'width': ft.get('width', 250.0),
-                        'height': ft.get('height', 250.0),
-                        'type': 'SVÍČKA+STĚNA' if not ft.get('is_solo') else 'SVÍČKA',
-                        'dist_mm': math.hypot(fx, fy),
-                        'from_field': True
-                    }
-                    self.ref_boxes.append(new_ref)
-                    changed = True
-
-        if changed:
-            self.recompute_anchors()
-            self.anchors_refined = True
-            self.refinement_count += 1
-            return True
-
-        return False
 
     def unlock_map(self):
         """Odemkne mapu a vrátí robota do výchozího stavu."""
@@ -1847,10 +1774,6 @@ class DualLidarVisualizer:
             elif active_b:
                 self.field_map.ingest_boxes(active_b, rx, ry, loc.robot_deg if loc.locked else 0.0)
 
-            # Zpřesnění referenčního etalonu a kotev podle kumulativní stabilní mapy hřiště!
-            if self.localizer.locked:
-                self.localizer.refine_anchors_from_field(self.field_map.get_field_targets())
-
     def update_current_details(self):
         """Aktualizuje stěny, svíčky a nájezdové waypointy pro všechny aktivní boxy."""
         if not self.detect_details_enabled or self.last_frame is None:
@@ -2207,10 +2130,8 @@ class DualLidarVisualizer:
 
         lock_badge = " 🔒 ZAMČENO" if loc.locked else " [L] ZAMKNOUT MAPU"
         self.screen.blit(self.font_big.render(f"2. REFERENČNÍ ETALON (START){lock_badge}", True, (80, 255, 160) if loc.locked else ACCENT_MAP), (offset_x + 25, 17))
-        tri_txt = " | Trojúhelník: AKTIVNÍ" if (loc.locked and loc.triangle_pattern) else ""
-        ref_txt = " | ✨ KOTVY ZPŘESNĚNY Z POLE" if loc.anchors_refined else ""
-        sub_str = f"Kotvy: {len(loc.anchors)} | Referenční boxy: {len(ref_boxes)}/4{tri_txt}{ref_txt}" if loc.locked else f"Sběr etalonu na startu... Boxů: {len(ref_boxes)}/4 (stiskněte [L])"
-        self.screen.blit(self.font_main.render(sub_str, True, (80, 255, 180) if loc.anchors_refined else (210, 215, 225)), (offset_x + 25, 39))
+        sub_str = f"Kotvy: {len(loc.anchors)} | Referenční boxy: {len(ref_boxes)}/4{tri_txt}" if loc.locked else f"Sběr etalonu na startu... Boxů: {len(ref_boxes)}/4 (stiskněte [L])"
+        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 39))
 
         # Spodní tip panel
         tip_box = pygame.Surface((570, 75))
@@ -2477,9 +2398,8 @@ class DualLidarVisualizer:
         opt_tag = " [O: 100% ESP32 NÁJEZDY ZAPNUTY]" if self.detect_details_enabled else " [O: NÁJEZDY Vypnuty]"
 
         self.screen.blit(self.font_big.render(f"3. SHODA [{fov_tag}]{opt_tag}: {pat_name}", True, (255, 200, 60) if self.detect_details_enabled else (80, 255, 160)), (offset_x + 25, 17))
-        ref_tag = " [✨ KOTVY Z POLE]" if loc.anchors_refined else ""
-        sub_str = f"Inliery: {inliers} | Kotvy: {len(matched_anchors)}/{len(loc.anchors)}{ref_tag} | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
-        self.screen.blit(self.font_main.render(sub_str, True, (80, 255, 180) if loc.anchors_refined else (210, 215, 225)), (offset_x + 25, 38))
+        sub_str = f"Inliery: {inliers} | Kotvy: {len(matched_anchors)}/6 | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
+        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 38))
 
         # 9. SPODNÍ TIP PANEL
         tip_box = pygame.Surface((570, 75))
