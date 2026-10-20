@@ -1335,7 +1335,7 @@ public:
                 float x2 = points[idx2].x;
                 float y2 = points[idx2].y;
                 float d = hypotf(x2 - x1, y2 - y1);
-                if (d < 65.0f) continue; // zmírněno z 85 mm na 65 mm
+                if (d < 85.0f) continue; // stěna musí mít reálné rozpětí
 
                 float nx = -(y2 - y1) / d;
                 float ny = (x2 - x1) / d;
@@ -1345,11 +1345,11 @@ public:
                 for (int k = 0; k < boxPtCount; k++) {
                     int pIdx = boxIndices[k];
                     float dist = fabsf((points[pIdx].x - x1) * nx + (points[pIdx].y - y1) * ny);
-                    if (dist <= 20.0f) { // zmírněno z 18 mm na 20 mm
+                    if (dist <= 18.0f) {
                         tempInl[inlCount++] = pIdx;
                     }
                 }
-                if (inlCount >= 4 && inlCount > bestW1Count) { // zmírněno z 5 na 4 inliery
+                if (inlCount >= 5 && inlCount > bestW1Count) {
                     bestW1Count = inlCount;
                     p1_idx = idx1;
                     p2_idx = idx2;
@@ -1359,8 +1359,8 @@ public:
             }
         }
 
-        // Pokud v boxu není žádná rovná stěna (alespoň 4 inliery a rozpětí) -> je to SOLO SVÍČKA!
-        if (bestW1Count < 4 || p1_idx < 0) {
+        // Pokud v boxu není žádná rovná stěna (alespoň 5 inlierů a rozpětí) -> je to čistě SOLO SVÍČKA!
+        if (bestW1Count < 5 || p1_idx < 0) {
             target.type = TARGET_SOLO;
             target.candle_x = (boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx;
             target.candle_y = (boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy;
@@ -1398,8 +1398,8 @@ public:
         float w1_ey = points[p1_idx].y + u1y * maxT1;
         float w1_len = maxT1 - minT1;
 
-        // Pokud je délka stěny příliš krátká (< 75 mm), není to stěna
-        if (w1_len < 75.0f) { // zmírněno ze 100 mm na 75 mm
+        // Pokud je délka stěny příliš krátká (< 100 mm), není to stěna
+        if (w1_len < 100.0f) {
             target.type = TARGET_SOLO;
             target.candle_x = (boxPtCount > 0) ? (sumX / (float)boxPtCount) : box.cx;
             target.candle_y = (boxPtCount > 0) ? (sumY / (float)boxPtCount) : box.cy;
@@ -1433,7 +1433,7 @@ public:
         int bestW2Count = 0;
         int q1_idx = -1, q2_idx = -1;
 
-        if (outCount >= 3) { // zmírněno z 4 na 3
+        if (outCount >= 4) {
             for (int i = 0; i < outCount && i < 25; i++) {
                 int qidx1 = outlierIndices[i];
                 float qx1 = points[qidx1].x;
@@ -1443,12 +1443,12 @@ public:
                     float qx2 = points[qidx2].x;
                     float qy2 = points[qidx2].y;
                     float qd = hypotf(qx2 - qx1, qy2 - qy1);
-                    if (qd < 55.0f) continue; // zmírněno ze 70 mm na 55 mm
+                    if (qd < 70.0f) continue;
 
                     float qux = (qx2 - qx1) / qd;
                     float quy = (qy2 - qy1) / qd;
                     float dot = fabsf(u1x * qux + u1y * quy);
-                    if (dot > 0.58f) continue; // kolmost (cca 54° až 126°)
+                    if (dot > 0.50f) continue; // kolmost (cca 60° až 120°)
 
                     float qnx = -quy;
                     float qny = qux;
@@ -1457,9 +1457,9 @@ public:
                     for (int k = 0; k < outCount; k++) {
                         int pIdx = outlierIndices[k];
                         float dist = fabsf((points[pIdx].x - qx1) * qnx + (points[pIdx].y - qy1) * qny);
-                        if (dist <= 20.0f) tempInl2[inl2++] = pIdx;
+                        if (dist <= 18.0f) tempInl2[inl2++] = pIdx;
                     }
-                    if (inl2 >= 3 && inl2 > bestW2Count) { // zmírněno z 4 na 3
+                    if (inl2 >= 4 && inl2 > bestW2Count) {
                         bestW2Count = inl2;
                         q1_idx = qidx1;
                         q2_idx = qidx2;
@@ -1856,12 +1856,14 @@ public:
         update(liveBoxes, liveCount, 160.0f);
 
         // 2. Aktualizace detailních cílů
+        // Extrahujeme detailní cíle na základě VYHLAZENÝCH STABILIZOVANÝCH BOXŮ (_tracked)
         float matchDistSq = matchDistMm * matchDistMm;
         bool matchedTracked[MAX_TRACKED_BOXES];
         for (int i = 0; i < MAX_TRACKED_BOXES; i++) matchedTracked[i] = false;
 
-        for (int i = 0; i < liveCount; i++) {
-            TargetDetail liveT = TargetExtractor::extract(points, pointCount, liveBoxes[i]);
+        for (int i = 0; i < _trackedCount; i++) {
+            const BoundingBox& stabBox = _tracked[i].box;
+            TargetDetail liveT = TargetExtractor::extract(points, pointCount, stabBox);
 
             int bestIdx = -1;
             float bestDistSq = matchDistSq;
@@ -1883,7 +1885,15 @@ public:
                 tt.missed = 0;
                 matchedTracked[bestIdx] = true;
 
+                // Útlum staré historie hlasů (aby živý majoritní stav okamžitě převážil a starý šum nezůstal viset)
+                int totalVotes = tt.type_votes[0] + tt.type_votes[1] + tt.type_votes[2];
+                if (totalVotes >= 14) {
+                    tt.type_votes[0] /= 2;
+                    tt.type_votes[1] /= 2;
+                    tt.type_votes[2] /= 2;
+                }
                 tt.type_votes[liveT.type]++;
+
                 // Typ určíme podle většinového hlasování (pokud má SOLO většinu, cíl je SOLO!)
                 int vSolo = tt.type_votes[TARGET_SOLO];
                 int vWall = tt.type_votes[TARGET_WALL];
@@ -1891,21 +1901,21 @@ public:
 
                 if (tt.hits <= 2) {
                     tt.target.type = liveT.type;
-                } else if (vCorner >= 3 && vCorner >= vWall) {
+                } else if (vCorner >= 4 && vCorner >= vWall && vCorner >= vSolo) {
                     tt.target.type = TARGET_CORNER;
-                } else if ((vWall + vCorner) >= 3 && (vWall + vCorner) > vSolo) {
-                    tt.target.type = (vCorner >= 2) ? TARGET_CORNER : TARGET_WALL;
-                } else if (vSolo >= (vWall + vCorner)) {
+                } else if (vWall >= 4 && vWall >= vSolo) {
+                    tt.target.type = TARGET_WALL;
+                } else if (vSolo >= vWall && vSolo >= vCorner) {
                     tt.target.type = TARGET_SOLO;
                 }
 
-                // Pokud je box malý (< 160 mm), NESMÍ mít stěny
-                if (tt.target.box.span_mm < 160.0f || tt.target.box.is_solo_candle) {
+                // Pokud je stabilizovaný box malý (< 160 mm) nebo je označen jako SOLO, cíl NESMÍ mít stěny
+                if (stabBox.span_mm < 160.0f || stabBox.is_solo_candle) {
                     tt.target.type = TARGET_SOLO;
                 }
 
                 const float alpha = 0.15f;
-                tt.target.box = liveT.box;
+                tt.target.box = stabBox;
                 tt.target.candle_x = (1.0f - alpha) * tt.target.candle_x + alpha * liveT.candle_x;
                 tt.target.candle_y = (1.0f - alpha) * tt.target.candle_y + alpha * liveT.candle_y;
                 tt.target.waypoint_x = (1.0f - alpha) * tt.target.waypoint_x + alpha * liveT.waypoint_x;
