@@ -201,6 +201,43 @@ def transform_esp_target_to_world(target, rx, ry, th_rad):
 
 
 
+BOX_SIZE_SMALL  = 0  # MALÝ: Samotná svíčka (span < 160 mm nebo solo svíčka)
+BOX_SIZE_MEDIUM = 1  # STŘEDNÍ: Svíčka s 1 stěnou (protáhlá deska, min_dim < 170 mm)
+BOX_SIZE_LARGE  = 2  # VELKÝ: Svíčka se 2 stěnami / Roh (obě strany >= 170 mm nebo span >= 365 mm)
+
+BOX_SIZE_NAMES = {
+    BOX_SIZE_SMALL:  "MALÝ (SVÍČKA)",
+    BOX_SIZE_MEDIUM: "STŘEDNÍ (1 STĚNA)",
+    BOX_SIZE_LARGE:  "VELKÝ (ROH)"
+}
+
+BOX_SIZE_SHORT = {
+    BOX_SIZE_SMALL:  "MALÝ",
+    BOX_SIZE_MEDIUM: "STŘEDNÍ",
+    BOX_SIZE_LARGE:  "VELKÝ"
+}
+
+def classify_box_size(box):
+    """
+    Kategorizuje Bounding Box do 3 velikostních tříd podle geometrických rozměrů:
+    0 = MALÝ: Samotná svíčka (span < 160 mm nebo solo svíčka)
+    1 = STŘEDNÍ: Svíčka s 1 stěnou (protáhlá deska, min rozměr < 170 mm)
+    2 = VELKÝ: Svíčka se 2 stěnami / Roh (obě strany >= 170 mm nebo span >= 365 mm)
+    """
+    w = float(box.get('width', 0.0))
+    h = float(box.get('height', 0.0))
+    span = float(box.get('span_mm', math.hypot(w, h)))
+    min_dim = min(w, h)
+    max_dim = max(w, h)
+
+    if span < 160.0 or max_dim < 140.0 or box.get('is_solo_candle', False) or box.get('is_solo', False):
+        return BOX_SIZE_SMALL
+    elif min_dim >= 170.0 or span >= 365.0:
+        return BOX_SIZE_LARGE
+    else:
+        return BOX_SIZE_MEDIUM
+
+
 # ============================================================
 #  Map-to-Map Lokalizátor robota (Porovnání Bounding Boxů)
 # ============================================================
@@ -249,11 +286,15 @@ class RobotLocalizer:
         self.prev_robot_deg       = 0.0
 
     def recompute_anchors(self):
-        """Přepočítá invariantní párové vzdálenosti (kotvy) ze všech aktuálních referenčních bodů."""
+        """Přepočítá invariantní párové vzdálenosti (kotvy) ze všech aktuálních referenčních bodů s kontrolou velikostí."""
         n = len(self.ref_boxes)
         if n < 2:
             self.anchors = []
             return
+
+        # Aktualizujeme velikostní třídu pro každý referenční box
+        for b in self.ref_boxes:
+            b['size_class'] = classify_box_size(b)
 
         raw_anchors = []
         for i in range(n):
@@ -263,11 +304,16 @@ class RobotLocalizer:
                 dx = b2['cx'] - b1['cx']
                 dy = b2['cy'] - b1['cy']
                 dist = math.hypot(dx, dy)
+                sz1 = b1['size_class']
+                sz2 = b2['size_class']
                 raw_anchors.append({
                     'idx1': i, 'idx2': j,
                     'p1': (b1['cx'], b1['cy']),
                     'p2': (b2['cx'], b2['cy']),
-                    'dist': dist
+                    'dist': dist,
+                    'size1': sz1,
+                    'size2': sz2,
+                    'pair_type': tuple(sorted([sz1, sz2]))
                 })
 
         raw_anchors.sort(key=lambda a: a['dist'], reverse=True)
@@ -285,7 +331,9 @@ class RobotLocalizer:
         for rank, a in enumerate(raw_anchors):
             a['rank'] = rank + 1
             pal = ANCHOR_PALETTE[rank % len(ANCHOR_PALETTE)]
-            a['name'] = f"{pal['name']} ({int(a['dist'])} mm)"
+            s1_s = BOX_SIZE_SHORT.get(a['size1'], "")
+            s2_s = BOX_SIZE_SHORT.get(a['size2'], "")
+            a['name'] = f"{pal['name']} ({int(a['dist'])} mm) [{s1_s}-{s2_s}]"
             a['color'] = pal['color']
             self.anchors.append(a)
 
@@ -443,6 +491,8 @@ class RobotLocalizer:
             return False
 
         cands = [(float(b['cx']), float(b['cy'])) for b in current_boxes]
+        cand_sizes = [classify_box_size(b) for b in current_boxes]
+        ref_sizes = [rb.get('size_class', classify_box_size(rb)) for rb in self.ref_boxes]
         n_cands = len(cands)
         n_refs = len(self.ref_boxes)
 
@@ -457,6 +507,25 @@ class RobotLocalizer:
             for ref_comb in itertools.combinations(range(n_refs), k):
                 # Pro každou uspořádanou k-tici kandidátů
                 for cand_perm in itertools.permutations(range(n_cands), k):
+                    # 0. KONTROLA VELIKOSTNÍCH TŘÍD (ZÁKAZ ZÁMĚNY MALÉ SVÍČKY SE STĚNOU/ROHEM)
+                    size_mismatch = False
+                    size_penalty = 0.0
+                    for i in range(k):
+                        rs = ref_sizes[ref_comb[i]]
+                        cs = cand_sizes[cand_perm[i]]
+                        # Zákaz párování: MALÝ (svíčka) se NIKDY nesmí spárovat se STŘEDNÍ nebo VELKÝ
+                        if rs == BOX_SIZE_SMALL and cs != BOX_SIZE_SMALL:
+                            size_mismatch = True
+                            break
+                        if rs != BOX_SIZE_SMALL and cs == BOX_SIZE_SMALL:
+                            size_mismatch = True
+                            break
+                        # Rozdíl 1 stěna vs 2 stěny (STŘEDNÍ vs VELKÝ) je tolerován, ale s penalizací
+                        if rs != cs:
+                            size_penalty += 1200.0
+                    if size_mismatch:
+                        continue
+
                     # 1. KONTROLA DÉLEK VŠECH KOTEVA (párové vzdálenosti)
                     edges_ok = True
                     sum_dist_err = 0.0
@@ -545,12 +614,17 @@ class RobotLocalizer:
                     err_sum = 0.0
                     inlier_pairs = []
 
-                    for cp in cands:
+                    for cp_idx, cp in enumerate(cands):
                         wx = tx + cp[0] * cos_t + cp[1] * sin_t
                         wy = ty - cp[0] * sin_t + cp[1] * cos_t
                         min_d = 9999.0
                         best_rb = None
-                        for rb in self.ref_boxes:
+                        cp_sz = cand_sizes[cp_idx]
+                        for rb_idx, rb in enumerate(self.ref_boxes):
+                            rb_sz = ref_sizes[rb_idx]
+                            # Inlier může být pouze geometricky slučitelná velikostní třída (svíčka se svíčkou)
+                            if (rb_sz == BOX_SIZE_SMALL and cp_sz != BOX_SIZE_SMALL) or (rb_sz != BOX_SIZE_SMALL and cp_sz == BOX_SIZE_SMALL):
+                                continue
                             d = math.hypot(wx - rb['cx'], wy - rb['cy'])
                             if d < min_d:
                                 min_d = d
@@ -563,7 +637,7 @@ class RobotLocalizer:
 
                     avg_err = (err_sum / inliers) if inliers > 0 else 9999.0
                     base_bonus = 6000.0 if k >= 4 else (3500.0 if k == 3 else 1000.0)
-                    score = base_bonus + inliers * 500.0 - avg_err * 2.0 - penalty
+                    score = base_bonus + inliers * 500.0 - avg_err * 2.0 - penalty - size_penalty
 
                     if score > best_score and inliers >= 2:
                         best_score = score
@@ -2175,7 +2249,10 @@ class DualLidarVisualizer:
                 pygame.draw.line(self.screen, a['color'], p1, p2, thick)
                 mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
                 off_y = -14 if (a['rank'] % 2 == 1) else 6
-                lbl = self.font_bold.render(f"K{a['rank']}: {int(a['dist'])} mm", True, a['color'])
+                s1_s = BOX_SIZE_SHORT.get(a.get('size1', -1), "")
+                s2_s = BOX_SIZE_SHORT.get(a.get('size2', -1), "")
+                sz_badge = f" [{s1_s}-{s2_s}]" if s1_s and s2_s else ""
+                lbl = self.font_bold.render(f"K{a['rank']}: {int(a['dist'])} mm{sz_badge}", True, a['color'])
                 self.screen.blit(lbl, (mx + 8, my + off_y))
 
         # Vykreslení referenčních Bounding Boxů
@@ -2198,7 +2275,9 @@ class DualLidarVisualizer:
             pygame.draw.circle(self.screen, (255, 230, 20), (scx, scy), 6)
             pygame.draw.circle(self.screen, (20, 20, 20), (scx, scy), 2)
 
-            lbl_t = self.font_bold.render(f"ETALON #{idx+1} [{cl['type']}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+            sz_code = cl.get('size_class', classify_box_size(cl))
+            sz_str = BOX_SIZE_SHORT.get(sz_code, cl.get('type', 'BOX'))
+            lbl_t = self.font_bold.render(f"ETALON #{idx+1} [{sz_str}]: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
             lbl_c = self.font_main.render(f"X:{int(cl['cx']):+d} Y:{int(cl['cy']):+d} | R:{int(cl['dist_mm'])} mm", True, (255, 245, 140))
             self.screen.blit(lbl_t, (rx + 4, max(4, ry - 18)))
             self.screen.blit(lbl_c, (scx + 8, scy - 7))
@@ -2291,7 +2370,8 @@ class DualLidarVisualizer:
             pygame.draw.rect(self.screen, (60, 75, 95), (rx, ry, rw, rh), 1)
             scx, scy = self.to_screen(rb['cx'], rb['cy'], offset_x)
             pygame.draw.circle(self.screen, (70, 85, 105), (scx, scy), 4, 1)
-            self.screen.blit(self.font_main.render(f"REF #{idx+1}", True, (90, 105, 125)), (rx + 2, max(4, ry - 14)))
+            rb_sz_str = BOX_SIZE_SHORT.get(rb.get('size_class', classify_box_size(rb)), '')
+            self.screen.blit(self.font_main.render(f"REF #{idx+1} [{rb_sz_str}]", True, (90, 105, 125)), (rx + 2, max(4, ry - 14)))
 
         # 2. VÝPOČET POLOHY AKTUÁLNÍCH BOUNDING BOXŮ Z NOVÉHO MÍSTA
         curr_boxes = self.processed_boxes if self.processed_boxes else parse_box_list(self.last_frame.get("static_boxes", []))
@@ -2326,7 +2406,10 @@ class DualLidarVisualizer:
             pygame.draw.line(self.screen, anc['color'], p1, p2, thick)
             mx = (p1[0] + p2[0]) // 2; my = (p1[1] + p2[1]) // 2
             off_y = -14 if (anc['rank'] % 2 == 1) else 6
-            lbl = self.font_bold.render(f"K{anc['rank']}: {int(ma['cur_dist'])} mm", True, anc['color'])
+            s1_s = BOX_SIZE_SHORT.get(anc.get('size1', -1), "")
+            s2_s = BOX_SIZE_SHORT.get(anc.get('size2', -1), "")
+            sz_badge = f" [{s1_s}-{s2_s}]" if s1_s and s2_s else ""
+            lbl = self.font_bold.render(f"K{anc['rank']}: {int(ma['cur_dist'])} mm{sz_badge}", True, anc['color'])
             self.screen.blit(lbl, (mx + 8, my + off_y))
 
         # Pokud ještě nemáme spárované kotvy, zobrazíme surové vzdálenosti mezi detekovanými boxy
@@ -2400,8 +2483,10 @@ class DualLidarVisualizer:
             pygame.draw.line(self.screen, (255, 255, 255), (scx, scy - 7), (scx, scy + 7), 2)
 
             # Popisky nového boxu
+            c_sz = classify_box_size(cl)
+            sz_str = BOX_SIZE_SHORT.get(c_sz, cl.get('type', 'BOX'))
             tag = " [ZACHRÁNĚNÁ]" if is_rec else (f" [★ ETALON #{cl.get('expected_ref_idx', '')}]" if is_exp else (" [VNĚ POLE]" if is_out else ""))
-            lbl1 = self.font_bold.render(f"NOVÝ #{idx+1} [{cl['type']}]{tag}: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
+            lbl1 = self.font_bold.render(f"NOVÝ #{idx+1} [{sz_str}]{tag}: {int(cl['width'])}x{int(cl['height'])} mm", True, box_col)
             lbl2 = self.font_main.render(f"SVĚT: [{int(wx):+d}, {int(wy):+d}] | R:{int(cl['dist_mm'])} mm ({cl.get('pts_count', 0)}b)", True, (255, 245, 140))
             self.screen.blit(lbl1, (scx + 10, scy - 18))
             self.screen.blit(lbl2, (scx + 10, scy - 4))
