@@ -237,8 +237,16 @@ class RobotLocalizer:
         # Stabilizace polohy a potlačení náhodného skákání robota
         self.pending_jump     = None # (cand_x, cand_y, cand_deg)
         self.jump_streak      = 0    # Počet po sobě jdoucích snímků potvrzujících skok
-        self.anchors_refined  = False
-        self.refinement_count = 0
+
+        # ZPŮSOB 2: Diskrétní jednorázový re-lock etalonu po pohybu a zastavení
+        self.relocked_in_field    = False
+        self.relock_count         = 0
+        self.has_moved_since_lock = False
+        self.stationary_frames    = 0
+        self.last_relock_pos      = (0.0, 0.0)
+        self.prev_robot_x         = 0.0
+        self.prev_robot_y         = 0.0
+        self.prev_robot_deg       = 0.0
 
     def recompute_anchors(self):
         """Přepočítá invariantní párové vzdálenosti (kotvy) ze všech aktuálních referenčních bodů."""
@@ -288,6 +296,14 @@ class RobotLocalizer:
         self.last_match_info = None
         self.pending_jump = None
         self.jump_streak = 0
+        self.relocked_in_field = False
+        self.relock_count = 0
+        self.has_moved_since_lock = False
+        self.stationary_frames = 0
+        self.last_relock_pos = (0.0, 0.0)
+        self.prev_robot_x = 0.0
+        self.prev_robot_y = 0.0
+        self.prev_robot_deg = 0.0
 
         n = len(self.ref_boxes)
         if n < 2:
@@ -305,6 +321,64 @@ class RobotLocalizer:
         self.is_stationary = True
         return True
 
+    def relock_map_from_field(self, current_boxes):
+        """
+        ZPŮSOB 2: Diskrétní jednorázový re-lock etalonu po pohybu a zastavení.
+        - Robot po pohybu zastaví u svíčky v klidu na známé pozici (robot_x, robot_y, robot_deg).
+        - Z tohoto nového místa vidí bounding boxy mnohem přesněji (menší vzdálenost, 360° rozhled).
+        - Přepočte středy aktuálních Bounding Boxů ze souřadnic robota do souřadnic světa.
+        - Uzamkne nový přesný etalon a přepočítá invariantní kotvy.
+        - Kotvy se během další jízdy opět ZCELA ZMRAZÍ (žádný plovoucí drift za jízdy).
+        """
+        if not self.locked or len(current_boxes) < 2:
+            return False
+
+        cos_t = math.cos(math.radians(self.robot_deg))
+        sin_t = math.sin(math.radians(self.robot_deg))
+
+        new_ref_boxes = []
+        for b in current_boxes:
+            cx_local = float(b['cx'])
+            cy_local = float(b['cy'])
+            # Transformace středu Bounding Boxu do světa hřiště
+            wx = self.robot_x + cx_local * cos_t + cy_local * sin_t
+            wy = self.robot_y - cx_local * sin_t + cy_local * cos_t
+
+            # Bezpečnostní kontrola: střed boxu musí ležet v hřišti (s rezervou)
+            if wy < -400.0 or wy > 4200.0 or abs(wx) > 1800.0:
+                continue
+
+            hw = float(b.get('width', 200.0)) * 0.5
+            hh = float(b.get('height', 200.0)) * 0.5
+            new_rb = {
+                'cx': wx,
+                'cy': wy,
+                'min_x': wx - hw,
+                'max_x': wx + hw,
+                'min_y': wy - hh,
+                'max_y': wy + hh,
+                'width': float(b.get('width', 200.0)),
+                'height': float(b.get('height', 200.0)),
+                'type': b.get('type', 'SVÍČKA+STĚNA'),
+                'dist_mm': math.hypot(wx, wy),
+                'from_relock': True
+            }
+            new_ref_boxes.append(new_rb)
+
+        if len(new_ref_boxes) < 2:
+            return False
+
+        # Nahradíme referenční etalon novým přesným měřením ze zastavení
+        self.ref_boxes = new_ref_boxes
+        self.recompute_anchors()
+        self.relocked_in_field = True
+        self.relock_count += 1
+        self.has_moved_since_lock = False
+        self.stationary_frames = 0
+        self.last_relock_pos = (self.robot_x, self.robot_y)
+        print(f"[LOC RE-LOCK #2] Etalon úspěšně přepočítán ze zastavení! Kotvy: {len(self.anchors)} | Pozice: [{self.robot_x:+.0f}, {self.robot_y:+.0f}] mm")
+        return True
+
     def unlock_map(self):
         """Odemkne mapu a vrátí robota do výchozího stavu."""
         self.locked = False
@@ -320,8 +394,14 @@ class RobotLocalizer:
         self.is_stationary = True
         self.pending_jump = None
         self.jump_streak = 0
-        self.anchors_refined = False
-        self.refinement_count = 0
+        self.relocked_in_field = False
+        self.relock_count = 0
+        self.has_moved_since_lock = False
+        self.stationary_frames = 0
+        self.last_relock_pos = (0.0, 0.0)
+        self.prev_robot_x = 0.0
+        self.prev_robot_y = 0.0
+        self.prev_robot_deg = 0.0
 
     @staticmethod
     def _rigid_transform_2d(src, dst):
@@ -593,6 +673,29 @@ class RobotLocalizer:
                     self.trajectory.append((self.robot_x, self.robot_y))
                     if len(self.trajectory) > 500:
                         self.trajectory.pop(0)
+
+                # ZPŮSOB 2: Sledování pohybu a automatický re-lock kotev při stabilním zastavení
+                d_frame = math.hypot(self.robot_x - self.prev_robot_x, self.robot_y - self.prev_robot_y)
+                deg_frame = abs((self.robot_deg - self.prev_robot_deg + 180.0) % 360.0 - 180.0)
+                self.prev_robot_x = self.robot_x
+                self.prev_robot_y = self.robot_y
+                self.prev_robot_deg = self.robot_deg
+
+                d_from_lock = math.hypot(self.robot_x - self.last_relock_pos[0], self.robot_y - self.last_relock_pos[1])
+                if d_from_lock > 350.0 and d_frame > 15.0:
+                    self.has_moved_since_lock = True
+                    self.stationary_frames = 0
+
+                if d_frame <= 10.0 and deg_frame <= 1.5:
+                    self.stationary_frames += 1
+                else:
+                    self.stationary_frames = 0
+
+                # Pokud robot ujel trasu (> 350 mm) a nyní stabilně stojí alespoň 14 snímků (~1.8 s)
+                # a má před sebou aspoň 3 boxy s dobrou jistotou -> automaticky jednorázově přepočíst a zamknout kotvy!
+                if (self.has_moved_since_lock and self.stationary_frames >= 14 and 
+                    len(current_boxes) >= 3 and self.pose_confidence >= 0.65):
+                    self.relock_map_from_field(current_boxes)
 
                 return True
             else:
@@ -2128,9 +2231,21 @@ class DualLidarVisualizer:
         border_col = (80, 255, 160) if loc.locked else (70, 60, 40)
         pygame.draw.rect(self.screen, border_col, (offset_x + 15, 12, 570, 56), 1)
 
-        lock_badge = " 🔒 ZAMČENO" if loc.locked else " [L] ZAMKNOUT MAPU"
-        self.screen.blit(self.font_big.render(f"2. REFERENČNÍ ETALON (START){lock_badge}", True, (80, 255, 160) if loc.locked else ACCENT_MAP), (offset_x + 25, 17))
-        sub_str = f"Kotvy: {len(loc.anchors)} | Referenční boxy: {len(ref_boxes)}/4{tri_txt}" if loc.locked else f"Sběr etalonu na startu... Boxů: {len(ref_boxes)}/4 (stiskněte [L])"
+        if loc.locked:
+            if loc.relocked_in_field:
+                lock_badge = f" 🔒 ZAMČENO V POLI #{loc.relock_count}"
+                badge_col = (0, 255, 200)
+            else:
+                lock_badge = " 🔒 ZAMČENO (START)"
+                badge_col = (80, 255, 160)
+        else:
+            lock_badge = " [L] ZAMKNOUT MAPU"
+            badge_col = ACCENT_MAP
+
+        self.screen.blit(self.font_big.render(f"2. REFERENČNÍ ETALON{lock_badge}", True, badge_col), (offset_x + 25, 17))
+        tri_txt = " | Trojúhelník: AKTIVNÍ" if (loc.locked and loc.triangle_pattern) else ""
+        relock_txt = " (PO ZASTAVENÍ)" if loc.relocked_in_field else ""
+        sub_str = f"Kotvy: {len(loc.anchors)} | Referenční boxy: {len(ref_boxes)}/4{tri_txt}{relock_txt}" if loc.locked else f"Sběr etalonu na startu... Boxů: {len(ref_boxes)}/4 (stiskněte [L])"
         self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 39))
 
         # Spodní tip panel
@@ -2139,9 +2254,9 @@ class DualLidarVisualizer:
         tip_box.fill((10, 12, 16))
         self.screen.blit(tip_box, (offset_x + 15, PANEL_H - 85))
         pygame.draw.rect(self.screen, (50, 45, 30), (offset_x + 15, PANEL_H - 85, 570, 75), 1)
-        self.screen.blit(self.font_bold.render("REFERENČNÍ ETALON (START 180°):", True, (240, 200, 80)), (offset_x + 25, PANEL_H - 79))
-        self.screen.blit(self.font_main.render("• Čistý sken 180° dopředu ze startovní zdi eliminuje falešné odrazy za mantinelem.", True, (200, 210, 225)), (offset_x + 25, PANEL_H - 61))
-        self.screen.blit(self.font_main.render("• [L] Zamknout etalon -> automaticky aktivuje 360° plný rozhled v poli!", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
+        self.screen.blit(self.font_bold.render("REFERENČNÍ ETALON (START 180° / POLE 360°):", True, (240, 200, 80)), (offset_x + 25, PANEL_H - 79))
+        self.screen.blit(self.font_main.render("• Čistý sken dopředu ze startu vytvoří základní etalon.", True, (200, 210, 225)), (offset_x + 25, PANEL_H - 61))
+        self.screen.blit(self.font_main.render("• [L] Zamknout start | [U/Z] Re-lock kotev v klidu (nebo automaticky po zastavení)", True, (100, 255, 140)), (offset_x + 25, PANEL_H - 43))
 
     # ========================================================
     #  PANEL 3: POROVNÁNÍ & LOKALIZACE ROBOTA (DRUHÁ STATICKÁ MAPA & KOTVY)
@@ -2738,6 +2853,19 @@ class DualLidarVisualizer:
                                 self.send_cmd("FOV 1")
                                 print("[FoV AUTO] Návrat na start -> Automaticky aktivuji 180° DOPŘEDNÝ KUŽEL!")
                             print("[LOC] Etalon odemčen. Můžete znovu nasbírat výchozí mapu.")
+
+                    elif event.key in [pygame.K_u, pygame.K_z]:
+                        if self.localizer.locked:
+                            boxes = self.processed_boxes if self.processed_boxes else parse_box_list(self.last_frame.get("static_boxes", []))
+                            if not boxes:
+                                boxes = parse_box_list(self.last_frame.get("boxes", []))
+                            ok = self.localizer.relock_map_from_field(boxes)
+                            if ok:
+                                print(f"[LOC RE-LOCK] Etalon úspěšně přepočítán ze zastavení! ({len(self.localizer.anchors)} kotev)")
+                            else:
+                                print("[LOC RE-LOCK] Nelze přepočítat etalon – v zorném poli je málo cílů (min. 2).")
+                        else:
+                            print("[LOC RE-LOCK] Nejprve musíte zamknout výchozí etalon na startu klávesou [L].")
 
                     elif event.key == pygame.K_n:
                         self.field_map.reset()
