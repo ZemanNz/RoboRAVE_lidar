@@ -667,11 +667,16 @@ class GlobalFieldMap:
                 t['is_visible'] = True
                 t['status'] = "VIDITELNÝ"
 
-                # PRAVIDLO: ZBLÍZKA VIDÍME LÍP
+                # PRAVIDLO: ZBLÍZKA VIDÍME LÍP (Zóna 1000 mm + monotónní zjemňování)
+                # Aktualizujeme a zpřesňujeme cíl, pokud:
+                # a) jsme v úvodní fázi ustálení (prvních 6 snímků)
+                # b) nebo jsme v pracovní zóně do 1 metru (d_curr <= 1000 mm)
+                # c) nebo jsme k cíli blíž než kdykoliv předtím (+ hystereze 35 mm)
+                in_close_zone = (d_curr <= 1000.0)
                 is_closer = (d_curr < t.get('best_view_dist_mm', 99999.0) + 35.0)
                 is_warmup = (t['hits'] <= 6)
 
-                if is_warmup or is_closer:
+                if is_warmup or in_close_zone or is_closer:
                     if d_curr < t.get('best_view_dist_mm', 99999.0):
                         t['best_view_dist_mm'] = d_curr
 
@@ -688,14 +693,22 @@ class GlobalFieldMap:
                     elif inc_type in ('STĚNA', 'WALL'): inc_type = 'WALL'
                     else: inc_type = 'SOLO'
 
-                    if t.get('type') == 'CORNER' and inc_type != 'CORNER' and not is_warmup:
+                    inc_walls = inc.get('walls_world', [])
+
+                    # Priorita rohu: ROH má nejvyšší strukturální váhu a v zóně do 1 m nepodléhá deformaci na 1 stěnu
+                    if inc_type == 'CORNER':
+                        t['type'] = 'CORNER'
+                    elif t.get('type') == 'CORNER' and inc_type != 'CORNER' and not is_warmup and len(t.get('walls_world', [])) >= 2:
+                        # Pokud již máme potvrzený roh se 2 stěnami, nepřepisujeme ho na 1 stěnu
                         pass
                     else:
                         t['type'] = inc_type
 
-                    inc_walls = inc.get('walls_world', [])
-                    if len(inc_walls) >= 1:
+                    if len(inc_walls) >= 2:
                         t['walls_world'] = list(inc_walls)
+                    elif len(inc_walls) == 1:
+                        if t['type'] != 'CORNER' or len(t.get('walls_world', [])) < 2:
+                            t['walls_world'] = list(inc_walls)
                     elif t['type'] == 'SOLO' and is_warmup:
                         t['walls_world'] = []
 
@@ -2427,15 +2440,28 @@ class DualLidarVisualizer:
             bh = max(8, int(t.get('height', 300) * draw_scale))
             box_rect = pygame.Rect(cand_s[0] - bw // 2, cand_s[1] - bh // 2, bw, bh)
 
+            d_cand = math.hypot(cand_w[0] - r_pos[0], cand_w[1] - r_pos[1])
+            is_active = (d_cand <= 1000.0) or (t.get('hits', 0) <= 6)
+
             if is_vis:
-                box_color = (0, 240, 160) if not t['is_solo'] else (255, 180, 40)
-                pygame.draw.rect(self.screen, box_color, box_rect, 2)
+                if is_active:
+                    box_color = (0, 240, 160) if not t['is_solo'] else (255, 180, 40)
+                    lbl_tag = f"C{idx+1}"
+                    lbl_col = (255, 230, 180)
+                    pygame.draw.rect(self.screen, box_color, box_rect, 2)
+                else:
+                    # Cíl je dál než 1 metr - držen PEVNĚ, nepřepisuje se horšími daty!
+                    box_color = (110, 130, 150)
+                    lbl_tag = f"C{idx+1} [PEVNÁ]"
+                    lbl_col = (150, 175, 195)
+                    pygame.draw.rect(self.screen, box_color, box_rect, 1)
             else:
                 # ZASTÍNĚNÝ CÍL (stále držen v paměti v nejlepší naměřené podobě!)
-                pygame.draw.rect(self.screen, (160, 140, 60), box_rect, 1)
+                box_color = (160, 140, 60)
+                lbl_tag = f"C{idx+1} [Z]"
+                lbl_col = (180, 170, 120)
+                pygame.draw.rect(self.screen, box_color, box_rect, 1)
 
-            lbl_tag = f"C{idx+1}" if is_vis else f"C{idx+1} [Z]"
-            lbl_col = (255, 230, 180) if is_vis else (180, 170, 120)
             self.screen.blit(self.font_bold.render(lbl_tag, True, lbl_col), (cand_s[0] + bw // 2 + 3, cand_s[1] - 7))
 
             # 2. Stěny uvnitř boxu (z nejlepšího měření zblízka)
