@@ -221,7 +221,7 @@ class RobotLocalizer:
 
     def __init__(self):
         self.locked           = False
-        self.ref_boxes        = []   # Referenční Bounding Boxy v souřadnicích startu
+        self.ref_boxes        = []   # Referenční Bounding Boxy v souřadnicích startu / hřiště
         self.ref_dists        = []   # [(i, j, dist_mm)] mezi referenčními středy boxů
         self.anchors          = []   # Seřazené kotvy podle rozvoru a kvality
         self.triangle_pattern = None # Trojúhelníkový vzorec
@@ -234,18 +234,19 @@ class RobotLocalizer:
         self.is_stationary    = True
         self.last_match_info  = None # Detailní informace o shodě pro vykreslení paprsků
 
-    def lock_map(self, boxes):
-        """Uloží aktuální potvrzené Bounding Boxy jako referenční etalon světa a sestaví všech až 6 kotev."""
-        self.ref_boxes = [dict(b) for b in boxes]
-        self.ref_dists = []
-        self.last_match_info = None
+        # Stabilizace polohy a potlačení náhodného skákání robota
+        self.pending_jump     = None # (cand_x, cand_y, cand_deg)
+        self.jump_streak      = 0    # Počet po sobě jdoucích snímků potvrzujících skok
+        self.anchors_refined  = False
+        self.refinement_count = 0
 
+    def recompute_anchors(self):
+        """Přepočítá invariantní párové vzdálenosti (kotvy) ze všech aktuálních referenčních bodů."""
         n = len(self.ref_boxes)
         if n < 2:
-            self.locked = False
-            return False
+            self.anchors = []
+            return
 
-        # Invariantní párové vzdálenosti a kotvy pro všech n*(n-1)/2 dvojic (pro 4 svíčky = přesně 6 kotev)
         raw_anchors = []
         for i in range(n):
             for j in range(i + 1, n):
@@ -261,7 +262,6 @@ class RobotLocalizer:
                     'dist': dist
                 })
 
-        # Seřadíme kotvy od nejdelší po nejkratší rozvor
         raw_anchors.sort(key=lambda a: a['dist'], reverse=True)
 
         ANCHOR_PALETTE = [
@@ -281,6 +281,23 @@ class RobotLocalizer:
             a['color'] = pal['color']
             self.anchors.append(a)
 
+    def lock_map(self, boxes):
+        """Uloží aktuální potvrzené Bounding Boxy jako referenční etalon světa a sestaví všech až 6 kotev."""
+        self.ref_boxes = [dict(b) for b in boxes]
+        self.ref_dists = []
+        self.last_match_info = None
+        self.anchors_refined = False
+        self.refinement_count = 0
+        self.pending_jump = None
+        self.jump_streak = 0
+
+        n = len(self.ref_boxes)
+        if n < 2:
+            self.locked = False
+            return False
+
+        self.recompute_anchors()
+
         self.locked = True
         self.robot_x = 0.0
         self.robot_y = 0.0
@@ -289,6 +306,77 @@ class RobotLocalizer:
         self.trajectory = [(0.0, 0.0)]
         self.is_stationary = True
         return True
+
+    def refine_anchors_from_field(self, field_targets):
+        """
+        Zpřesňuje referenční etalon a invariantní kotvy na základě dlouhodobě stabilizované mapy hřiště (GlobalFieldMap):
+        - Když se robot přiblíží ke svíčkám, získá o nich data zblízka (<= 1000 mm), která jsou přesnější než startovní měření.
+        - Aktualizuje středy referenčních boxů a přepočítá invariantní kotvy.
+        - Pokud se v poli objeví 4. svíčka, která nebyla ze startu vidět (např. skrytá za stěnou), automaticky ji zařadí!
+        """
+        if not self.locked or not field_targets:
+            return False
+
+        changed = False
+
+        for ft in field_targets:
+            # Bereme pouze spolehlivé cíle z pole
+            if ft.get('hits', 0) < 6:
+                continue
+
+            fx, fy = ft['candle_world']
+            dist_from_rob = ft.get('dist_from_robot', 9999.0)
+            best_dist = ft.get('best_view_dist_mm', 9999.0)
+
+            # Párujeme k existujícímu referenčnímu boxu
+            best_idx = -1
+            best_d = 360.0
+            for idx, rb in enumerate(self.ref_boxes):
+                d = math.hypot(rb['cx'] - fx, rb['cy'] - fy)
+                if d < best_d:
+                    best_d = d
+                    best_idx = idx
+
+            if best_idx >= 0:
+                rb = self.ref_boxes[best_idx]
+                # Váha zpřesnění: pokud jsme u cíle blízko (<= 1000 mm), zpřesňujeme svižněji, jinak klidně
+                w_alpha = 0.18 if (best_dist <= 1000.0 or dist_from_rob <= 1000.0) else 0.08
+                old_x, old_y = rb['cx'], rb['cy']
+                rb['cx'] = (1.0 - w_alpha) * rb['cx'] + w_alpha * fx
+                rb['cy'] = (1.0 - w_alpha) * rb['cy'] + w_alpha * fy
+                rb['min_x'] = rb['cx'] - rb.get('width', 200.0) * 0.5
+                rb['max_x'] = rb['cx'] + rb.get('width', 200.0) * 0.5
+                rb['min_y'] = rb['cy'] - rb.get('height', 200.0) * 0.5
+                rb['max_y'] = rb['cy'] + rb.get('height', 200.0) * 0.5
+                rb['dist_mm'] = math.hypot(rb['cx'], rb['cy'])
+                if math.hypot(rb['cx'] - old_x, rb['cy'] - old_y) > 0.5:
+                    changed = True
+            else:
+                # Nový cíl v poli (např. 4. svíčka, kterou robot ze startu neviděl přes stěnu)
+                if len(self.ref_boxes) < 4 and ft.get('hits', 0) >= 8:
+                    new_ref = {
+                        'cx': fx,
+                        'cy': fy,
+                        'min_x': fx - 100.0,
+                        'max_x': fx + 100.0,
+                        'min_y': fy - 100.0,
+                        'max_y': fy + 100.0,
+                        'width': ft.get('width', 250.0),
+                        'height': ft.get('height', 250.0),
+                        'type': 'SVÍČKA+STĚNA' if not ft.get('is_solo') else 'SVÍČKA',
+                        'dist_mm': math.hypot(fx, fy),
+                        'from_field': True
+                    }
+                    self.ref_boxes.append(new_ref)
+                    changed = True
+
+        if changed:
+            self.recompute_anchors()
+            self.anchors_refined = True
+            self.refinement_count += 1
+            return True
+
+        return False
 
     def unlock_map(self):
         """Odemkne mapu a vrátí robota do výchozího stavu."""
@@ -303,6 +391,10 @@ class RobotLocalizer:
         self.pose_confidence = 0.0
         self.trajectory = [(0.0, 0.0)]
         self.is_stationary = True
+        self.pending_jump = None
+        self.jump_streak = 0
+        self.anchors_refined = False
+        self.refinement_count = 0
 
     @staticmethod
     def _rigid_transform_2d(src, dst):
@@ -430,15 +522,15 @@ class RobotLocalizer:
                         if not (-1400.0 <= tx <= 1400.0 and -400.0 <= ty <= 3800.0):
                             penalty += 4000.0
 
-                        # Kontinuita orientace a polohy (ochrana proti 180° skokům, pokud už robot byl lokalizován)
+                        # Kontinuita orientace a polohy (přísná ochrana proti nepravdivým skokům u 2 svíček)
                         if self.pose_confidence > 0.2:
                             deg_cur = math.degrees(th)
                             deg_diff = abs((deg_cur - self.robot_deg + 180.0) % 360.0 - 180.0)
                             dist_jump = math.hypot(tx - self.robot_x, ty - self.robot_y)
-                            if deg_diff > 90.0:
-                                penalty += 3000.0 + deg_diff * 20.0
-                            if dist_jump > 600.0:
-                                penalty += dist_jump * 3.0
+                            if deg_diff > 40.0:
+                                penalty += 3500.0 + deg_diff * 35.0
+                            if dist_jump > 240.0:
+                                penalty += 3000.0 + dist_jump * 6.0
 
                     # 5. VYHODNOCENÍ VŠECH KANDIDÁTŮ S TOUTO TRANSFORMACÍ (Inliers)
                     cos_t = math.cos(th); sin_t = math.sin(th)
@@ -488,7 +580,7 @@ class RobotLocalizer:
                                     'p2_world': (w2x, w2y),
                                     'cur_dist': cur_d,
                                     'ref_dist': anc['dist']
-                                })
+                                    })
 
                         pat_name = f"PLNÁ SHODA ({k} CÍLE, {len(matched_anchors)} KOTEVA)" if k >= 4 else \
                                   (f"TROJÚHELNÍK (3 CÍLE, {len(matched_anchors)} KOTVY)" if k == 3 else \
@@ -509,24 +601,77 @@ class RobotLocalizer:
             if best_match_info is not None and best_match_info['k_matched'] >= 3:
                 break
 
-        # Aplikace výsledku lokalizace
+        # Aplikace výsledku lokalizace s ochranou proti skákání robota
         if best_match_info is not None and best_match_info['inliers'] >= 2:
             self.last_match_info = best_match_info
-            self.robot_x = best_match_info['tx']
-            self.robot_y = best_match_info['ty']
-            self.robot_deg = math.degrees(best_match_info['theta'])
-            self.is_stationary = True
-            quality = min(1.0, best_match_info['inliers'] / max(2, len(self.ref_boxes)))
-            self.pose_confidence = quality
+            cand_x = best_match_info['tx']
+            cand_y = best_match_info['ty']
+            cand_deg = math.degrees(best_match_info['theta'])
+            k_m = best_match_info['k_matched']
+            err_m = best_match_info['avg_error']
 
-            # Záznam trajektorie robota (při posunu alespoň o 20 mm)
-            last_pt = self.trajectory[-1]
-            if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 20.0:
-                self.trajectory.append((self.robot_x, self.robot_y))
-                if len(self.trajectory) > 500:
-                    self.trajectory.pop(0)
+            d_jump = math.hypot(cand_x - self.robot_x, cand_y - self.robot_y)
+            deg_diff = abs((cand_deg - self.robot_deg + 180.0) % 360.0 - 180.0)
 
-            return True
+            accept_pose = False
+
+            if self.pose_confidence < 0.35:
+                # Úvodní inicializace pozice robota
+                accept_pose = True
+                self.robot_x = cand_x
+                self.robot_y = cand_y
+                self.robot_deg = cand_deg
+                self.jump_streak = 0
+                self.pending_jump = None
+            elif d_jump <= 220.0 and deg_diff <= 28.0:
+                # Normální plynulý pohyb robota - klidný EMA filtr
+                accept_pose = True
+                self.jump_streak = 0
+                self.pending_jump = None
+                alpha = 0.35
+                self.robot_x = (1.0 - alpha) * self.robot_x + alpha * cand_x
+                self.robot_y = (1.0 - alpha) * self.robot_y + alpha * cand_y
+                diff_signed = (cand_deg - self.robot_deg + 180.0) % 360.0 - 180.0
+                self.robot_deg = (self.robot_deg + alpha * diff_signed) % 360.0
+            else:
+                # Podezření na skok (> 220 mm nebo > 28°)
+                # Počkáme, až se nová poloha potvrdí stabilně více snímky po sobě!
+                if self.pending_jump is not None and math.hypot(cand_x - self.pending_jump[0], cand_y - self.pending_jump[1]) < 90.0:
+                    self.jump_streak += 1
+                else:
+                    self.pending_jump = (cand_x, cand_y, cand_deg)
+                    self.jump_streak = 1
+
+                req_streak = 2 if (k_m >= 3 and err_m < 50.0) else 4
+                if self.jump_streak >= req_streak:
+                    # Skok spolehlivě potvrzen více snímky za sebou
+                    accept_pose = True
+                    self.robot_x = cand_x
+                    self.robot_y = cand_y
+                    self.robot_deg = cand_deg
+                    self.jump_streak = 0
+                    self.pending_jump = None
+                else:
+                    # Neznámý jednorázový záškub -> IGNORUJEME, robot neskočí!
+                    accept_pose = False
+
+            if accept_pose:
+                self.is_stationary = True
+                quality = min(1.0, best_match_info['inliers'] / max(2, len(self.ref_boxes)))
+                self.pose_confidence = min(1.0, self.pose_confidence * 0.7 + quality * 0.3 + 0.1)
+
+                # Záznam trajektorie robota (při posunu alespoň o 20 mm)
+                last_pt = self.trajectory[-1]
+                if math.hypot(self.robot_x - last_pt[0], self.robot_y - last_pt[1]) > 20.0:
+                    self.trajectory.append((self.robot_x, self.robot_y))
+                    if len(self.trajectory) > 500:
+                        self.trajectory.pop(0)
+
+                return True
+            else:
+                # Držíme dosavadní pozici bez poskakování
+                self.pose_confidence = max(0.25, self.pose_confidence - 0.02)
+                return True
         else:
             self.pose_confidence = max(0.0, self.pose_confidence - 0.05)
             return False
@@ -1702,6 +1847,10 @@ class DualLidarVisualizer:
             elif active_b:
                 self.field_map.ingest_boxes(active_b, rx, ry, loc.robot_deg if loc.locked else 0.0)
 
+            # Zpřesnění referenčního etalonu a kotev podle kumulativní stabilní mapy hřiště!
+            if self.localizer.locked:
+                self.localizer.refine_anchors_from_field(self.field_map.get_field_targets())
+
     def update_current_details(self):
         """Aktualizuje stěny, svíčky a nájezdové waypointy pro všechny aktivní boxy."""
         if not self.detect_details_enabled or self.last_frame is None:
@@ -2059,8 +2208,9 @@ class DualLidarVisualizer:
         lock_badge = " 🔒 ZAMČENO" if loc.locked else " [L] ZAMKNOUT MAPU"
         self.screen.blit(self.font_big.render(f"2. REFERENČNÍ ETALON (START){lock_badge}", True, (80, 255, 160) if loc.locked else ACCENT_MAP), (offset_x + 25, 17))
         tri_txt = " | Trojúhelník: AKTIVNÍ" if (loc.locked and loc.triangle_pattern) else ""
-        sub_str = f"Kotvy: {len(loc.anchors)} | Referenční boxy: {len(ref_boxes)}/4{tri_txt}" if loc.locked else f"Sběr etalonu na startu... Boxů: {len(ref_boxes)}/4 (stiskněte [L])"
-        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 39))
+        ref_txt = " | ✨ KOTVY ZPŘESNĚNY Z POLE" if loc.anchors_refined else ""
+        sub_str = f"Kotvy: {len(loc.anchors)} | Referenční boxy: {len(ref_boxes)}/4{tri_txt}{ref_txt}" if loc.locked else f"Sběr etalonu na startu... Boxů: {len(ref_boxes)}/4 (stiskněte [L])"
+        self.screen.blit(self.font_main.render(sub_str, True, (80, 255, 180) if loc.anchors_refined else (210, 215, 225)), (offset_x + 25, 39))
 
         # Spodní tip panel
         tip_box = pygame.Surface((570, 75))
@@ -2327,8 +2477,9 @@ class DualLidarVisualizer:
         opt_tag = " [O: 100% ESP32 NÁJEZDY ZAPNUTY]" if self.detect_details_enabled else " [O: NÁJEZDY Vypnuty]"
 
         self.screen.blit(self.font_big.render(f"3. SHODA [{fov_tag}]{opt_tag}: {pat_name}", True, (255, 200, 60) if self.detect_details_enabled else (80, 255, 160)), (offset_x + 25, 17))
-        sub_str = f"Inliery: {inliers} | Kotvy: {len(matched_anchors)}/6 | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
-        self.screen.blit(self.font_main.render(sub_str, True, (210, 215, 225)), (offset_x + 25, 38))
+        ref_tag = " [✨ KOTVY Z POLE]" if loc.anchors_refined else ""
+        sub_str = f"Inliery: {inliers} | Kotvy: {len(matched_anchors)}/{len(loc.anchors)}{ref_tag} | Chyba: {err:.1f} mm | Od startu: {dist_from_start:.0f} mm | Jistota: {conf_pct}%"
+        self.screen.blit(self.font_main.render(sub_str, True, (80, 255, 180) if loc.anchors_refined else (210, 215, 225)), (offset_x + 25, 38))
 
         # 9. SPODNÍ TIP PANEL
         tip_box = pygame.Surface((570, 75))
